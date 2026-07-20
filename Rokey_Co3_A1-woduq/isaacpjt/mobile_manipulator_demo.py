@@ -58,7 +58,9 @@ from isaacsim.core.utils.types import ArticulationAction
 from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics
 
 
-WORKSPACE = Path("/home/rokey/cobot3_ws")
+WORKSPACE = Path(
+    os.environ.get("COBOT3_WS", Path(__file__).resolve().parents[1])
+).resolve()
 # Isaac's URDF importer resolves package:// URLs through ROS_PACKAGE_PATH,
 # while a sourced ROS 2/ament workspace does not populate that ROS 1 variable.
 _package_roots = [

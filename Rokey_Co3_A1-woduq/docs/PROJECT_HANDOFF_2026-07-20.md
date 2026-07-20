@@ -157,9 +157,11 @@ See `docs/ISAAC_MOVEIT_QUICKSTART.md` for the three-terminal MoveIt workflow.
    CUDA error 700 in this mixed scene.
 3. CameraInfo currently falls back to `plumb_bob` with zero coefficients because the
    collected camera has no supported physical distortion model.
-4. Absolute paths assume `/home/rokey/cobot3_ws`. The Lightwheel source asset must exist
-   under `/home/rokey/.gemini/antigravity/scratch/assets/Lightwheel_Kitchen/...` or the
-   stage reference must be repathed.
+4. The Lightwheel runtime asset is intentionally distributed separately. Extract its
+   archive at the workspace root so that
+   `assets/Lightwheel_Kitchen/Collected_KitchenRoom/KitchenRoom.usd` exists. Scene asset
+   references are relative; `mobile_manipulator_demo.py` derives the workspace from its
+   own location, or accepts `COBOT3_WS` as an override.
 5. Large source packs are intentionally not committed: `assets/nvidia_restaurant`,
    `assets/kenney_furniture`, and unrelated collected block textures.
 
@@ -178,8 +180,28 @@ See `docs/ISAAC_MOVEIT_QUICKSTART.md` for the three-terminal MoveIt workflow.
 
 ## 10. Asset portability
 
-The Git commit should include the lightweight restaurant, generated mobile robot USD,
-and the selected M0609/RG2/D455 runtime subset. If a clone reports a missing asset,
-compare the USD reference with this machine's
+The Git commit includes the lightweight hall, generated mobile robot USD, and selected
+M0609/RG2/D455 runtime subset. Lightwheel Kitchen is kept at
+`assets/Lightwheel_Kitchen` locally but its 1.2 GB collected scene is ignored by Git.
+It is licensed CC BY-NC 4.0, so its archive includes the upstream `README.md` and
+`LICENSE.txt` and may only be redistributed under those terms.
+
+Create the distribution archive and checksum:
+
+```bash
+cd /home/rokey/cobot3_ws
+./tools/package_lightwheel_kitchen.sh
+```
+
+On another computer, extract it from the cloned workspace root:
+
+```bash
+cd /path/containing/the/archive
+sha256sum -c Lightwheel_Kitchen_runtime_cc-by-nc-4.0.tar.zst.sha256
+tar --zstd -xf Lightwheel_Kitchen_runtime_cc-by-nc-4.0.tar.zst \
+  -C /path/to/cobot3_ws
+```
+
+If a clone reports a missing M0609/RG2/D455 asset, compare the USD reference with
 `isaacpjt/M0609/Collected_m0609_camera2` and copy only the referenced subtree. Do not
 commit the 8.4 GB NVIDIA restaurant download.
