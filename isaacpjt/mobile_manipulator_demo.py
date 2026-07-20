@@ -21,7 +21,7 @@ _ros_bridge_lib = Path(
 if os.environ.get("MOBILE_DEMO_ROS_CAMERA", "1") == "1":
     os.environ.setdefault("ROS_DISTRO", "humble")
     os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
-    os.environ.setdefault("ROS_DOMAIN_ID", "102")
+    os.environ.setdefault("ROS_DOMAIN_ID", "101")
     _ld_paths = [path for path in os.environ.get("LD_LIBRARY_PATH", "").split(":") if path]
     _python_paths = [
         path
@@ -723,10 +723,44 @@ def main():
         simulation_app.close()
         return
 
+    # Initialize ROS 2 Status Publisher for HMI Integration
+    import json
+    import rclpy
+    from std_msgs.msg import String
+
+    if not rclpy.ok():
+        rclpy.init()
+    status_node = rclpy.create_node('isaac_robot_status_publisher')
+    status_pub = status_node.create_publisher(String, '/serving_robot/status', 10)
+    last_status_pub_time = 0.0
+
+    print("[HMI Integration] Real-time Isaac Sim pose publisher active on /serving_robot/status", flush=True)
+
     while simulation_app.is_running():
         simulation_app.update()
-        # Keep the GUI event loop responsive without throttling it to the old
-        # uneven 16 ms cadence.
+        now = time.time()
+        if now - last_status_pub_time > 0.1:  # 10 Hz
+            last_status_pub_time = now
+            try:
+                pos, rot = articulation.get_world_pose()
+                w, x, y, z = rot
+                siny_cosp = 2 * (w * z + x * y)
+                cosy_cosp = 1 - 2 * (y * y + z * z)
+                yaw = np.arctan2(siny_cosp, cosy_cosp)
+
+                is_parked = os.environ.get("MOBILE_DEMO_PARKED_HOLD", "1") == "1"
+                status_payload = {
+                    "pose": {"x": float(pos[0]), "y": float(pos[1]), "yaw": float(yaw)},
+                    "state": "READY" if is_parked else "NAVIGATING",
+                    "parking_brake": is_parked,
+                    "battery": 98.5
+                }
+                msg = String()
+                msg.data = json.dumps(status_payload)
+                status_pub.publish(msg)
+                rclpy.spin_once(status_node, timeout_sec=0)
+            except Exception as e:
+                pass
         time.sleep(0.010)
 
 
