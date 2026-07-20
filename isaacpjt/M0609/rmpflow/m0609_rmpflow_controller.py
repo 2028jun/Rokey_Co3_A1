@@ -27,11 +27,12 @@ class RMPFlowController(mg.MotionPolicyController):
             Path(rmpflow_config_path) if rmpflow_config_path else base_dir / "m0609_rmpflow_common.yaml"
         )
 
+        #m0609_rmpflow_controller.py 핵심부분
         self.rmp_flow = mg.lula.motion_policies.RmpFlow(
-            robot_description_path=robot_description_path,
-            rmpflow_config_path=rmpflow_config_path,
-            urdf_path=urdf_path,
-            end_effector_frame_name=end_effector_frame_name,
+            robot_description_path=robot_description_path, #<- m0609_descripton.yaml경로
+            rmpflow_config_path=rmpflow_config_path, #<- m0609_rmpflow_common.yaml경로
+            urdf_path=urdf_path, # <- m0609_isaac_sim.urdf경로
+            end_effector_frame_name=end_effector_frame_name, # <- link_6
             maximum_substep_size=maximum_substep_size,
         )
 

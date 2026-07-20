@@ -11,7 +11,7 @@ import time
 import omni.usd
 from pxr import Usd, UsdGeom
 
-USD_PATH = str(Path(__file__).resolve().parent / "Collected_m0609_camera2/m0609_gripper.usd")
+USD_PATH = str(Path(__file__).resolve().parent / "Collected_m0609_camera/m0609_camera.usd")
 
 # /World prim 명시적 생성 후 USD reference 연결
 stage = omni.usd.get_context().get_stage()
@@ -22,14 +22,14 @@ world_prim.GetReferences().AddReference(USD_PATH)
 for _ in range(15):
     simulation_app.update()
 
-# 로드된 prim 구조 출력
-print("\n" + "=" * 60)
-print("Stage prim 구조")
-print("=" * 60)
-for prim in Usd.PrimRange(stage.GetPseudoRoot()):
-    depth = len(str(prim.GetPath()).split("/")) - 2
-    indent = "  " * depth
-    print(f"{indent}{prim.GetName()}  [{prim.GetTypeName()}]")
+# # 로드된 prim 구조 출력
+# print("\n" + "=" * 60)
+# print("Stage prim 구조")
+# print("=" * 60)
+# for prim in Usd.PrimRange(stage.GetPseudoRoot()):
+#     depth = len(str(prim.GetPath()).split("/")) - 2
+#     indent = "  " * depth
+#     print(f"{indent}{prim.GetName()}  [{prim.GetTypeName()}]")
 
 print("\n시뮬레이션 실행 중 (Play 버튼을 눌러 확인하세요)")
 

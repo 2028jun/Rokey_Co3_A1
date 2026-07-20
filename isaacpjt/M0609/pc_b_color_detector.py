@@ -1,7 +1,7 @@
 """PC B용 ROS 2 색상 판별 노드.
 
 /rgb(sensor_msgs/msg/Image)를 구독해 중앙 Pick 영역의 큐브 색상을 판별하고
-/cube_color(std_msgs/msg/Int32)로 1=파랑, 2=초록을 발행한다.
+/color_id(std_msgs/msg/Int32)로 1=파랑, 2=초록을 발행한다.
 """
 
 import cv2
@@ -15,7 +15,7 @@ from std_msgs.msg import Int32
 
 
 RGB_TOPIC = "/rgb"
-COLOR_TOPIC = "/cube_color"
+COLOR_TOPIC = "/color_id"
 
 BLUE = 1
 GREEN = 2

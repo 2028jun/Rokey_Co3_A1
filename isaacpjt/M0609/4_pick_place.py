@@ -70,16 +70,16 @@ EE_OFFSET     = np.array([0.0, 0.0, 0.2])               # 접근 높이
 
 # ── B-3. 10단계 타이밍 (작을수록 빠름) ────────────────────────
 EVENTS_DT = [
-    0.008,   # 0. 접근 이동
-    0.005,   # 1. 하강
+    0.01,   # 0. 접근 이동
+    0.01,   # 1. 하강
     0.02,    # 2. 그리퍼 닫기 대기
     0.1,     # 3. 그리퍼 닫힘 유지
-    0.0025,  # 4. 들어올리기
+    0.01,  # 4. 들어올리기
     0.01,    # 5. Place 위치로 이동
-    0.0025,  # 6. 하강
+    0.01,  # 6. 하강
     1,   # 7. 그리퍼 열기 대기
-    0.0025,   # 8. 상승
-    0.08,    # 9. 복귀
+    0.01,   # 8. 상승
+    0.1,    # 9. 복귀
 ]
 
 
@@ -327,6 +327,7 @@ def main():
             controller.reset()
             task_done = False
 
+
         # 매 스텝 제어
         if is_playing and not task_done:
             # (1) 관측 데이터 수집
@@ -345,11 +346,14 @@ def main():
             # (3) 로봇에 적용
             robot.apply_action(actions)
 
+            if controller.get_current_event() >= 5:
+                print("[완료] Pick 성공 - 큐브를 잡은 상태로 정지")
+                task_done = True
+
             # (4) 완료 확인
             if controller.is_done():
                 print("[완료] Pick & Place 성공!")
                 task_done = True
-                my_world.pause()
 
             # 디버그 출력
             event = controller.get_current_event()

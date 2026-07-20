@@ -67,7 +67,11 @@ M0609_DESCRIPTION_PATH    = str(_THIS_DIR / "rmpflow/m0609_description.yaml")
 M0609_RMPFLOW_CONFIG_PATH = str(_THIS_DIR / "rmpflow/m0609_rmpflow_common.yaml")
 
 # ── B-2. Pick & Place 동작 파라미터 ───────────────────────────
-PICK_POS = np.array([0.30, 0.40, 0.02575])
+# 기존에 집기가 검증된 [0.30, 0.40] 주변의 안전한 직사각형 범위다.
+# 범위를 넓힐 때는 RMPFlow 도달 가능 여부와 마커 충돌을 다시 확인해야 한다.
+PICK_X_RANGE = (0.25, 0.40)
+PICK_Y_RANGE = (0.25, 0.45)
+PICK_Z = 0.02575  # 5cm 큐브 중심 높이
 
 BLUE_WAIT_POS = np.array([0.10, 0.60, 0.40])
 GREEN_WAIT_POS = np.array([0.10, 0.75, 0.40])
@@ -78,7 +82,7 @@ GREEN_GOAL_POS = np.array([0.55, 0.35, 0.01])
 BLUE = 1
 GREEN = 2
 
-COLOR_TOPIC = "/cube_color"
+COLOR_TOPIC = "/color_id"
 
 EE_OFFSET     = np.array([0.0, 0.0, 0.2])               # 접근 높이
 
@@ -149,10 +153,12 @@ class M0609Task(BaseTask):
 
     def __init__(self, name):
         super().__init__(name=name, offset=None)
+        self._rng = np.random.default_rng()
         self._task_achieved = False
         self._selected_color = None
         self._selected_cube = None
         self._selected_goal = None
+        self._pick_position = None
 
     def set_up_scene(self, scene):
         super().set_up_scene(scene)
@@ -237,7 +243,7 @@ class M0609Task(BaseTask):
             restitution=0.0,
         )
         # 두 큐브는 공중 대기 위치에서 생성한다. Reset할 때 하나만
-        # 무작위로 PICK_POS로 이동하고 나머지는 공중에 고정한다.
+        # 무작위 Pick 위치로 이동하고 나머지는 공중에 고정한다.
         self._blue_cube = scene.add(
             DynamicCuboid(
                 prim_path="/World/blue_cube",
@@ -265,7 +271,7 @@ class M0609Task(BaseTask):
         print(f"  [OK] green cube wait @ {GREEN_WAIT_POS}")
 
         # 색상별 Place 위치를 눈으로 확인할 수 있는 마커 두 개를 만든다.
-        scene.add(
+        self._blue_marker = scene.add(
             VisualCuboid(
                 prim_path="/World/blue_goal_marker",
                 name="blue_goal_marker",
@@ -275,7 +281,7 @@ class M0609Task(BaseTask):
             )
         )
 
-        scene.add(
+        self._green_marker = scene.add(
             VisualCuboid(
                 prim_path="/World/green_goal_marker",
                 name="green_goal_marker",
@@ -312,6 +318,10 @@ class M0609Task(BaseTask):
 
     def prepare_round(self):
         """Reset마다 큐브 하나를 무작위로 골라 Pick 영역에 배치한다."""
+        # 색상 판별 전에는 목표 마커가 Wrist Camera에 잡히지 않도록 숨긴다.
+        self._blue_marker.set_visibility(False)
+        self._green_marker.set_visibility(False)
+
         # 두 큐브를 먼저 원래 공중 대기 위치로 되돌리고 고정한다.
         self._set_cube_kinematic(self._blue_cube, True)
         self._set_cube_kinematic(self._green_cube, True)
@@ -329,14 +339,28 @@ class M0609Task(BaseTask):
             self._selected_goal = GREEN_GOAL_POS
             color_name = "GREEN"
 
-        # 선택된 큐브만 Pick 영역으로 옮기고 물리 영향을 받도록 해제한다.
-        self._selected_cube.set_world_pose(position=PICK_POS)
+        # 로봇이 안정적으로 집을 수 있는 범위 안에서 매 라운드 XY를 뽑는다.
+        self._pick_position = np.array(
+            [
+                self._rng.uniform(*PICK_X_RANGE),
+                self._rng.uniform(*PICK_Y_RANGE),
+                PICK_Z,
+            ]
+        )
+
+        # 선택된 큐브만 랜덤 Pick 위치로 옮기고 물리 영향을 받도록 해제한다.
+        self._selected_cube.set_world_pose(position=self._pick_position)
         self._set_cube_kinematic(self._selected_cube, False)
         self._task_achieved = False
 
         print(f"[ROUND] selected color = {color_name} ({self._selected_color})")
-        print(f"[ROUND] pick position  = {PICK_POS}")
+        print(f"[ROUND] pick position  = {self._pick_position}")
         print(f"[ROUND] goal position  = {self._selected_goal}")
+
+    def show_goal_markers(self):
+        """색상 판별이 끝나면 두 Place 마커를 모두 화면에 표시한다."""
+        self._blue_marker.set_visibility(True)
+        self._green_marker.set_visibility(True)
 
     def get_observations(self):
         """선택된 큐브 위치와 로봇 관절 상태를 Controller에 제공한다."""
@@ -415,7 +439,9 @@ def main():
     # ── C-3. 초기 상태 진단 ───────────────────────────────────
     ee_pos, _ = robot.end_effector.get_world_pose()
     print(f"\n  EE 초기 위치 = {ee_pos}")
-    print(f"  Pick 위치    = {PICK_POS}")
+    print(f"  Pick X 범위  = {PICK_X_RANGE}")
+    print(f"  Pick Y 범위  = {PICK_Y_RANGE}")
+    print(f"  Pick Z 높이  = {PICK_Z}")
     print(f"  파란 목표    = {BLUE_GOAL_POS}")
     print(f"  초록 목표    = {GREEN_GOAL_POS}")
 
@@ -429,7 +455,7 @@ def main():
 
     while simulation_app.is_running():
         my_world.step(render=True)
-        # PC B의 /cube_color 콜백을 Isaac Sim 렌더 루프를 막지 않고 처리한다.
+        # PC B의 /color_id 콜백을 Isaac Sim 렌더 루프를 막지 않고 처리한다.
         rclpy.spin_once(color_subscriber, timeout_sec=0.0)
         time.sleep(0.01)
         is_playing = my_world.is_playing()
@@ -475,6 +501,7 @@ def main():
                 if detected_color is None and color_subscriber.detected_color is not None:
                     detected_color = color_subscriber.detected_color
                     color_name = "BLUE" if detected_color == BLUE else "GREEN"
+                    task.show_goal_markers()
                     print(f"[ROS] {COLOR_TOPIC} 수신: {color_name} ({detected_color})")
 
                 if detected_color is None:

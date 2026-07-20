@@ -30,13 +30,13 @@ rmp_params:
         accel_potential_exploder_length_scale: 0.1
         accel_potential_exploder_eps: 1e-2
     joint_velocity_cap_rmp:
-        max_velocity: 3.927
+        max_velocity: 3.927 #관절 최대 속도 (rad/s)
         velocity_damping_region: 1.2
         damping_gain: 1000.0
         metric_weight: 100.
     target_rmp:
-        accel_p_gain: 30.
-        accel_d_gain: 85.
+        accel_p_gain: 30. #목표 위치로 끌어당기는 힘
+        accel_d_gain: 85. #흔들림 억제
         accel_norm_eps: 0.075
         metric_alpha_length_scale: 0.05
         min_metric_alpha: 0.01
@@ -59,7 +59,7 @@ rmp_params:
         damping_std_dev: 0.04
         damping_robustness_eps: 1e-2
         damping_velocity_gate_length_scale: 0.01
-        repulsion_gain: 800.
+        repulsion_gain: 800. #충돌 회피 반발력
         repulsion_std_dev: 0.02
         metric_modulation_radius: 0.5
         metric_scalar: 10000.
