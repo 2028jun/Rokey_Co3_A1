@@ -1,0 +1,351 @@
+<?xml version="1.0"?>
+
+<robot name="m0609" xmlns:xacro="http://www.ros.org/wiki/xacro">
+		<link name="base_link">
+			<inertial>
+				<mass value="3.18"/>
+				<origin xyz="-2.8e-05   -0.006045    0.038403"/>
+				<inertia ixx="0.017789" ixy="-7.4356e-06" ixz="3.0378e-06" iyy="0.011135"
+					iyz="-0.00029038"
+					izz="0.020054"/>
+			</inertial>
+			<collision>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_collision/MF0609_0_0.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</collision>
+			<visual>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_white/MF0609_0_0.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</visual>
+		</link>
+		<link name="base"/>
+		<joint name="base_link-base" type="fixed">
+			<origin rpy="0 0 0" xyz="0 0 0.450"/>
+			<parent link="base_link"/>
+			<child link="base"/>
+		</joint>
+		<!-- joint 1 -->
+		<joint name="joint_1" type="revolute">
+			<parent link="base_link" />
+			<child link="link_1" />
+			<origin rpy="0 0 0" xyz="0 0 0.1345" />
+			<axis xyz="0 0 1" />
+			<limit effort="9600" lower="-6.2832" upper="6.2832" velocity="2.618"/>
+			<dynamics friction="0" damping="26.6667" stiffness="266.6667"/>
+		</joint>
+		<link name="link_1">
+			<inertial>
+				<mass value="5.02"/>
+				<origin xyz="7.2e-05    0.036227   -0.003417"/>
+				<inertia ixx="0.026195" ixy="2.3904e-05" ixz="-1.3319e-05" iyy="0.016899"
+					iyz="-0.00071987"
+					izz="0.022944"/>
+			</inertial>
+            <collision>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_collision/MF0609_1_0.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</collision>
+			<visual>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_white/MF0609_1_0.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</visual>
+		</link>
+		<!-- joint2 -->
+		<joint name="joint_2" type="revolute">
+			<parent link="link_1" />
+			<child link="link_2" />
+			<origin rpy="0 -1.571 -1.571" xyz="0 0.0062 0" />
+			<axis xyz="0 0 1" />
+			<limit effort="9600" lower="-6.2832" upper="6.2832" velocity="2.618"/>
+			<dynamics friction="0"  damping="26.6667" stiffness="266.6667"/>
+		</joint>
+		<link name="link_2">
+			<inertial>
+				<mass value="8.04"/>
+				<origin xyz="0.20447     2.6e-05     0.16005"/>
+				<inertia ixx="0.026743" ixy="-0.00019461" ixz="-0.00058734" iyy="0.30084"
+					iyz="-6.7892e-06"
+					izz="0.29898"/>
+			</inertial>
+            <collision>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_collision/MF0609_2_0.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</collision>
+			<visual>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_white/MF0609_2_0.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</visual>
+			<collision>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_collision/MF0609_2_1.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</collision>
+			<visual>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_white/MF0609_2_1.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</visual>
+			<collision>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_collision/MF0609_2_2.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</collision>
+			<visual>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_white/MF0609_2_2.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</visual>
+		</link>
+		<!-- joint3 -->
+		<joint name="joint_3" type="revolute">
+			<parent link="link_2" />
+			<child link="link_3" />
+			<origin rpy="0 0 1.571" xyz="0.411 0 0" />
+			<axis xyz="0 0 1" />
+			<limit effort="5400" lower="-2.618" upper="2.618" velocity="3.1416"/>
+			<dynamics friction="0"  damping="15" stiffness="150"/>
+		</joint>
+		<link name="link_3">
+			<inertial>
+				<mass value="3.6"/>
+				<origin xyz="-2.2e-05   -0.006867    0.043445"/>
+				<inertia ixx="0.018342" ixy="1.1302e-05" ixz="-4.5308e-06" iyy="0.018239"
+					iyz="-0.00099247"
+					izz="0.01326"/>
+			</inertial>
+			<collision>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_collision/MF0609_3_0.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</collision>
+			<visual>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_white/MF0609_3_0.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</visual>
+		</link>
+		<!-- joint4 -->
+		<joint name="joint_4" type="revolute">
+			<parent link="link_3" />
+			<child link="link_4" />
+			<origin rpy="1.571 0 0" xyz="0 -0.368 0" />
+			<axis xyz="0 0 1" />
+			<limit effort="2700" lower="-6.2832" upper="6.2832" velocity="3.927"/>
+			<dynamics friction="0"  damping="7.5" stiffness="750"/>
+		</joint>
+		<link name="link_4">
+			<inertial>
+				<mass value="3.57"/>
+				<origin xyz="4e-05    0.097079    -0.10981"/>
+				<inertia ixx="0.08035" ixy="-4.6119e-06" ixz="-8.1798e-06" iyy="0.066005"
+					iyz="-0.028996"
+					izz="0.029763"/>
+			</inertial>
+            <collision>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_collision/MF0609_4_0.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</collision>
+			<visual>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_white/MF0609_4_0.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</visual>
+			<collision>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_collision/MF0609_4_1.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</collision>
+			<visual>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_white/MF0609_4_1.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</visual>
+		</link>
+		<!-- joint5 -->
+		<joint name="joint_5" type="revolute">
+			<parent link="link_4" />
+			<child link="link_5" />
+			<origin rpy="-1.571 0 0" xyz="0 0 0" />
+			<axis xyz="0 0 1" />
+			<limit effort="2700" lower="-6.2832" upper="6.2832" velocity="3.927"/>
+			<dynamics friction="0"   damping="7.5" stiffness="750"/>
+		</joint>
+		<link name="link_5">
+			<inertial>
+				<mass value="2.83"/>
+				<origin xyz="-6.8e-05    0.003827    0.031969"/>
+				<inertia ixx="0.014275" ixy="2.2026e-05" ixz="3.3017e-06" iyy="0.012569"
+					iyz="0.00045077"
+					izz="0.0085318"/>
+			</inertial>
+            <collision>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_collision/MF0609_5_0.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</collision>
+			<visual>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_white/MF0609_5_0.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</visual>
+		</link>
+		<!-- joint6 -->
+		<joint name="joint_6" type="revolute">
+			<parent link="link_5" />
+			<child link="link_6" />
+			<origin rpy="1.571 0 0" xyz="0 -0.121 0" />
+			<axis xyz="0 0 1" />
+			<limit effort="2700" lower="-6.2832" upper="6.2832" velocity="3.927"/>
+			<dynamics friction="0"   damping="7.5" stiffness="750"/>
+		</joint>
+		<link name="link_6">
+			<inertial>
+				<mass value="1.16"/>
+				<origin xyz="-3e-05    -4.5e-05     -0.0539"/>
+				<inertia ixx="0.0080226" ixy="1.371e-06" ixz="6.3578e-06" iyy="0.0053992"
+					iyz="7.4676e-06"
+					izz="0.0053912"/>
+			</inertial>
+			<collision>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_collision/MF0609_6_0.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</collision>
+			<visual>
+				<origin rpy="0 0 0" xyz="0 0 0" />
+				<geometry>
+					<mesh filename="package://m0609_isaac_description/urdf/meshes/m0609_white/MF0609_6_0.dae" scale="0.001 0.001 0.001" />
+				</geometry>
+			</visual>
+		</link>
+		<link name="tool0"/>
+		<joint name="joint_6-tool0" type="fixed">
+			<origin rpy="0 0 0" xyz="0 0 0"/>
+			<parent link="link_6"/>
+			<child link="tool0"/>
+		</joint>
+
+		<!-- Detailed OnRobot RG2 model. The fingers use the zero-angle pose for
+		     the current six-axis arm test; Isaac Sim retains the live gripper
+		     articulation. The fixed links keep RViz and MoveIt state complete. -->
+		<material name="rg2_silver"><color rgba="0.68 0.69 0.68 1"/></material>
+		<material name="rg2_blue"><color rgba="0.216 0.592 0.812 1"/></material>
+
+		<xacro:macro name="rg2_mesh_link" params="name mesh visual_xyz:='0 0 0' color:='rg2_silver'">
+			<link name="${name}">
+				<!-- Fixed RG2 parts still become individual rigid bodies when
+				     Isaac's importer preserves fixed joints.  Give them finite
+				     mass properties to avoid negative-mass fallback and jitter. -->
+				<inertial>
+					<origin xyz="0 0 0" rpy="0 0 0"/>
+					<mass value="0.10"/>
+					<inertia ixx="0.0001" ixy="0" ixz="0"
+					         iyy="0.0001" iyz="0" izz="0.0001"/>
+				</inertial>
+				<visual>
+					<origin xyz="${visual_xyz}" rpy="0 0 0"/>
+					<geometry>
+						<mesh filename="package://m0609_isaac_description/onrobot_rg2/visual/${mesh}.stl" scale="0.001 0.001 0.001"/>
+					</geometry>
+					<material name="${color}"/>
+				</visual>
+				<collision>
+					<origin xyz="${visual_xyz}" rpy="0 0 0"/>
+					<geometry>
+						<mesh filename="package://m0609_isaac_description/onrobot_rg2/collision/${mesh}.stl" scale="0.001 0.001 0.001"/>
+					</geometry>
+				</collision>
+			</link>
+		</xacro:macro>
+
+		<xacro:rg2_mesh_link name="rg2_quick_changer" mesh="quick_changer" color="rg2_blue"/>
+		<xacro:rg2_mesh_link name="rg2_angle_bracket" mesh="angle_bracket" visual_xyz="0 0 -0.00255"/>
+		<xacro:rg2_mesh_link name="rg2_base_link" mesh="gripper_body" visual_xyz="0.02705 0 -0.047"/>
+		<xacro:rg2_mesh_link name="rg2_left_inner_knuckle" mesh="left_inner_knuckle" visual_xyz="-0.0075 0.009367 -0.139397"/>
+		<xacro:rg2_mesh_link name="rg2_right_outer_knuckle" mesh="right_outer_knuckle" visual_xyz="0.017 0.009534 -0.122898"/>
+		<xacro:rg2_mesh_link name="rg2_left_outer_knuckle" mesh="left_outer_knuckle" visual_xyz="-0.017 0.009534 -0.122898"/>
+		<xacro:rg2_mesh_link name="rg2_left_inner_finger" mesh="left_inner_finger" visual_xyz="-0.056748 0.00475 -0.160866"/>
+		<xacro:rg2_mesh_link name="rg2_right_inner_finger" mesh="right_inner_finger" visual_xyz="0.056748 0.00475 -0.160866"/>
+		<xacro:rg2_mesh_link name="rg2_right_inner_knuckle" mesh="right_inner_knuckle" visual_xyz="0.0075 0.009367 -0.139397"/>
+
+		<joint name="rg2_quick_changer_joint" type="fixed">
+			<parent link="tool0"/>
+			<child link="rg2_quick_changer"/>
+			<origin xyz="0 0 0" rpy="0 0 0"/>
+		</joint>
+		<joint name="rg2_angle_bracket_joint" type="fixed">
+			<parent link="rg2_quick_changer"/>
+			<child link="rg2_angle_bracket"/>
+			<origin xyz="0 0 0.00255" rpy="0 0 0"/>
+		</joint>
+		<joint name="rg2_gripper_body_joint" type="fixed">
+			<parent link="rg2_angle_bracket"/>
+			<child link="rg2_base_link"/>
+			<origin xyz="-0.02705 0 0.04445" rpy="0.0101229097 0 0"/>
+		</joint>
+		<joint name="rg2_left_inner_knuckle_joint" type="fixed">
+			<parent link="rg2_base_link"/>
+			<child link="rg2_left_inner_knuckle"/>
+			<origin xyz="0.03455 -0.009367 0.092397" rpy="0 0.415388362 0"/>
+		</joint>
+		<joint name="rg2_finger_joint" type="fixed">
+			<parent link="rg2_base_link"/>
+			<child link="rg2_right_outer_knuckle"/>
+			<origin xyz="0.01005 -0.009534 0.075898" rpy="0 -0.415388362 0"/>
+		</joint>
+		<joint name="rg2_left_outer_knuckle_joint" type="fixed">
+			<parent link="rg2_base_link"/>
+			<child link="rg2_left_outer_knuckle"/>
+			<origin xyz="0.04405 -0.009534 0.075898" rpy="0 0.415388362 0"/>
+		</joint>
+		<joint name="rg2_left_inner_finger_joint" type="fixed">
+			<parent link="rg2_left_outer_knuckle"/>
+			<child link="rg2_left_inner_finger"/>
+			<origin xyz="0.039748 0.004784 0.037968" rpy="0 -0.415388362 0"/>
+		</joint>
+		<joint name="rg2_right_inner_finger_joint" type="fixed">
+			<parent link="rg2_right_outer_knuckle"/>
+			<child link="rg2_right_inner_finger"/>
+			<origin xyz="-0.039748 0.004784 0.037968" rpy="0 0.415388362 0"/>
+		</joint>
+		<joint name="rg2_right_inner_knuckle_joint" type="fixed">
+			<parent link="rg2_base_link"/>
+			<child link="rg2_right_inner_knuckle"/>
+			<origin xyz="0.01955 -0.009367 0.092397" rpy="0 -0.415388362 0"/>
+		</joint>
+		<link name="rg2_tcp"/>
+		<joint name="rg2_tcp_joint" type="fixed">
+			<parent link="tool0"/>
+			<child link="rg2_tcp"/>
+			<origin xyz="0 0 0.231066" rpy="0 0 0"/>
+		</joint>
+
+
+</robot>
