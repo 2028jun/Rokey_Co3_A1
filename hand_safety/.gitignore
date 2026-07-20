@@ -1,0 +1,26 @@
+# ROS 2
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 학습 결과 및 대용량 파일
+runs/
+datasets/
+rosbag*/
+*.db3
+*.mcap
+*.pt
+*.onnx
+*.engine
+
+# 개인정보
+.env
+
+# IDE
+.vscode/

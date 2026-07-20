@@ -1,0 +1,12 @@
+# Conservative footprint including the Ridgeback body and serving shelf.
+# The shelf stays inside the R100 chassis, but 30 mm safety margin is included.
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      footprint: "[[0.51, 0.43], [0.51, -0.43], [-0.51, -0.43], [-0.51, 0.43]]"
+      robot_radius: 0.0
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      footprint: "[[0.51, 0.43], [0.51, -0.43], [-0.51, -0.43], [-0.51, 0.43]]"
+      robot_radius: 0.0
