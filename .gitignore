@@ -12,6 +12,11 @@ assets/nvidia_restaurant/
 assets/kenney_furniture/
 external/
 
+# Lightwheel Kitchen is distributed as a separate CC BY-NC 4.0 archive.
+assets/Lightwheel_Kitchen/Collected_KitchenRoom/
+dist/Lightwheel_Kitchen_runtime*.tar.zst
+dist/Lightwheel_Kitchen_runtime*.tar.zst.sha256
+
 # A collected Isaac scene is 200+ MB. Required runtime subsets are force-added
 # deliberately; unrelated block textures remain local.
 isaacpjt/M0609/Collected_m0609_camera2/

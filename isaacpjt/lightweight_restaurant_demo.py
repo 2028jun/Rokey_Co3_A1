@@ -21,14 +21,14 @@ from omni.kit.viewport.utility import get_active_viewport
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics
 
 
-WORK_DIR = Path("/home/rokey/cobot3_ws/assets/lightweight_restaurant")
+WORKSPACE = Path(__file__).resolve().parents[1]
+WORK_DIR = WORKSPACE / "assets/lightweight_restaurant"
 SOURCE_DIR = Path(
-    "/home/rokey/cobot3_ws/assets/kenney_furniture/extracted/Models/GLTF format"
+    WORKSPACE / "assets/kenney_furniture/extracted/Models/GLTF format"
 )
 SCENE_PATH = WORK_DIR / "lightweight_pizza_restaurant.usda"
 LIGHTWHEEL_KITCHEN_PATH = Path(
-    "/home/rokey/.gemini/antigravity/scratch/assets/Lightwheel_Kitchen/"
-    "Collected_KitchenRoom/KitchenRoom.usd"
+    WORKSPACE / "assets/Lightwheel_Kitchen/Collected_KitchenRoom/KitchenRoom.usd"
 )
 
 ASSETS = {

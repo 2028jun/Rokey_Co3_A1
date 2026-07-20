@@ -29,6 +29,18 @@ ros2 run ridgeback_m0609_description validate_description.py
 
 발표 또는 다른 GPU 작업이 끝난 뒤에만 실행합니다.
 
+먼저 별도 배포되는 Lightwheel Kitchen 압축파일을 워크스페이스 루트에서
+풉니다. 다음 파일이 존재해야 합니다.
+
+```text
+assets/Lightwheel_Kitchen/Collected_KitchenRoom/KitchenRoom.usd
+```
+
+```bash
+cd /home/rokey/cobot3_ws
+tar --zstd -xf /path/to/Lightwheel_Kitchen_runtime_cc-by-nc-4.0.tar.zst
+```
+
 ```bash
 source /opt/ros/humble/setup.bash
 source /home/rokey/cobot3_ws/install/setup.bash
