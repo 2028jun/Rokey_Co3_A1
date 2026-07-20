@@ -30,8 +30,8 @@ rmp_params:
         accel_potential_exploder_length_scale: 0.1
         accel_potential_exploder_eps: 1e-2
     joint_velocity_cap_rmp:
-        max_velocity: 3.927 #관절 최대 속도 (rad/s)
-        velocity_damping_region: 1.2
+        max_velocity: 1.0 # RG2 장착 상태의 안전한 관절 최대 속도 (rad/s)
+        velocity_damping_region: 0.5
         damping_gain: 1000.0
         metric_weight: 100.
     target_rmp:

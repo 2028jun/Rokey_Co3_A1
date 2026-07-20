@@ -21,6 +21,20 @@ EXPECTED_MOVING_JOINTS = {
     "joint_4",
     "joint_5",
     "joint_6",
+    "rg2_finger_joint",
+    "rg2_left_inner_finger_joint",
+    "rg2_left_inner_knuckle_joint",
+    "rg2_left_outer_knuckle_joint",
+    "rg2_right_inner_finger_joint",
+    "rg2_right_inner_knuckle_joint",
+}
+
+RG2_MIMIC_MULTIPLIERS = {
+    "rg2_left_inner_finger_joint": -1.0,
+    "rg2_left_inner_knuckle_joint": -1.0,
+    "rg2_left_outer_knuckle_joint": -1.0,
+    "rg2_right_inner_finger_joint": -1.0,
+    "rg2_right_inner_knuckle_joint": 1.0,
 }
 
 
@@ -63,6 +77,13 @@ def main():
             f"missing={sorted(EXPECTED_MOVING_JOINTS-moving)}, "
             f"extra={sorted(moving-EXPECTED_MOVING_JOINTS)}"
         )
+
+    for name, multiplier in RG2_MIMIC_MULTIPLIERS.items():
+        mimic = joints[name].find("mimic")
+        if mimic is None or mimic.attrib.get("joint") != "rg2_finger_joint":
+            fail(f"invalid RG2 mimic source: {name}")
+        if float(mimic.attrib.get("multiplier", "nan")) != multiplier:
+            fail(f"invalid RG2 mimic multiplier: {name}")
 
     mount = joints.get("m0609_mount_joint")
     if mount is None:

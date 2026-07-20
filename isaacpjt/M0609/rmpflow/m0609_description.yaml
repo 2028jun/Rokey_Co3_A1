@@ -16,7 +16,7 @@ root_link: base_link
 
 default_q: [0.0, -1.5708, 1.5708, 0.0, 0.0, 0.0]
 
-acceleration_limits: [8.0, 8.0, 10.0, 12.0, 12.0, 12.0]
+acceleration_limits: [2.0, 2.0, 2.5, 3.0, 3.0, 3.0]
 jerk_limits: [4000.0, 4000.0, 5000.0, 6000.0, 6000.0, 6000.0]
 
 # No cspace_to_urdf_rules are needed because all generalized coordinates map

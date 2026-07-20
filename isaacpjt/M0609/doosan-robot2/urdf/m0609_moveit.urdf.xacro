@@ -252,17 +252,15 @@
 			<child link="tool0"/>
 		</joint>
 
-		<!-- Detailed OnRobot RG2 model. The fingers use the zero-angle pose for
-		     the current six-axis arm test; Isaac Sim retains the live gripper
-		     articulation. The fixed links keep RViz and MoveIt state complete. -->
+		<!-- Detailed OnRobot RG2 model. rg2_finger_joint is the actuated joint;
+		     the remaining linkage joints follow it through URDF mimic tags. -->
 		<material name="rg2_silver"><color rgba="0.68 0.69 0.68 1"/></material>
 		<material name="rg2_blue"><color rgba="0.216 0.592 0.812 1"/></material>
 
 		<xacro:macro name="rg2_mesh_link" params="name mesh visual_xyz:='0 0 0' color:='rg2_silver'">
 			<link name="${name}">
-				<!-- Fixed RG2 parts still become individual rigid bodies when
-				     Isaac's importer preserves fixed joints.  Give them finite
-				     mass properties to avoid negative-mass fallback and jitter. -->
+				<!-- Every imported RG2 link needs finite mass properties for a
+				     stable PhysX articulation. -->
 				<inertial>
 					<origin xyz="0 0 0" rpy="0 0 0"/>
 					<mass value="0.10"/>
@@ -310,35 +308,52 @@
 			<child link="rg2_base_link"/>
 			<origin xyz="-0.02705 0 0.04445" rpy="0.0101229097 0 0"/>
 		</joint>
-		<joint name="rg2_left_inner_knuckle_joint" type="fixed">
+		<joint name="rg2_left_inner_knuckle_joint" type="revolute">
 			<parent link="rg2_base_link"/>
 			<child link="rg2_left_inner_knuckle"/>
 			<origin xyz="0.03455 -0.009367 0.092397" rpy="0 0.415388362 0"/>
+			<axis xyz="0 0.999949 -0.010122"/>
+			<limit effort="50" lower="-1.19" upper="0.01" velocity="2"/>
+			<mimic joint="rg2_finger_joint" multiplier="-1" offset="0"/>
 		</joint>
-		<joint name="rg2_finger_joint" type="fixed">
+		<joint name="rg2_finger_joint" type="revolute">
 			<parent link="rg2_base_link"/>
 			<child link="rg2_right_outer_knuckle"/>
 			<origin xyz="0.01005 -0.009534 0.075898" rpy="0 -0.415388362 0"/>
+			<axis xyz="0 0.999949 -0.010122"/>
+			<limit effort="50" lower="0" upper="1.18" velocity="2"/>
 		</joint>
-		<joint name="rg2_left_outer_knuckle_joint" type="fixed">
+		<joint name="rg2_left_outer_knuckle_joint" type="revolute">
 			<parent link="rg2_base_link"/>
 			<child link="rg2_left_outer_knuckle"/>
 			<origin xyz="0.04405 -0.009534 0.075898" rpy="0 0.415388362 0"/>
+			<axis xyz="0 0.999949 -0.010122"/>
+			<limit effort="50" lower="-1.19" upper="0.01" velocity="2"/>
+			<mimic joint="rg2_finger_joint" multiplier="-1" offset="0"/>
 		</joint>
-		<joint name="rg2_left_inner_finger_joint" type="fixed">
+		<joint name="rg2_left_inner_finger_joint" type="revolute">
 			<parent link="rg2_left_outer_knuckle"/>
 			<child link="rg2_left_inner_finger"/>
 			<origin xyz="0.039748 0.004784 0.037968" rpy="0 -0.415388362 0"/>
+			<axis xyz="0 -0.999949 0.010122"/>
+			<limit effort="50" lower="-1.19" upper="0.01" velocity="2"/>
+			<mimic joint="rg2_finger_joint" multiplier="-1" offset="0"/>
 		</joint>
-		<joint name="rg2_right_inner_finger_joint" type="fixed">
+		<joint name="rg2_right_inner_finger_joint" type="revolute">
 			<parent link="rg2_right_outer_knuckle"/>
 			<child link="rg2_right_inner_finger"/>
 			<origin xyz="-0.039748 0.004784 0.037968" rpy="0 0.415388362 0"/>
+			<axis xyz="0 0.999949 -0.010122"/>
+			<limit effort="50" lower="-1.19" upper="0.01" velocity="2"/>
+			<mimic joint="rg2_finger_joint" multiplier="-1" offset="0"/>
 		</joint>
-		<joint name="rg2_right_inner_knuckle_joint" type="fixed">
+		<joint name="rg2_right_inner_knuckle_joint" type="revolute">
 			<parent link="rg2_base_link"/>
 			<child link="rg2_right_inner_knuckle"/>
 			<origin xyz="0.01955 -0.009367 0.092397" rpy="0 -0.415388362 0"/>
+			<axis xyz="0 0.999949 -0.010122"/>
+			<limit effort="50" lower="-0.01" upper="1.19" velocity="2"/>
+			<mimic joint="rg2_finger_joint" multiplier="1" offset="0"/>
 		</joint>
 		<link name="rg2_tcp"/>
 		<joint name="rg2_tcp_joint" type="fixed">

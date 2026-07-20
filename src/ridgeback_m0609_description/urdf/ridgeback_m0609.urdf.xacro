@@ -116,14 +116,26 @@
       <origin xyz="0 0 0.44"/>
       <geometry><box size="0.74 0.62 0.025"/></geometry>
     </collision>
+    <!-- Upper tray with a -X/+Y serving notch.  The rear panel and +X rail
+         remain, while the plate-side front edge is open for horizontal RG2
+         access. -->
     <visual>
-      <origin xyz="0 0 0.64"/>
-      <geometry><box size="0.74 0.62 0.025"/></geometry>
+      <origin xyz="0 -0.145 0.64"/>
+      <geometry><box size="0.74 0.33 0.025"/></geometry>
       <material name="shelf_tray"/>
     </visual>
     <collision>
-      <origin xyz="0 0 0.64"/>
-      <geometry><box size="0.74 0.62 0.025"/></geometry>
+      <origin xyz="0 -0.145 0.64"/>
+      <geometry><box size="0.74 0.33 0.025"/></geometry>
+    </collision>
+    <visual>
+      <origin xyz="0.21 0.165 0.64"/>
+      <geometry><box size="0.32 0.29 0.025"/></geometry>
+      <material name="shelf_tray"/>
+    </visual>
+    <collision>
+      <origin xyz="0.21 0.165 0.64"/>
+      <geometry><box size="0.32 0.29 0.025"/></geometry>
     </collision>
     <visual>
       <origin xyz="0 0 0.84"/>
