@@ -1,0 +1,6 @@
+Asset: Supreme Pizza
+Author: Jarlan Perez
+Source: https://poly.pizza/m/efHt8L0V77z
+License: Creative Commons Attribution (CC BY)
+
+The project copy is named supreme_pizza_jarlan_perez.glb.

@@ -18,7 +18,10 @@ _ros_bridge_lib = Path(
     "/home/rokey/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/"
     "exts/isaacsim.ros2.bridge/humble/lib"
 )
-if os.environ.get("MOBILE_DEMO_ROS_CAMERA", "1") == "1":
+if (
+    os.environ.get("MOBILE_DEMO_ROS_CAMERA", "1") == "1"
+    or os.environ.get("MOBILE_DEMO_ROS_LIDAR", "1") == "1"
+):
     os.environ.setdefault("ROS_DISTRO", "humble")
     os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
     os.environ.setdefault("ROS_DOMAIN_ID", "102")
@@ -49,6 +52,7 @@ import numpy as np
 import omni.kit.app
 import omni.kit.commands
 import omni.graph.core as og
+import omni.replicator.core as rep
 import omni.timeline
 import omni.usd
 import usdrt.Sdf
@@ -83,6 +87,8 @@ from pizza_serving import (
 _package_roots = [
     WORKSPACE / "install/m0609_isaac_description/share",
     WORKSPACE / "install/ridgeback_m0609_description/share",
+    WORKSPACE.parent / "install/m0609_isaac_description/share",
+    WORKSPACE.parent / "install/ridgeback_m0609_description/share",
 ]
 os.environ["ROS_PACKAGE_PATH"] = ":".join(
     [str(path) for path in _package_roots if path.is_dir()]
@@ -113,6 +119,14 @@ TABLE_CAMERA_PATH = (
     "/World/ServingRobot/Robot/ridgeback_base_link/ridgeback_base_link/"
     "fixed_table_depth_camera/realsense_d455/RSD455/Camera_Pseudo_Depth"
 )
+FRONT_LIDAR_TRANSLATION = Gf.Vec3d(0.40, 0.0, 0.33)
+FRONT_LIDAR_CONFIG = "RPLIDAR_S2E"
+FRONT_LIDAR_FRAME = "base_scan"
+FRONT_LIDAR_TOPIC = "/scan"
+
+# Keep Replicator objects alive for the complete simulation lifetime.
+_front_lidar_render_product = None
+_front_lidar_writer = None
 ARM_JOINTS = [f"joint_{index}" for index in range(1, 7)]
 WHEEL_JOINTS = [
     "front_left_wheel_joint",
@@ -233,6 +247,8 @@ async def _convert_food_asset(source, destination):
 
 def prepare_antigravity_food_assets():
     """Validate the retained Supreme pizza asset."""
+    if not PICK_PLACE_ENABLED:
+        return
     if not SUPREME_PIZZA_GLB.is_file():
         raise FileNotFoundError(SUPREME_PIZZA_GLB)
 
@@ -586,6 +602,83 @@ def connect_table_camera_ros2(stage):
     )
 
 
+def attach_front_rplidar_ros2(stage):
+    """Mount a Slamtec RPLIDAR S2E and publish LaserScan plus its TF."""
+    global _front_lidar_render_product, _front_lidar_writer
+
+    if os.environ.get("MOBILE_DEMO_ROS_LIDAR", "1") != "1":
+        print("[front lidar] disabled by MOBILE_DEMO_ROS_LIDAR=0", flush=True)
+        return
+
+    manager = omni.kit.app.get_app().get_extension_manager()
+    manager.set_extension_enabled_immediate("isaacsim.sensors.rtx", True)
+    manager.set_extension_enabled_immediate("isaacsim.ros2.bridge", True)
+    for _ in range(3):
+        simulation_app.update()
+
+    base_path = Sdf.Path(
+        "/World/ServingRobot/Robot/ridgeback_base_link/ridgeback_base_link"
+    )
+    base_prim = stage.GetPrimAtPath(base_path)
+    if not base_prim.IsValid() or not base_prim.HasAPI(UsdPhysics.RigidBodyAPI):
+        raise RuntimeError(f"mobile-base rigid body is missing: {base_path}")
+    mount_path = base_prim.GetPath().AppendChild(FRONT_LIDAR_FRAME)
+    mount = UsdGeom.Xform.Define(stage, mount_path)
+    mount.AddTranslateOp().Set(FRONT_LIDAR_TRANSLATION)
+
+    status, lidar_prim = omni.kit.commands.execute(
+        "IsaacSensorCreateRtxLidar",
+        path="/RPLIDAR_S2E",
+        parent=str(mount_path),
+        config=FRONT_LIDAR_CONFIG,
+        translation=Gf.Vec3d(0.0, 0.0, 0.0),
+        orientation=Gf.Quatd(1.0, 0.0, 0.0, 0.0),
+        visibility=True,
+    )
+    if not status or lidar_prim is None or not lidar_prim.IsValid():
+        raise RuntimeError("failed to create front RPLIDAR S2E")
+
+    _front_lidar_render_product = rep.create.render_product(
+        lidar_prim.GetPath(), [1, 1], name="FrontRPLidar"
+    )
+    _front_lidar_writer = rep.writers.get("RtxLidarROS2PublishLaserScan")
+    _front_lidar_writer.initialize(
+        topicName=FRONT_LIDAR_TOPIC,
+        frameId=FRONT_LIDAR_FRAME,
+    )
+    _front_lidar_writer.attach([_front_lidar_render_product])
+
+    keys = og.Controller.Keys
+    og.Controller.edit(
+        {
+            "graph_path": "/World/ServingRobot/FrontLidarTF",
+            "evaluator_name": "execution",
+        },
+        {
+            keys.CREATE_NODES: [
+                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
+                ("PublishTF", "isaacsim.ros2.bridge.ROS2PublishTransformTree"),
+            ],
+            keys.SET_VALUES: [
+                ("PublishTF.inputs:parentPrim", [usdrt.Sdf.Path(str(base_prim.GetPath()))]),
+                ("PublishTF.inputs:targetPrims", [usdrt.Sdf.Path(str(mount_path))]),
+                ("PublishTF.inputs:staticPublisher", True),
+            ],
+            keys.CONNECT: [
+                ("OnPlaybackTick.outputs:tick", "PublishTF.inputs:execIn"),
+                ("ReadSimTime.outputs:simulationTime", "PublishTF.inputs:timeStamp"),
+            ],
+        },
+    )
+    print(
+        "[front lidar] model=SLAMTEC RPLIDAR S2E "
+        f"parent={base_prim.GetPath()} xyz=(0.40, 0.00, 0.33)m "
+        f"topic={FRONT_LIDAR_TOPIC} frame={FRONT_LIDAR_FRAME}",
+        flush=True,
+    )
+
+
 def open_table_camera_preview():
     if HEADLESS:
         return
@@ -923,6 +1016,7 @@ def main():
     attach_m0609_visuals(stage)
     attach_fixed_table_depth_camera(stage)
     connect_table_camera_ros2(stage)
+    attach_front_rplidar_ros2(stage)
     pick_place = TrayPizzaPickPlace(stage) if PICK_PLACE_ENABLED else None
     if pick_place is None:
         print(
