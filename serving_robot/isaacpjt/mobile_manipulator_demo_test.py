@@ -113,8 +113,11 @@ RESTAURANT_USD = (
     / "assets/lightweight_restaurant/lightweight_pizza_restaurant.usda"
 )
 
-# Dock the robot's -X face 8 cm from TableSet_00's clear right short edge.
+# Keep the robot on the corridor side of TableSet_00. Rotating the complete
+# base by 180 degrees makes local +X/Nav2-forward, the lidar, and the
+# front-mounted arm face the table without moving the robot to the window side.
 SPAWN_POSITION = Gf.Vec3d(-1.82, -2.20, 0.002)
+SPAWN_YAW_DEG = 180.0
 TABLE_CAMERA_PATH = (
     "/World/ServingRobot/Robot/ridgeback_base_link/ridgeback_base_link/"
     "fixed_table_depth_camera/realsense_d455/RSD455/Camera_Pseudo_Depth"
@@ -134,11 +137,10 @@ WHEEL_JOINTS = [
     "rear_left_wheel_joint",
     "rear_right_wheel_joint",
 ]
-# URDF-IK solution for the first high top-down waypoint.  link_6 starts near
-# arm-frame [0.5425, 0.0, 0.5147] with the wrist already pointing down.  J1 no
-# longer swings the arm sideways across the pizza, while J2/J3 use the compact
-# elbow-up branch and keep the shoulder links above the top deck.
-STOW_CONFIGURATION = [-0.0115, 1.1305, -0.6484, 0.0009, 2.6594, 3.1307]
+# Mirrored URDF-IK seed for the first high top-down waypoint.  J1 starts near
+# +pi so the front-mounted arm reaches the pizza stored behind it; J2-J6 retain
+# the proven compact elbow-up geometry.
+STOW_CONFIGURATION = [3.1301, 1.1305, -0.6484, 0.0009, 2.6594, 3.1307]
 ARM_DRIVE_STIFFNESS = float(os.environ.get("MOBILE_ARM_STIFFNESS", "200000"))
 ARM_DRIVE_DAMPING = float(os.environ.get("MOBILE_ARM_DAMPING", "20000"))
 ARM_DRIVE_MAX_FORCE = float(os.environ.get("MOBILE_ARM_MAX_FORCE", "10000"))
@@ -309,6 +311,7 @@ def open_restaurant_and_reference_robot():
     stage = context.get_stage()
     spawn = UsdGeom.Xform.Define(stage, "/World/ServingRobot")
     spawn.AddTranslateOp().Set(SPAWN_POSITION)
+    spawn.AddRotateZOp().Set(SPAWN_YAW_DEG)
     robot = UsdGeom.Xform.Define(stage, "/World/ServingRobot/Robot")
     # Isaac's URDF importer does not author a defaultPrim on this layered USD,
     # so reference its known robot root explicitly.
@@ -425,13 +428,13 @@ def attach_fixed_table_depth_camera(stage):
     assembly_path = base_path.AppendChild("fixed_table_depth_camera")
     UsdGeom.Xform.Define(stage, assembly_path)
 
-    # Tall mast on the +X/right side, opposite the -X table docking face.  This
+    # Tall mast on the -X side, opposite the +X table docking face.  This
     # lets the camera look over the arm instead of through it.
     mast = UsdGeom.Cylinder.Define(stage, assembly_path.AppendChild("mast"))
     mast.CreateRadiusAttr(0.018)
     mast.CreateHeightAttr(0.935)
     mast.CreateAxisAttr(UsdGeom.Tokens.z)
-    mast.AddTranslateOp().Set(Gf.Vec3f(0.25, -0.285, 1.3225))
+    mast.AddTranslateOp().Set(Gf.Vec3f(-0.25, -0.285, 1.3225))
     mast.CreateDisplayColorAttr([Gf.Vec3f(0.12, 0.15, 0.18)])
     UsdPhysics.CollisionAPI.Apply(mast.GetPrim())
 
@@ -440,15 +443,15 @@ def attach_fixed_table_depth_camera(stage):
     boom.CreateRadiusAttr(0.018)
     boom.CreateHeightAttr(0.215)
     boom.CreateAxisAttr(UsdGeom.Tokens.z)
-    boom.AddTranslateOp().Set(Gf.Vec3f(0.25, -0.3925, 1.79))
+    boom.AddTranslateOp().Set(Gf.Vec3f(-0.25, -0.3925, 1.79))
     boom.AddRotateXOp().Set(90.0)
     boom.CreateDisplayColorAttr([Gf.Vec3f(0.12, 0.15, 0.18)])
     UsdPhysics.CollisionAPI.Apply(boom.GetPrim())
 
-    # The table docks on the arm side (-X).  Aim over the arm at the center of
+    # The table docks on the arm side (+X).  Aim over the arm at the center of
     # a 0.74 m-high table while retaining a useful top-down view of hands.
-    camera_position = Gf.Vec3d(0.25, -0.50, 1.85)
-    table_target = Gf.Vec3d(-1.00, -0.15, 0.74)
+    camera_position = Gf.Vec3d(-0.25, -0.50, 1.85)
+    table_target = Gf.Vec3d(1.00, -0.15, 0.74)
     desired_camera_to_base = Gf.Matrix4d().SetLookAt(
         camera_position, table_target, Gf.Vec3d(0.0, 0.0, 1.0)
     ).GetInverse()
@@ -515,7 +518,7 @@ def attach_fixed_table_depth_camera(stage):
     depth_camera.CreateClippingRangeAttr(Gf.Vec2f(0.15, 4.0))
     print(
         "[mobile robot] fixed table depth camera height=1.85m "
-        "target=(-1.00, -0.15, 0.74) docking=-X",
+        "target=(1.00, -0.15, 0.74) docking=+X",
         flush=True,
     )
 

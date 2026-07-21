@@ -67,23 +67,28 @@ M0609_RMPFLOW_CONFIG = RMPFLOW_DIR / "m0609_rmpflow_common.yaml"
 # on the open top deck, away from the internal tray reserved for cans and small
 # personal plates.  The board now rests directly on the top deck; the old
 # 8 cm support block is removed so it cannot snag during a vertical lift.
-TOP_DECK_DISH_LOCAL = np.array([0.38, 0.0, -0.030])
-# The notched upper tray consists of a rear panel and a +X side rail.  Values
-# are relative to the arm base and match the two boxes authored in the URDF.
+TOP_DECK_DISH_LOCAL = np.array([-0.38, 0.0, -0.030])
+# The front-mounted arm and asymmetric tray are the X-mirror of the proven
+# rear-arm layout. Values remain relative to the M0609 base.
 UPPER_TRAY_COLLIDERS = (
-    (np.array([0.22, -0.145, -0.255]), np.array([0.74, 0.33, 0.025])),
-    (np.array([0.43, 0.165, -0.255]), np.array([0.32, 0.29, 0.025])),
+    (np.array([-0.22, -0.145, -0.255]), np.array([0.74, 0.33, 0.025])),
+    (np.array([-0.43, 0.165, -0.255]), np.array([0.32, 0.29, 0.025])),
 )
-# Reachable centreline target on the destination tabletop.  At local X=-0.55
+# Reachable centreline target on the destination tabletop.  At local X=+0.55
 # the 39 cm board remains fully inside the table edge while the arm can first
 # translate there at its lifted height, then descend vertically.  The former
 # 8 cm support block is gone, so place directly on the table collider.
-TABLE_DISH_LOCAL = np.array([-0.55, 0.0, -0.14568])
+TABLE_DISH_LOCAL = np.array([0.55, 0.0, -0.14568])
 # RG2-specific wooden pizza board.  A rigid U-shaped bail carries the board
 # from both ±Y edges so its centre of mass hangs below the grasp point.
 BOARD_RADIUS = 0.195
 BOARD_THICKNESS = 0.018
 BOARD_BAIL_X = 0.0
+# The loose board is authored in world axes at the initial dock. With the
+# chassis yawed 180 degrees, its visible folded bail still matches the proven
+# world +X geometry while it lies toward arm-local -X.
+BOARD_BAIL_FOLD_X_SIGN = 1.0
+BOARD_BAIL_FOLD_ARM_X_SIGN = -1.0
 BOARD_BAIL_HALF_SPAN = 0.165
 BOARD_BAIL_HEIGHT = 0.165
 BOARD_BAIL_MIN_ANGLE_DEG = 10.0
@@ -124,6 +129,7 @@ INITIAL_TRANSITION_STEPS = 240
 # arc targets prevent the handle from being impulsively flung past RG2.
 BAIL_ARC_STEPS = 240
 J1_HALF_TURN_STEPS = 600
+J1_DELIVERY_TURN = -np.pi
 PLACEMENT_DESCENT_STEPS = 360
 RG2_TCP_LENGTH = 0.231066
 # Keep local X (finger separation) upward and point the assembled RG2 forward
@@ -135,6 +141,8 @@ HORIZONTAL_EE_ORIENTATION = np.array(
 # Rotate 180 degrees about world X: the assembled RG2 nose points down while
 # its local X finger-separation axis remains aligned with world X, suitable
 # for pinching the world-Y bail crossbar from directly above.
+# The chassis yaw and mirrored J1 seed cancel each other, reproducing the
+# proven world-space downward RG2 pose used before the front-arm conversion.
 VERTICAL_EE_ORIENTATION = np.array([0.0, 1.0, 0.0, 0.0], dtype=float)
 
 
@@ -230,7 +238,7 @@ def author_wooden_pizza_board(
     # Physical 10-degree rest stops.  The two pads sit below the folded
     # crossbar near the rim, keeping a real gripper-access gap even if the
     # revolute solver starts exactly on its angular limit.
-    stop_x = BOARD_BAIL_X + BOARD_BAIL_HEIGHT * np.cos(
+    stop_x = BOARD_BAIL_X + BOARD_BAIL_FOLD_X_SIGN * BOARD_BAIL_HEIGHT * np.cos(
         np.deg2rad(BOARD_BAIL_MIN_ANGLE_DEG)
     )
     stop_z = 0.5 * BOARD_THICKNESS + 0.5 * BOARD_BAIL_STOP_SIZE[2]
@@ -258,8 +266,9 @@ def author_wooden_pizza_board(
         stop_physx.CreateRestOffsetAttr(0.0)
 
     # One Y-axis revolute joint represents the two coaxial physical pivots.
-    # The separate rigid bail starts folded toward board +X and rotates upward
-    # as RG2 follows the crossbar's circular path.
+    # At this dock the separate rigid bail starts toward world +X, equivalent
+    # to arm-local -X after the chassis' 180-degree yaw, and rotates upward as
+    # RG2 follows the crossbar's circular path.
     bail_path = "/World/PizzaBoardBail"
     bail_root = UsdGeom.Xform.Define(stage, bail_path)
     bail_pivot_world = np.asarray(board_world_position, dtype=float) + np.array(
@@ -339,11 +348,15 @@ def author_wooden_pizza_board(
         sphere.CreateDisplayColorAttr([Gf.Vec3f(0.12, 0.14, 0.16)])
         configure_bail_collider(sphere.GetPrim())
 
-    # Folded pose is explicitly 10 degrees above +X.  Overlapping spheres form
-    # each slender arm without requiring an orientation transform.
+    # Folded pose is explicitly 10 degrees above world +X (arm-local -X).
+    # Overlapping spheres form each slender arm without an orientation transform.
     folded_angle = np.deg2rad(BOARD_BAIL_MIN_ANGLE_DEG)
     folded_direction = np.array(
-        [np.cos(folded_angle), 0.0, np.sin(folded_angle)]
+        [
+            BOARD_BAIL_FOLD_X_SIGN * np.cos(folded_angle),
+            0.0,
+            np.sin(folded_angle),
+        ]
     )
     for side, sign in (("MinusY", -1.0), ("PlusY", 1.0)):
         for index, distance in enumerate(
@@ -559,6 +572,12 @@ class TrayPizzaPickPlace:
         # placement and gripper approach are intentionally independent.
         self._handle_world = np.array([0.0, 1.0, 0.0])
         self._up_world = np.array([0.0, 0.0, 1.0])
+        self._base_forward_world = self.local_vector_to_world(
+            np.array([1.0, 0.0, 0.0])
+        )
+        self._bail_fold_world = self.local_vector_to_world(
+            np.array([BOARD_BAIL_FOLD_ARM_X_SIGN, 0.0, 0.0])
+        )
         self._controller = None
         self._gripper = None
         self._gripper_joint_index = None
@@ -725,9 +744,8 @@ class TrayPizzaPickPlace:
             ]
         )
         arm_vector = np.asarray(crossbar_board, dtype=float) - hinge_board
-        return float(
-            np.degrees(np.arctan2(arm_vector[2], arm_vector[0]))
-        )
+        folded_axis_distance = BOARD_BAIL_FOLD_X_SIGN * arm_vector[0]
+        return float(np.degrees(np.arctan2(arm_vector[2], folded_axis_distance)))
 
     def _command_gripper(self, articulation, target):
         """Drive the one independent RG2 mimic joint to an absolute target."""
@@ -781,7 +799,7 @@ class TrayPizzaPickPlace:
                     current[self._arm_joint_indices], dtype=float
                 ).copy()
                 self._j1_turn_target = self._j1_turn_start.copy()
-                self._j1_turn_target[0] += np.pi
+                self._j1_turn_target[0] += J1_DELIVERY_TURN
                 print(
                     "[serving-bail] lift verified; "
                     f"board_lift={board_lift:.4f}m, starting J1 half-turn",
@@ -803,16 +821,21 @@ class TrayPizzaPickPlace:
                 self._end_effector
             )
             actual_tcp = wrist_position - self._up_world * RG2_TCP_LENGTH
-            # At the lifted pose, translate only toward world -X.  Keep the
-            # measured Y/Z so phase 8 introduces neither lateral nor vertical
-            # motion.  Phase 9 performs the complete vertical descent.
-            delivery_above = actual_tcp.copy()
-            delivery_above[0] = self._targets[8][0]
+            # Translate only along base +X toward the table. Keep the measured
+            # lateral/Z coordinates; phase 9 performs the vertical descent.
+            requested_above = self._targets[8]
+            forward_delta = float(
+                np.dot(requested_above - actual_tcp, self._base_forward_world)
+            )
+            delivery_above = (
+                actual_tcp + self._base_forward_world * forward_delta
+            )
             self._targets[8] = delivery_above
             self._targets[11] = delivery_above.copy()
             print(
                 "[serving-bail] delivery wrist orientation locked after J1 turn; "
-                f"translating only world-X to {delivery_above[0]:.4f}m",
+                "translating only base +X to "
+                f"{np.round(delivery_above, 4)}",
                 flush=True,
             )
         elif phase == 10:
@@ -886,7 +909,7 @@ class TrayPizzaPickPlace:
 
         pick_center = self._dish.get_world_pose()[0]
         self._pick_start_position = np.asarray(pick_center, dtype=float).copy()
-        world_x = -self._approach_world
+        world_x = self._bail_fold_world
         hinge = (
             pick_center
             + world_x * BOARD_BAIL_X

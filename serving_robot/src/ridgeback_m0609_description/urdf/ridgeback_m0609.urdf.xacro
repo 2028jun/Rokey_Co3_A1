@@ -104,8 +104,9 @@
   <xacro:ridgeback_wheel prefix="rear_left"   x="${-wheel_x}" y="${ wheel_y}"/>
   <xacro:ridgeback_wheel prefix="rear_right"  x="${-wheel_x}" y="${-wheel_y}"/>
 
-  <!-- Fixed stainless shelf.  Two food trays are below the arm plate, and the
-       arm is offset rearward so it can reach both trays and the table. -->
+  <!-- Fixed stainless shelf.  The arm is offset toward base +X so Nav2 can
+       approach a service table forwards; the asymmetric tray details are
+       mirrored so the pizza remains behind the arm during transport. -->
   <link name="serving_shelf_link">
     <visual>
       <origin xyz="0 0 0.44"/>
@@ -116,9 +117,8 @@
       <origin xyz="0 0 0.44"/>
       <geometry><box size="0.74 0.62 0.025"/></geometry>
     </collision>
-    <!-- Upper tray with a -X/+Y serving notch.  The rear panel and +X rail
-         remain, while the plate-side front edge is open for horizontal RG2
-         access. -->
+    <!-- Mirrored upper tray: retain the +X-facing service layout while the
+         plate-side -X edge remains open for RG2 access from the front arm. -->
     <visual>
       <origin xyz="0 -0.145 0.64"/>
       <geometry><box size="0.74 0.33 0.025"/></geometry>
@@ -129,12 +129,12 @@
       <geometry><box size="0.74 0.33 0.025"/></geometry>
     </collision>
     <visual>
-      <origin xyz="0.21 0.165 0.64"/>
+      <origin xyz="-0.21 0.165 0.64"/>
       <geometry><box size="0.32 0.29 0.025"/></geometry>
       <material name="shelf_tray"/>
     </visual>
     <collision>
-      <origin xyz="0.21 0.165 0.64"/>
+      <origin xyz="-0.21 0.165 0.64"/>
       <geometry><box size="0.32 0.29 0.025"/></geometry>
     </collision>
     <visual>
@@ -164,16 +164,16 @@
     <xacro:shelf_post x="-0.34" y="-0.28"/>
 
     <visual>
-      <origin xyz="-0.355 0 0.56"/>
+      <origin xyz="0.355 0 0.56"/>
       <geometry><box size="0.025 0.58 0.54"/></geometry>
       <material name="shelf_steel"/>
     </visual>
     <collision>
-      <origin xyz="-0.355 0 0.56"/>
+      <origin xyz="0.355 0 0.56"/>
       <geometry><box size="0.025 0.58 0.54"/></geometry>
     </collision>
     <inertial>
-      <origin xyz="-0.03 0 0.57"/>
+      <origin xyz="0.03 0 0.57"/>
       <mass value="20.0"/>
       <inertia ixx="1.20" ixy="0" ixz="0" iyy="1.25" iyz="0" izz="1.50"/>
     </inertial>
@@ -198,7 +198,7 @@
   <joint name="arm_mount_joint" type="fixed">
     <parent link="serving_shelf_link"/>
     <child link="arm_mount_link"/>
-    <origin xyz="-0.22 0 0.875"/>
+    <origin xyz="0.22 0 0.875"/>
   </joint>
 
   <joint name="m0609_mount_joint" type="fixed">

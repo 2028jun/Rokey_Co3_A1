@@ -21,7 +21,7 @@ _ros_bridge_lib = Path(
 if os.environ.get("MOBILE_DEMO_ROS_CAMERA", "1") == "1":
     os.environ.setdefault("ROS_DISTRO", "humble")
     os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
-    os.environ.setdefault("ROS_DOMAIN_ID", "101")
+    os.environ.setdefault("ROS_DOMAIN_ID", "102")
     _ld_paths = [path for path in os.environ.get("LD_LIBRARY_PATH", "").split(":") if path]
     _python_paths = [
         path
@@ -58,12 +58,16 @@ from isaacsim.core.utils.types import ArticulationAction
 from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics
 
 
-WORKSPACE = Path("/home/rokey/cobot3_ws")
+WORKSPACE = Path(
+    os.environ.get("COBOT3_WS", Path(__file__).resolve().parents[1])
+).resolve()
 # Isaac's URDF importer resolves package:// URLs through ROS_PACKAGE_PATH,
 # while a sourced ROS 2/ament workspace does not populate that ROS 1 variable.
 _package_roots = [
     WORKSPACE / "install/m0609_isaac_description/share",
     WORKSPACE / "install/ridgeback_m0609_description/share",
+    WORKSPACE.parent / "install/m0609_isaac_description/share",
+    WORKSPACE.parent / "install/ridgeback_m0609_description/share",
 ]
 os.environ["ROS_PACKAGE_PATH"] = ":".join(
     [str(path) for path in _package_roots if path.is_dir()]
@@ -88,8 +92,10 @@ RESTAURANT_USD = (
     / "assets/lightweight_restaurant/lightweight_pizza_restaurant.usda"
 )
 
-# Dock the robot's -X face 8 cm from TableSet_00's clear right short edge.
+# Keep the robot on the corridor side and rotate it so local +X/Nav2-forward
+# and the front-mounted arm face TableSet_00.
 SPAWN_POSITION = Gf.Vec3d(-1.82, -2.20, 0.002)
+SPAWN_YAW_DEG = 180.0
 TABLE_CAMERA_PATH = (
     "/World/ServingRobot/Robot/ridgeback_base_link/ridgeback_base_link/"
     "fixed_table_depth_camera/realsense_d455/RSD455/Camera_Pseudo_Depth"
@@ -164,6 +170,7 @@ def open_restaurant_and_reference_robot():
     stage = context.get_stage()
     spawn = UsdGeom.Xform.Define(stage, "/World/ServingRobot")
     spawn.AddTranslateOp().Set(SPAWN_POSITION)
+    spawn.AddRotateZOp().Set(SPAWN_YAW_DEG)
     robot = UsdGeom.Xform.Define(stage, "/World/ServingRobot/Robot")
     # Isaac's URDF importer does not author a defaultPrim on this layered USD,
     # so reference its known robot root explicitly.
@@ -280,13 +287,13 @@ def attach_fixed_table_depth_camera(stage):
     assembly_path = base_path.AppendChild("fixed_table_depth_camera")
     UsdGeom.Xform.Define(stage, assembly_path)
 
-    # Tall mast on the +X/right side, opposite the -X table docking face.  This
+    # Tall mast on the -X side, opposite the +X table docking face.  This
     # lets the camera look over the arm instead of through it.
     mast = UsdGeom.Cylinder.Define(stage, assembly_path.AppendChild("mast"))
     mast.CreateRadiusAttr(0.018)
     mast.CreateHeightAttr(0.935)
     mast.CreateAxisAttr(UsdGeom.Tokens.z)
-    mast.AddTranslateOp().Set(Gf.Vec3f(0.25, -0.285, 1.3225))
+    mast.AddTranslateOp().Set(Gf.Vec3f(-0.25, -0.285, 1.3225))
     mast.CreateDisplayColorAttr([Gf.Vec3f(0.12, 0.15, 0.18)])
     UsdPhysics.CollisionAPI.Apply(mast.GetPrim())
 
@@ -295,15 +302,15 @@ def attach_fixed_table_depth_camera(stage):
     boom.CreateRadiusAttr(0.018)
     boom.CreateHeightAttr(0.215)
     boom.CreateAxisAttr(UsdGeom.Tokens.z)
-    boom.AddTranslateOp().Set(Gf.Vec3f(0.25, -0.3925, 1.79))
+    boom.AddTranslateOp().Set(Gf.Vec3f(-0.25, -0.3925, 1.79))
     boom.AddRotateXOp().Set(90.0)
     boom.CreateDisplayColorAttr([Gf.Vec3f(0.12, 0.15, 0.18)])
     UsdPhysics.CollisionAPI.Apply(boom.GetPrim())
 
-    # The table docks on the arm side (-X).  Aim over the arm at the center of
+    # The table docks on the arm side (+X).  Aim over the arm at the center of
     # a 0.74 m-high table while retaining a useful top-down view of hands.
-    camera_position = Gf.Vec3d(0.25, -0.50, 1.85)
-    table_target = Gf.Vec3d(-1.00, -0.15, 0.74)
+    camera_position = Gf.Vec3d(-0.25, -0.50, 1.85)
+    table_target = Gf.Vec3d(1.00, -0.15, 0.74)
     desired_camera_to_base = Gf.Matrix4d().SetLookAt(
         camera_position, table_target, Gf.Vec3d(0.0, 0.0, 1.0)
     ).GetInverse()
@@ -370,7 +377,7 @@ def attach_fixed_table_depth_camera(stage):
     depth_camera.CreateClippingRangeAttr(Gf.Vec2f(0.15, 4.0))
     print(
         "[mobile robot] fixed table depth camera height=1.85m "
-        "target=(-1.00, -0.15, 0.74) docking=-X",
+        "target=(1.00, -0.15, 0.74) docking=+X",
         flush=True,
     )
 
@@ -496,7 +503,7 @@ def add_parking_brake(stage, articulation_path):
     )
     joint.CreateBody1Rel().SetTargets([Sdf.Path(articulation_path)])
     joint.CreateLocalPos0Attr().Set(SPAWN_POSITION)
-    joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    joint.CreateLocalRot0Attr().Set(Gf.Quatf(0.0, 0.0, 0.0, 1.0))
     joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
     joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
     print("[mobile robot] parking brake=on (fixed base)", flush=True)
