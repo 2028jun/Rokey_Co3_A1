@@ -107,12 +107,19 @@ WHEEL_JOINTS = [
     "rear_left_wheel_joint",
     "rear_right_wheel_joint",
 ]
+SLIDING_TRAY_JOINTS = [
+    "upper_tray_left_slide_joint",
+    "upper_tray_right_slide_joint",
+]
 STOW_CONFIGURATION = [0.0, 0.0, 1.57, 0.0, 1.57, 0.0]
 ARM_DRIVE_STIFFNESS = float(os.environ.get("MOBILE_ARM_STIFFNESS", "200000"))
 ARM_DRIVE_DAMPING = float(os.environ.get("MOBILE_ARM_DAMPING", "20000"))
 ARM_DRIVE_MAX_FORCE = float(os.environ.get("MOBILE_ARM_MAX_FORCE", "10000"))
 WHEEL_DRIVE_DAMPING = float(os.environ.get("MOBILE_WHEEL_DAMPING", "1500"))
 WHEEL_DRIVE_MAX_FORCE = float(os.environ.get("MOBILE_WHEEL_MAX_FORCE", "2000"))
+TRAY_DRIVE_STIFFNESS = float(os.environ.get("MOBILE_TRAY_STIFFNESS", "4000"))
+TRAY_DRIVE_DAMPING = float(os.environ.get("MOBILE_TRAY_DAMPING", "500"))
+TRAY_DRIVE_MAX_FORCE = float(os.environ.get("MOBILE_TRAY_MAX_FORCE", "400"))
 PARKED_HOLD = os.environ.get("MOBILE_DEMO_PARKED_HOLD", "1") == "1"
 
 
@@ -384,6 +391,9 @@ def attach_fixed_table_depth_camera(stage):
 
 def connect_table_camera_ros2(stage):
     """Publish the fixed camera's RGB, depth, and calibration on ROS 2."""
+    if os.environ.get("MOBILE_DEMO_ROS_CAMERA", "1") != "1":
+        print("[table camera ROS2] disabled by MOBILE_DEMO_ROS_CAMERA=0", flush=True)
+        return
     if not stage.GetPrimAtPath(TABLE_CAMERA_PATH).IsValid():
         raise RuntimeError(f"table camera is missing: {TABLE_CAMERA_PATH}")
 
@@ -546,6 +556,7 @@ def configure_physics_stability(stage, articulation_path):
 def configure_joint_drives(stage):
     configured_arm = []
     configured_wheels = []
+    configured_trays = []
     for prim in stage.Traverse():
         name = prim.GetName()
         if name in ARM_JOINTS:
@@ -571,11 +582,20 @@ def configure_joint_drives(stage):
                 "isaacmecanumwheel:angle", Sdf.ValueTypeNames.Float
             ).Set(angle)
             configured_wheels.append(name)
+        elif name in SLIDING_TRAY_JOINTS:
+            drive = UsdPhysics.DriveAPI.Apply(prim, "linear")
+            drive.CreateStiffnessAttr(TRAY_DRIVE_STIFFNESS)
+            drive.CreateDampingAttr(TRAY_DRIVE_DAMPING)
+            drive.CreateMaxForceAttr(TRAY_DRIVE_MAX_FORCE)
+            drive.CreateTargetPositionAttr(0.0)
+            configured_trays.append(name)
 
     if set(configured_arm) != set(ARM_JOINTS):
         raise RuntimeError(f"arm drive setup incomplete: {configured_arm}")
     if set(configured_wheels) != set(WHEEL_JOINTS):
         raise RuntimeError(f"wheel drive setup incomplete: {configured_wheels}")
+    if set(configured_trays) != set(SLIDING_TRAY_JOINTS):
+        raise RuntimeError(f"sliding tray drive setup incomplete: {configured_trays}")
 
 
 def initialize_robot(articulation_path):
@@ -601,7 +621,7 @@ def initialize_robot(articulation_path):
     articulation.set_sleep_threshold(0.5)
 
     dof_names = list(articulation.dof_names)
-    expected = set(ARM_JOINTS + WHEEL_JOINTS)
+    expected = set(ARM_JOINTS + WHEEL_JOINTS + SLIDING_TRAY_JOINTS)
     missing = expected - set(dof_names)
     if missing:
         raise RuntimeError(f"missing articulation DOFs: {sorted(missing)}")
@@ -610,6 +630,8 @@ def initialize_robot(articulation_path):
     for name, value in zip(ARM_JOINTS, STOW_CONFIGURATION):
         positions[dof_names.index(name)] = value
     for name in WHEEL_JOINTS:
+        positions[dof_names.index(name)] = 0.0
+    for name in SLIDING_TRAY_JOINTS:
         positions[dof_names.index(name)] = 0.0
     articulation.set_joint_positions(positions)
     articulation.set_joint_velocities(np.zeros(len(dof_names), dtype=float))

@@ -81,6 +81,28 @@ from pizza_serving import (
     PICK_PLACE_ENABLED,
     TrayPizzaPickPlace,
 )
+from drink_serving import spawn_soda_cans
+from cutlery_serving import spawn_cutlery_box
+from cutlery_pick_place import CutleryBoxPickPlace
+from soda1_delivery import Soda1PickPlace
+from soda2_delivery import Soda2PickPlace
+from delivery_sequence import (
+    PizzaThenSodaTask,
+    PizzaSoda1Soda2Task,
+    PizzaSoda1Soda2CutleryTask,
+)
+
+SERVING_TASK = os.environ.get("MOBILE_DEMO_TASK", "pizza").strip().lower()
+if SERVING_TASK not in {
+    "pizza", "soda", "soda1", "soda2", "pizza_soda",
+    "pizza_soda1_soda2", "pizza_soda1_soda2_cutlery", "cutlery", "none"
+}:
+    raise ValueError(
+        "MOBILE_DEMO_TASK must be one of: pizza, soda, soda1, soda2, "
+        "pizza_soda, pizza_soda1_soda2, "
+        "pizza_soda1_soda2_cutlery, cutlery, none; "
+        f"got {SERVING_TASK!r}"
+    )
 
 # Isaac's URDF importer resolves package:// URLs through ROS_PACKAGE_PATH,
 # while a sourced ROS 2/ament workspace does not populate that ROS 1 variable.
@@ -137,15 +159,28 @@ WHEEL_JOINTS = [
     "rear_left_wheel_joint",
     "rear_right_wheel_joint",
 ]
+SLIDING_TRAY_JOINTS = [
+    "upper_tray_left_slide_joint",
+    "upper_tray_right_slide_joint",
+]
 # Mirrored URDF-IK seed for the first high top-down waypoint.  J1 starts near
 # +pi so the front-mounted arm reaches the pizza stored behind it; J2-J6 retain
 # the proven compact elbow-up geometry.
-STOW_CONFIGURATION = [3.1301, 1.1305, -0.6484, 0.0009, 2.6594, 3.1307]
+# Shared high-clearance ready pose for both pizza and soda tasks.  Lula IK
+# checks show this seed converges to the proven pizza-safe solution and to the
+# soda elbow-up solution, whereas the former pizza-specific stow
+# [179, +65, -37, 0, +152, 179] trapped soda pickup in an elbow-down branch.
+STOW_CONFIGURATION = list(
+    np.deg2rad([90.0, 0.0, -90.0, 0.0, -60.0, 90.0])
+)
 ARM_DRIVE_STIFFNESS = float(os.environ.get("MOBILE_ARM_STIFFNESS", "200000"))
 ARM_DRIVE_DAMPING = float(os.environ.get("MOBILE_ARM_DAMPING", "20000"))
 ARM_DRIVE_MAX_FORCE = float(os.environ.get("MOBILE_ARM_MAX_FORCE", "10000"))
 WHEEL_DRIVE_DAMPING = float(os.environ.get("MOBILE_WHEEL_DAMPING", "1500"))
 WHEEL_DRIVE_MAX_FORCE = float(os.environ.get("MOBILE_WHEEL_MAX_FORCE", "2000"))
+TRAY_DRIVE_STIFFNESS = float(os.environ.get("MOBILE_TRAY_STIFFNESS", "4000"))
+TRAY_DRIVE_DAMPING = float(os.environ.get("MOBILE_TRAY_DAMPING", "500"))
+TRAY_DRIVE_MAX_FORCE = float(os.environ.get("MOBILE_TRAY_MAX_FORCE", "400"))
 PARKED_HOLD = os.environ.get("MOBILE_DEMO_PARKED_HOLD", "1") == "1"
 
 ANTIGRAVITY_FOOD_DIR = Path(
@@ -249,7 +284,10 @@ async def _convert_food_asset(source, destination):
 
 def prepare_antigravity_food_assets():
     """Validate the retained Supreme pizza asset."""
-    if not PICK_PLACE_ENABLED:
+    if SERVING_TASK not in {
+        "pizza", "pizza_soda", "pizza_soda1_soda2",
+        "pizza_soda1_soda2_cutlery",
+    } or not PICK_PLACE_ENABLED:
         return
     if not SUPREME_PIZZA_GLB.is_file():
         raise FileNotFoundError(SUPREME_PIZZA_GLB)
@@ -428,13 +466,14 @@ def attach_fixed_table_depth_camera(stage):
     assembly_path = base_path.AppendChild("fixed_table_depth_camera")
     UsdGeom.Xform.Define(stage, assembly_path)
 
-    # Tall mast on the -X side, opposite the +X table docking face.  This
-    # lets the camera look over the arm instead of through it.
+    # Tall mast on the robot-left (+Y) side, mirrored from its former
+    # robot-right (-Y) position.  Keep X and height unchanged so the camera
+    # still overlooks the same table docking face.
     mast = UsdGeom.Cylinder.Define(stage, assembly_path.AppendChild("mast"))
     mast.CreateRadiusAttr(0.018)
     mast.CreateHeightAttr(0.935)
     mast.CreateAxisAttr(UsdGeom.Tokens.z)
-    mast.AddTranslateOp().Set(Gf.Vec3f(-0.25, -0.285, 1.3225))
+    mast.AddTranslateOp().Set(Gf.Vec3f(-0.25, 0.285, 1.3225))
     mast.CreateDisplayColorAttr([Gf.Vec3f(0.12, 0.15, 0.18)])
     UsdPhysics.CollisionAPI.Apply(mast.GetPrim())
 
@@ -443,15 +482,15 @@ def attach_fixed_table_depth_camera(stage):
     boom.CreateRadiusAttr(0.018)
     boom.CreateHeightAttr(0.215)
     boom.CreateAxisAttr(UsdGeom.Tokens.z)
-    boom.AddTranslateOp().Set(Gf.Vec3f(-0.25, -0.3925, 1.79))
+    boom.AddTranslateOp().Set(Gf.Vec3f(-0.25, 0.3925, 1.79))
     boom.AddRotateXOp().Set(90.0)
     boom.CreateDisplayColorAttr([Gf.Vec3f(0.12, 0.15, 0.18)])
     UsdPhysics.CollisionAPI.Apply(boom.GetPrim())
 
     # The table docks on the arm side (+X).  Aim over the arm at the center of
     # a 0.74 m-high table while retaining a useful top-down view of hands.
-    camera_position = Gf.Vec3d(-0.25, -0.50, 1.85)
-    table_target = Gf.Vec3d(1.00, -0.15, 0.74)
+    camera_position = Gf.Vec3d(-0.25, 0.50, 1.85)
+    table_target = Gf.Vec3d(1.00, 0.15, 0.74)
     desired_camera_to_base = Gf.Matrix4d().SetLookAt(
         camera_position, table_target, Gf.Vec3d(0.0, 0.0, 1.0)
     ).GetInverse()
@@ -518,13 +557,16 @@ def attach_fixed_table_depth_camera(stage):
     depth_camera.CreateClippingRangeAttr(Gf.Vec2f(0.15, 4.0))
     print(
         "[mobile robot] fixed table depth camera height=1.85m "
-        "target=(1.00, -0.15, 0.74) docking=+X",
+        "side=robot-left(+Y) target=(1.00, 0.15, 0.74) docking=+X",
         flush=True,
     )
 
 
 def connect_table_camera_ros2(stage):
     """Publish the fixed camera's RGB, depth, and calibration on ROS 2."""
+    if os.environ.get("MOBILE_DEMO_ROS_CAMERA", "1") != "1":
+        print("[table camera ROS2] disabled by MOBILE_DEMO_ROS_CAMERA=0", flush=True)
+        return
     if not stage.GetPrimAtPath(TABLE_CAMERA_PATH).IsValid():
         raise RuntimeError(f"table camera is missing: {TABLE_CAMERA_PATH}")
 
@@ -800,6 +842,7 @@ def configure_joint_drives(stage):
     configured_arm = []
     configured_wheels = []
     configured_gripper = []
+    configured_trays = []
     for prim in stage.Traverse():
         name = prim.GetName()
         if name in ARM_JOINTS:
@@ -825,6 +868,13 @@ def configure_joint_drives(stage):
                 "isaacmecanumwheel:angle", Sdf.ValueTypeNames.Float
             ).Set(angle)
             configured_wheels.append(name)
+        elif name in SLIDING_TRAY_JOINTS:
+            drive = UsdPhysics.DriveAPI.Apply(prim, "linear")
+            drive.CreateStiffnessAttr(TRAY_DRIVE_STIFFNESS)
+            drive.CreateDampingAttr(TRAY_DRIVE_DAMPING)
+            drive.CreateMaxForceAttr(TRAY_DRIVE_MAX_FORCE)
+            drive.CreateTargetPositionAttr(0.0)
+            configured_trays.append(name)
         elif name == GRIPPER_JOINTS[0]:
             drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
             drive.CreateStiffnessAttr(GRIPPER_DRIVE_STIFFNESS)
@@ -836,7 +886,9 @@ def configure_joint_drives(stage):
         raise RuntimeError(f"arm drive setup incomplete: {configured_arm}")
     if set(configured_wheels) != set(WHEEL_JOINTS):
         raise RuntimeError(f"wheel drive setup incomplete: {configured_wheels}")
-    if PICK_PLACE_ENABLED and configured_gripper != [GRIPPER_JOINTS[0]]:
+    if set(configured_trays) != set(SLIDING_TRAY_JOINTS):
+        raise RuntimeError(f"sliding tray drive setup incomplete: {configured_trays}")
+    if SERVING_TASK != "none" and configured_gripper != [GRIPPER_JOINTS[0]]:
         raise RuntimeError(f"gripper drive setup incomplete: {configured_gripper}")
 
     # The board handle still carries the load off-centre, so give the RG2
@@ -903,7 +955,7 @@ def initialize_robot(articulation_path):
     articulation.set_sleep_threshold(0.5)
 
     dof_names = list(articulation.dof_names)
-    expected = set(ARM_JOINTS + WHEEL_JOINTS)
+    expected = set(ARM_JOINTS + WHEEL_JOINTS + SLIDING_TRAY_JOINTS)
     missing = expected - set(dof_names)
     if missing:
         raise RuntimeError(
@@ -915,6 +967,8 @@ def initialize_robot(articulation_path):
     for name, value in zip(ARM_JOINTS, STOW_CONFIGURATION):
         positions[dof_names.index(name)] = value
     for name in WHEEL_JOINTS:
+        positions[dof_names.index(name)] = 0.0
+    for name in SLIDING_TRAY_JOINTS:
         positions[dof_names.index(name)] = 0.0
     articulation.set_joint_positions(positions)
     articulation.set_joint_velocities(np.zeros(len(dof_names), dtype=float))
@@ -1016,17 +1070,54 @@ def main():
     prepare_antigravity_food_assets()
     import_robot_usd()
     stage = open_restaurant_and_reference_robot()
+    if SERVING_TASK in {
+        "soda", "soda1", "soda2", "pizza_soda", "pizza_soda1_soda2",
+        "pizza_soda1_soda2_cutlery",
+    }:
+        spawn_soda_cans(stage)
+    spawn_cutlery_box(stage)
     attach_m0609_visuals(stage)
     attach_fixed_table_depth_camera(stage)
     connect_table_camera_ros2(stage)
     attach_front_rplidar_ros2(stage)
-    pick_place = TrayPizzaPickPlace(stage) if PICK_PLACE_ENABLED else None
-    if pick_place is None:
+    if SERVING_TASK == "pizza" and PICK_PLACE_ENABLED:
+        serving_task = TrayPizzaPickPlace(stage)
+    elif SERVING_TASK in {"soda", "soda1"}:
+        serving_task = Soda1PickPlace(stage)
+    elif SERVING_TASK == "soda2":
+        serving_task = Soda2PickPlace(stage)
+    elif SERVING_TASK == "cutlery":
+        serving_task = CutleryBoxPickPlace(stage)
+    elif SERVING_TASK == "pizza_soda" and PICK_PLACE_ENABLED:
+        serving_task = PizzaThenSodaTask(
+            TrayPizzaPickPlace(stage),
+            Soda1PickPlace(stage, wait_for_start=True),
+        )
+    elif SERVING_TASK == "pizza_soda1_soda2" and PICK_PLACE_ENABLED:
+        serving_task = PizzaSoda1Soda2Task(
+            TrayPizzaPickPlace(stage),
+            Soda1PickPlace(stage, wait_for_start=True),
+            Soda2PickPlace(stage, wait_for_start=True),
+        )
+    elif (
+        SERVING_TASK == "pizza_soda1_soda2_cutlery"
+        and PICK_PLACE_ENABLED
+    ):
+        serving_task = PizzaSoda1Soda2CutleryTask(
+            TrayPizzaPickPlace(stage),
+            Soda1PickPlace(stage, wait_for_start=True),
+            Soda2PickPlace(stage, wait_for_start=True),
+            CutleryBoxPickPlace(stage, wait_for_start=True),
+        )
+    else:
+        serving_task = None
+    if serving_task is None:
         print(
-            "[serving] disabled because MOBILE_DEMO_PICK_PLACE=0; "
-            "no dish will be spawned",
+            f"[serving] task={SERVING_TASK}; no delivery task will run",
             flush=True,
         )
+    else:
+        print(f"[serving] selected task={SERVING_TASK}", flush=True)
     for _ in range(10):
         simulation_app.update()
     configure_joint_drives(stage)
@@ -1034,8 +1125,8 @@ def main():
     add_parking_brake(stage, articulation_path)
     configure_physics_stability(stage, articulation_path)
     articulation, dof_names = initialize_robot(articulation_path)
-    if pick_place is not None:
-        pick_place.initialize(articulation, dof_names)
+    if serving_task is not None:
+        serving_task.initialize(articulation, dof_names)
     open_table_camera_preview()
     if os.environ.get("MOBILE_DEMO_PRINT_BOUNDS", "0") == "1":
         print_arm_visual_bounds(stage)
@@ -1043,21 +1134,21 @@ def main():
     run_stability_check(articulation, dof_names)
 
     if os.environ.get("MOBILE_DEMO_EXIT_AFTER_READY", "0") == "1":
-        if pick_place is not None:
-            pick_place.close()
+        if serving_task is not None:
+            serving_task.close()
         simulation_app.close()
         return
 
     while simulation_app.is_running():
         simulation_app.update()
-        if pick_place is not None:
-            pick_place.step(articulation)
+        if serving_task is not None:
+            serving_task.step(articulation)
         # Keep the GUI event loop responsive without throttling it to the old
         # uneven 16 ms cadence.
         time.sleep(0.010)
 
-    if pick_place is not None:
-        pick_place.close()
+    if serving_task is not None:
+        serving_task.close()
 
 
 if __name__ == "__main__":

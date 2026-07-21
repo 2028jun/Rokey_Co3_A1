@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 from isaacsim.core.api.materials.physics_material import PhysicsMaterial
-from isaacsim.core.api.objects import DynamicCylinder, FixedCuboid
+from isaacsim.core.api.objects import DynamicCylinder
 from isaacsim.core.utils.types import ArticulationAction
 from isaacsim.robot.manipulators.grippers import ParallelGripper
 from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdPhysics, UsdShade
@@ -68,12 +68,14 @@ M0609_RMPFLOW_CONFIG = RMPFLOW_DIR / "m0609_rmpflow_common.yaml"
 # personal plates.  The board now rests directly on the top deck; the old
 # 8 cm support block is removed so it cannot snag during a vertical lift.
 TOP_DECK_DISH_LOCAL = np.array([-0.38, 0.0, -0.030])
-# The front-mounted arm and asymmetric tray are the X-mirror of the proven
-# rear-arm layout. Values remain relative to the M0609 base.
-UPPER_TRAY_COLLIDERS = (
-    (np.array([-0.22, -0.145, -0.255]), np.array([0.74, 0.33, 0.025])),
-    (np.array([-0.43, 0.165, -0.255]), np.array([0.32, 0.29, 0.025])),
+SLIDING_TRAY_JOINTS = (
+    "upper_tray_left_slide_joint",
+    "upper_tray_right_slide_joint",
 )
+SLIDING_TRAY_EXTENSION = 0.25
+# Three seconds at the 120 Hz scene rate keeps peak smoothstep velocity below
+# the URDF's 0.15 m/s joint limit, which is gentle enough for loaded drinks.
+SLIDING_TRAY_DEPLOY_STEPS = 360
 # Reachable centreline target on the destination tabletop.  At local X=+0.55
 # the 39 cm board remains fully inside the table edge while the arm can first
 # translate there at its lifted height, then descend vertically.  The former
@@ -104,6 +106,12 @@ BOARD_BAIL_GRASP_INSERT_DEPTH = 0.020
 BOARD_HANDLE_CROSS_INSERT_X = BOARD_BAIL_X
 # Pizza + wooden board combined mass.
 BOARD_TEST_MASS = 2.0
+MAGNET_MAX_FORCE = float(os.environ.get("MOBILE_MAGNET_MAX_FORCE", "25.0"))
+MAGNET_CAPTURE_RANGE = float(
+    os.environ.get("MOBILE_MAGNET_CAPTURE_RANGE", "0.003")
+)
+MAGNET_LATERAL_CAPTURE_RADIUS = 0.060
+STEEL_PLATE_RADIUS = 0.025 * 1.15
 PIZZA_ASSET_SCALE = 0.72
 DISH_RADIUS = BOARD_RADIUS
 # DynamicCylinder is only the rigid-body carrier; its collider is disabled.
@@ -128,8 +136,13 @@ INITIAL_TRANSITION_STEPS = 240
 # Two seconds at 120 Hz for each 40-degree bail segment.  Smooth continuous
 # arc targets prevent the handle from being impulsively flung past RG2.
 BAIL_ARC_STEPS = 240
+BAIL_PHASE4_OVERSHOOT_DEG = 60.0
+BAIL_UPRIGHT_ACCEPT_DEG = 85.0
+VERTICAL_LIFT_STEPS = 360
 J1_HALF_TURN_STEPS = 600
-J1_DELIVERY_TURN = -np.pi
+# Camera mast now occupies robot-left (+Y), so carry the raised pizza through
+# the opposite half-turn direction to keep the board/arm clear of the mast.
+J1_DELIVERY_TURN = np.pi
 PLACEMENT_DESCENT_STEPS = 360
 RG2_TCP_LENGTH = 0.231066
 # Keep local X (finger separation) upward and point the assembled RG2 forward
@@ -162,6 +175,25 @@ def quaternion_slerp(start, end, amount):
         np.sin((1.0 - amount) * angle) * start
         + np.sin(amount * angle) * end
     ) / np.sin(angle)
+
+
+def author_magnetic_steel_plate(stage):
+    """Add only the board-side steel target; the magnet is in robot USD."""
+    plate = UsdGeom.Cylinder.Define(
+        stage, "/World/ServingDish/MagneticSteelPlate"
+    )
+    plate.CreateAxisAttr(UsdGeom.Tokens.z)
+    plate.CreateRadiusAttr(STEEL_PLATE_RADIUS)
+    plate.CreateHeightAttr(0.001)
+    plate.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, -0.5 * BOARD_THICKNESS))
+    plate.CreateDisplayColorAttr([Gf.Vec3f(0.20, 0.22, 0.24)])
+    print(
+        "[serving-magnet] board steel plate authored; tray magnet comes "
+        "from robot USD "
+        f"max_force={MAGNET_MAX_FORCE:.1f}N "
+        f"capture_range={MAGNET_CAPTURE_RANGE * 1000.0:.1f}mm",
+        flush=True,
+    )
 
 def author_wooden_pizza_board(
     stage, mesh_path, physics_material, board_world_position
@@ -588,23 +620,19 @@ class TrayPizzaPickPlace:
         self._initial_wrist = None
         self._initial_orientation = None
         self._delivery_orientation = None
+        self._phase5_start_angle_deg = 50.0
+        self._lift_j1_hold = None
+        self._lift_tcp_start = None
+        self._lift_tcp_target = None
+        self._lift_orientation = None
+        self._tray_joint_indices = None
+        self._tray_deploy_steps = 0
+        self._trays_deployed = False
+        self._magnet_force = 0.0
+        self._magnet_gap = 0.0
         self.done = False
         self.failed = False
 
-        serving_shelf = find_serving_robot_prim(stage, "serving_shelf_link")
-        for index, (position, scale) in enumerate(UPPER_TRAY_COLLIDERS):
-            proxy = FixedCuboid(
-                prim_path=f"/World/UpperTrayCollisionProxy_{index}",
-                name=f"upper_tray_collision_proxy_{index}",
-                position=self.local_to_world(position),
-                scale=scale,
-                visible=False,
-            )
-            # Each proxy overlaps its original shelf collider by design.
-            # Filter only that pair; RG2 links still collide with the proxy.
-            UsdPhysics.FilteredPairsAPI.Apply(
-                stage.GetPrimAtPath(proxy.prim_path)
-            ).CreateFilteredPairsRel().AddTarget(serving_shelf.GetPath())
         dish_material = PhysicsMaterial(
             prim_path="/World/Physics_Materials/serving_dish_material",
             static_friction=GRIP_CONTACT_STATIC_FRICTION,
@@ -680,6 +708,7 @@ class TrayPizzaPickPlace:
             dish_material,
             self.local_to_world(TOP_DECK_DISH_LOCAL),
         )
+        author_magnetic_steel_plate(stage)
         self._bail = stage.GetPrimAtPath("/World/PizzaBoardBail")
         if not self._bail.IsValid():
             raise RuntimeError("/World/PizzaBoardBail was not authored")
@@ -758,6 +787,38 @@ class TrayPizzaPickPlace:
             )
         )
 
+    def _apply_magnetic_retention(self):
+        """Apply a weak short-range downward force like a permanent magnet."""
+        if ANCHOR_BOARD_FOR_BAIL_TEST:
+            self._magnet_force = 0.0
+            self._magnet_gap = 0.0
+            return
+        board_position = np.asarray(self._dish.get_world_pose()[0], dtype=float)
+        displacement = board_position - self._pick_start_position
+        gap = max(0.0, float(np.dot(displacement, self._up_world)))
+        lateral = displacement - self._up_world * float(
+            np.dot(displacement, self._up_world)
+        )
+        lateral_distance = float(np.linalg.norm(lateral))
+        force_amount = 0.0
+        if (
+            gap < MAGNET_CAPTURE_RANGE
+            and lateral_distance < MAGNET_LATERAL_CAPTURE_RADIUS
+        ):
+            normalized_gap = np.clip(gap / MAGNET_CAPTURE_RANGE, 0.0, 1.0)
+            # Smoothstep decay has no force discontinuity at the edge of the
+            # 3 mm magnetic capture range.
+            decay = 1.0 - normalized_gap * normalized_gap * (
+                3.0 - 2.0 * normalized_gap
+            )
+            force_amount = MAGNET_MAX_FORCE * decay
+            force = -self._up_world * force_amount
+            self._dish._rigid_prim_view.apply_forces(
+                np.asarray([force], dtype=np.float32)
+            )
+        self._magnet_force = force_amount
+        self._magnet_gap = gap
+
     def _enter_phase(self, phase, articulation):
         self._phase = phase
         self._phase_steps = 0
@@ -775,34 +836,56 @@ class TrayPizzaPickPlace:
             "lower pizza board onto table",
             "open gripper",
             "retreat vertically from table",
-            "delivery complete",
+            "pizza delivery complete",
         ]
         print(f"[serving-bail] phase={phase} {names[phase]}", flush=True)
         if phase == 3:
             self._command_gripper(articulation, GRIPPER_CLOSE[0])
-        elif phase == 6 and ANCHOR_BOARD_FOR_BAIL_TEST:
-            bail_angle = self._bail_angle_deg()
-            self.done = True
+        elif phase == 6:
+            current = articulation.get_joint_positions()
+            self._lift_j1_hold = float(current[self._arm_joint_indices[0]])
+            wrist_position, self._lift_orientation, _ = prim_world_pose(
+                self._end_effector
+            )
+            self._lift_tcp_start = (
+                wrist_position - self._up_world * RG2_TCP_LENGTH
+            )
+            self._lift_tcp_target = self._lift_tcp_start.copy()
+            self._lift_tcp_target[2] += TOP_DECK_SAFE_CLEARANCE
             print(
-                "[serving-bail] anchored-board hinge test complete; "
-                f"bail_angle={bail_angle:.1f}deg, holding pose",
+                "[serving-bail] vertical-lift J1 branch locked at "
+                f"{np.degrees(self._lift_j1_hold):.1f}deg; "
+                f"fixed_xy={np.round(self._lift_tcp_start[:2], 4)} "
+                f"z={self._lift_tcp_start[2]:.4f}"
+                f"->{self._lift_tcp_target[2]:.4f}m",
                 flush=True,
             )
+            if ANCHOR_BOARD_FOR_BAIL_TEST:
+                bail_angle = self._bail_angle_deg()
+                self.done = True
+                print(
+                    "[serving-bail] anchored-board hinge test complete; "
+                    f"bail_angle={bail_angle:.1f}deg, holding pose",
+                    flush=True,
+                )
         elif phase == 7:
+            self._lift_j1_hold = None
             board_position = np.asarray(self._dish.get_world_pose()[0])
             board_lift = float(
                 np.dot(board_position - self._pick_start_position, self._up_world)
             )
             if board_lift >= 0.08:
                 current = articulation.get_joint_positions()
-                self._j1_turn_start = np.asarray(
-                    current[self._arm_joint_indices], dtype=float
-                ).copy()
-                self._j1_turn_target = self._j1_turn_start.copy()
-                self._j1_turn_target[0] += J1_DELIVERY_TURN
+                self._j1_turn_start = float(
+                    current[self._arm_joint_indices[0]]
+                )
+                self._j1_turn_target = (
+                    self._j1_turn_start + J1_DELIVERY_TURN
+                )
                 print(
                     "[serving-bail] lift verified; "
-                    f"board_lift={board_lift:.4f}m, starting J1 half-turn",
+                    f"board_lift={board_lift:.4f}m, starting J1 "
+                    f"half-turn direction={np.degrees(J1_DELIVERY_TURN):+.0f}deg",
                     flush=True,
                 )
             else:
@@ -848,10 +931,11 @@ class TrayPizzaPickPlace:
             )
 
     def initialize(self, articulation, dof_names):
-        missing = [name for name in GRIPPER_JOINTS[:1] if name not in dof_names]
+        required = (*GRIPPER_JOINTS[:1], *SLIDING_TRAY_JOINTS)
+        missing = [name for name in required if name not in dof_names]
         if missing:
             raise RuntimeError(
-                f"missing RG2 drive DOF {missing}; run once with "
+                f"missing serving drive DOF {missing}; run once with "
                 "MOBILE_DEMO_REIMPORT=1"
             )
         self._dish.initialize()
@@ -887,6 +971,10 @@ class TrayPizzaPickPlace:
         self._gripper_joint_index = dof_names.index(GRIPPER_JOINTS[0])
         self._arm_joint_indices = np.asarray(
             [dof_names.index(name) for name in ARM_JOINTS], dtype=np.int32
+        )
+        self._tray_joint_indices = np.asarray(
+            [dof_names.index(name) for name in SLIDING_TRAY_JOINTS],
+            dtype=np.int32,
         )
         self._gripper.set_joint_positions(GRIPPER_OPEN)
 
@@ -992,10 +1080,58 @@ class TrayPizzaPickPlace:
             f"table_place={np.round(place_grasp, 4)}",
             flush=True,
         )
-        self._enter_phase(0, articulation)
+        print(
+            "[sliding-tray] destination reached; deploying both trays "
+            f"to {SLIDING_TRAY_EXTENSION:.2f}m before pick-and-place",
+            flush=True,
+        )
 
     def step(self, articulation):
         if self.done or self.failed:
+            return
+        self._apply_magnetic_retention()
+        if not self._trays_deployed:
+            self._tray_deploy_steps += 1
+            raw_amount = min(
+                1.0,
+                self._tray_deploy_steps / SLIDING_TRAY_DEPLOY_STEPS,
+            )
+            amount = raw_amount * raw_amount * (3.0 - 2.0 * raw_amount)
+            target = np.full(
+                len(SLIDING_TRAY_JOINTS),
+                SLIDING_TRAY_EXTENSION * amount,
+                dtype=float,
+            )
+            articulation.apply_action(
+                ArticulationAction(
+                    joint_positions=target,
+                    joint_indices=self._tray_joint_indices,
+                )
+            )
+            actual = articulation.get_joint_positions()[self._tray_joint_indices]
+            error = float(np.max(np.abs(target - actual)))
+            if self._tray_deploy_steps % 60 == 0:
+                print(
+                    "[sliding-tray] "
+                    f"target={target[0]:.3f}m "
+                    f"actual={np.round(actual, 3).tolist()}m",
+                    flush=True,
+                )
+            if raw_amount >= 1.0 and error < 0.005:
+                self._trays_deployed = True
+                print(
+                    "[sliding-tray] deployment complete; "
+                    "pick-and-place enabled",
+                    flush=True,
+                )
+                self._enter_phase(0, articulation)
+            elif self._tray_deploy_steps >= SLIDING_TRAY_DEPLOY_STEPS + 360:
+                self.failed = True
+                print(
+                    "[sliding-tray] STOPPED: deployment did not converge; "
+                    f"joint error={error:.4f}m",
+                    flush=True,
+                )
             return
         self._phase_steps += 1
         if self._phase in (3, 10):
@@ -1030,17 +1166,21 @@ class TrayPizzaPickPlace:
             )
             articulation.apply_action(
                 ArticulationAction(
-                    joint_positions=target,
-                    joint_indices=self._arm_joint_indices,
+                    joint_positions=np.asarray([target], dtype=float),
+                    joint_indices=np.asarray(
+                        [self._arm_joint_indices[0]], dtype=np.int32
+                    ),
                 )
             )
-            actual = articulation.get_joint_positions()[self._arm_joint_indices]
-            error = float(np.max(np.abs(target - actual)))
+            actual = float(
+                articulation.get_joint_positions()[self._arm_joint_indices[0]]
+            )
+            error = abs(target - actual)
             if self._phase_steps % 60 == 0:
                 print(
                     "[serving-j1-turn] "
-                    f"command={np.degrees(target[0]):.1f}deg "
-                    f"actual={np.degrees(actual[0]):.1f}deg "
+                    f"command={np.degrees(target):.1f}deg "
+                    f"actual={np.degrees(actual):.1f}deg "
                     f"error={np.degrees(error):.2f}deg",
                     flush=True,
                 )
@@ -1066,7 +1206,7 @@ class TrayPizzaPickPlace:
             start_angle, end_angle = (
                 (BOARD_BAIL_MIN_ANGLE_DEG, 50.0)
                 if self._phase == 4
-                else (50.0, 90.0)
+                else (self._phase5_start_angle_deg, 90.0)
             )
             raw_amount = min(1.0, self._phase_steps / BAIL_ARC_STEPS)
             amount = raw_amount * raw_amount * (3.0 - 2.0 * raw_amount)
@@ -1089,6 +1229,23 @@ class TrayPizzaPickPlace:
                     f"command={np.degrees(commanded_angle):.1f}deg",
                     flush=True,
                 )
+        elif self._phase == 6:
+            raw_amount = min(1.0, self._phase_steps / VERTICAL_LIFT_STEPS)
+            amount = raw_amount * raw_amount * (3.0 - 2.0 * raw_amount)
+            tcp_target = self._lift_tcp_start.copy()
+            tcp_target[2] = (
+                self._lift_tcp_start[2]
+                + amount
+                * (self._lift_tcp_target[2] - self._lift_tcp_start[2])
+            )
+            transition_complete = raw_amount >= 1.0
+            if self._phase_steps % 60 == 0:
+                print(
+                    "[serving-lift] vertical-only "
+                    f"z={tcp_target[2]:.4f}m "
+                    f"target_z={self._lift_tcp_target[2]:.4f}m",
+                    flush=True,
+                )
         elif self._phase == 9:
             raw_amount = min(
                 1.0, self._phase_steps / PLACEMENT_DESCENT_STEPS
@@ -1109,12 +1266,16 @@ class TrayPizzaPickPlace:
                     f"target_z={place_grasp[2]:.4f}m",
                     flush=True,
                 )
-
         wrist_target = self._tcp_to_wrist(tcp_target)
         target_orientation = (
-            self._delivery_orientation
-            if self._phase >= 8 and self._delivery_orientation is not None
-            else VERTICAL_EE_ORIENTATION
+            self._lift_orientation
+            if self._phase == 6 and self._lift_orientation is not None
+            else (
+                self._delivery_orientation
+                if self._phase >= 8
+                and self._delivery_orientation is not None
+                else VERTICAL_EE_ORIENTATION
+            )
         )
         if self._phase == 0:
             raw_amount = min(1.0, self._phase_steps / INITIAL_TRANSITION_STEPS)
@@ -1136,10 +1297,57 @@ class TrayPizzaPickPlace:
             target_end_effector_orientation=target_orientation,
         )
         articulation.apply_action(action)
+        if self._phase == 6 and self._lift_j1_hold is not None:
+            # RMPFlow's default posture has J1=0 while this pickup branch is
+            # near +pi.  At the top of the vertical lift it can otherwise
+            # jump to the equivalent zero-J1 IK branch before phase 7 begins.
+            articulation.apply_action(
+                ArticulationAction(
+                    joint_positions=np.asarray(
+                        [self._lift_j1_hold], dtype=float
+                    ),
+                    joint_indices=np.asarray(
+                        [self._arm_joint_indices[0]], dtype=np.int32
+                    ),
+                )
+            )
+            if self._phase_steps % 60 == 0:
+                actual_j1 = float(
+                    articulation.get_joint_positions()[
+                        self._arm_joint_indices[0]
+                    ]
+                )
+                print(
+                    "[serving-lift] J1 branch hold "
+                    f"target={np.degrees(self._lift_j1_hold):.1f}deg "
+                    f"actual={np.degrees(actual_j1):.1f}deg",
+                    flush=True,
+                )
 
         ee_position, _, _ = prim_world_pose(self._end_effector)
         error = float(np.linalg.norm(wrist_target - ee_position))
         bail_angle = self._bail_angle_deg()
+        if (
+            self._phase == 4
+            and bail_angle >= BAIL_PHASE4_OVERSHOOT_DEG
+        ):
+            if bail_angle >= BAIL_UPRIGHT_ACCEPT_DEG:
+                print(
+                    "[serving-bail] phase=4 overshoot accepted; "
+                    f"bail already upright at {bail_angle:.1f}deg, "
+                    "skipping phase=5",
+                    flush=True,
+                )
+                self._enter_phase(6, articulation)
+            else:
+                self._phase5_start_angle_deg = bail_angle
+                print(
+                    "[serving-bail] phase=4 overshoot accepted; "
+                    f"continuing phase=5 from {bail_angle:.1f}deg",
+                    flush=True,
+                )
+                self._enter_phase(5, articulation)
+            return
         required_bail_angle = {4: 45.0, 5: 85.0}.get(self._phase)
         bail_angle_reached = (
             required_bail_angle is None
@@ -1170,7 +1378,9 @@ class TrayPizzaPickPlace:
                 f"[serving-bail-angle] phase={self._phase} "
                 f"actual={bail_angle:.1f}deg "
                 f"required={required_bail_angle:.1f}deg "
-                f"tcp_error={error:.4f}m",
+                f"tcp_error={error:.4f}m "
+                f"magnet={self._magnet_force:.1f}N "
+                f"gap={self._magnet_gap * 1000.0:.2f}mm",
                 flush=True,
             )
         position_tolerance = 0.03 if self._phase == 0 else 0.025
