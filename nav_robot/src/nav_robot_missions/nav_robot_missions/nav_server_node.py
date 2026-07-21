@@ -35,13 +35,13 @@ class NavServerNode(RailMissionNode):
             "nav_server_node",
             table_id=4,
             routes_path=routes_path,
-            linear_speed=0.35,
+            linear_speed=0.50,
             angular_speed=0.55,
             dock_speed=0.16,
             xy_tolerance=0.12,
             yaw_tolerance=0.12,
             lat_tolerance=0.12,
-            segment_timeout=90.0,
+            segment_timeout=150.0,
             stall_timeout=6.0,
         )
 

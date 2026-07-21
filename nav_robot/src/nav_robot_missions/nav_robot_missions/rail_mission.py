@@ -293,6 +293,16 @@ class RailMissionNode(Node):
 
         deadline = time.time() + self.segment_timeout
         max_v = self.dock_speed if (slow or reverse) else self.linear_speed
+        # Spine waypoints guide the robot through a wide aisle; they are not
+        # precision docking targets.  Requiring the same 12 cm lateral error
+        # used at a table made the robot pass a waypoint and then continue
+        # forever at minimum speed.  Keep docking strict, but allow the next
+        # spine segment to continue correcting a modest lateral offset.
+        completion_lat_tol = (
+            self.lat_tolerance
+            if (slow or reverse)
+            else max(self.lat_tolerance, 0.25)
+        )
         travel = _wrap(hold_yaw + math.pi) if reverse else hold_yaw
         ux, uy = math.cos(travel), math.sin(travel)
         k_yaw, k_cross = 1.2, 1.0
@@ -313,7 +323,7 @@ class RailMissionNode(Node):
             cross = -dx * uy + dy * ux
             yaw_err = _wrap(hold_yaw - yaw)
 
-            if abs(along) <= self.xy_tolerance and abs(cross) <= self.lat_tolerance:
+            if along <= self.xy_tolerance and abs(cross) <= completion_lat_tol:
                 self._stop()
                 return True
             if math.hypot(dx, dy) <= max(self.xy_tolerance, self.lat_tolerance):
@@ -335,9 +345,9 @@ class RailMissionNode(Node):
 
             speed = min(max_v, max(0.06, 0.7 * max(along, 0.05)))
             if abs(cross) > 0.08:
-                speed = min(speed, 0.12)
+                speed = min(speed, 0.22)
             if abs(yaw_err) > self.yaw_tolerance:
-                speed = min(speed, 0.08)
+                speed = min(speed, 0.14)
             self._cmd((-speed if reverse else speed), wz)
 
         self._stop()
@@ -390,6 +400,72 @@ class RailMissionNode(Node):
         p = self.pose()
         self.get_logger().error(
             f"timeout ({label}) ty={ty:.2f} "
+            f"pose={None if p is None else (round(p[0], 2), round(p[1], 2), round(p[2], 2))}"
+        )
+        return False
+
+    def drive_to_pose_rolling(
+        self,
+        tx: float,
+        ty: float,
+        final_yaw: float,
+        label: str,
+    ) -> bool:
+        """Approach a nearby dock with a rolling turn instead of a skid spin."""
+        deadline = time.time() + self.segment_timeout
+        stall = _StallWatch(self.stall_timeout, move_tol=0.025, yaw_tol=0.04)
+        stall.reset(self.pose())
+        p0 = self.pose()
+        self.get_logger().info(
+            f"rolling approach ({label}) from="
+            f"{None if p0 is None else (round(p0[0], 2), round(p0[1], 2), round(p0[2], 2))} "
+            f"to=({tx:.2f},{ty:.2f},{final_yaw:.2f})"
+        )
+
+        while time.time() < deadline and rclpy.ok():
+            self._tick()
+            p = self.pose()
+            if p is None:
+                continue
+            stuck = stall.tick(p)
+            if stuck >= self.stall_timeout:
+                return self._stall_fail(label, p, stuck)
+
+            x, y, yaw = p
+            dx, dy = tx - x, ty - y
+            distance = math.hypot(dx, dy)
+            final_err = _wrap(final_yaw - yaw)
+            if distance <= self.xy_tolerance:
+                self._stop()
+                if abs(final_err) <= max(self.yaw_tolerance, 0.22):
+                    return True
+                self.get_logger().warning(
+                    f"{label} position reached with yaw error "
+                    f"{math.degrees(final_err):.1f}deg"
+                )
+                return abs(final_err) <= 0.35
+
+            path_yaw = math.atan2(dy, dx)
+            heading_err = _wrap(path_yaw - yaw)
+            # Use a moderate yaw-rate cap so the commanded curve has a useful
+            # radius instead of looking like another in-place pivot.
+            wz = max(-0.30, min(0.30, 1.2 * heading_err))
+
+            # Keep the wheels rolling during large heading changes.  A
+            # physical four-wheel skid-steer turns far more reliably this way
+            # than when all four tires must break static lateral friction.
+            if abs(heading_err) > 0.75:
+                speed = min(0.13, self.dock_speed * 0.85)
+            elif abs(heading_err) > 0.30:
+                speed = min(0.14, self.dock_speed * 0.90)
+            else:
+                speed = min(self.dock_speed, max(0.06, 0.55 * distance))
+            self._cmd(speed, wz)
+
+        self._stop()
+        p = self.pose()
+        self.get_logger().error(
+            f"timeout ({label}) tgt=({tx:.2f},{ty:.2f}) "
             f"pose={None if p is None else (round(p[0], 2), round(p[1], 2), round(p[2], 2))}"
         )
         return False
@@ -457,11 +533,24 @@ class RailMissionNode(Node):
             f"dock=({dock['x']:.2f},{dock['y']:.2f})"
         )
 
-        for i, wp in enumerate(spine):
-            tx, ty, yaw = float(wp["x"]), float(wp["y"]), float(wp["yaw"])
-            if self._near(tx, ty):
-                continue
-            if not self.drive_rail(tx, ty, yaw, f"spine[{i}]"):
+        # All outbound spine points lie on the same clear central aisle.  Run
+        # it as one continuous rail instead of stopping at every marker.
+        if spine:
+            wp = spine[-1]
+            tx, yaw = float(wp["x"]), float(wp["yaw"])
+            ty = float(wp["y"])
+            if self.table_id in (0, 1, 2, 3):
+                # Begin the table turn before the geometric branch.  Driving
+                # all the way to pre_dock first necessarily produces an
+                # L-shaped path even when the wheels keep rolling.
+                ty = py + 0.75
+                self.get_logger().info(
+                    f"continuous turn entry=({tx:.2f},{ty:.2f}) "
+                    f"before branch y={py:.2f}"
+                )
+            if not self._near(tx, ty) and not self.drive_rail(
+                tx, ty, yaw, "spine"
+            ):
                 return False
 
         if self.table_id not in (0, 1, 2, 3):
@@ -469,17 +558,11 @@ class RailMissionNode(Node):
                 float(dock["x"]), float(dock["y"]), float(dock["yaw"]), "kitchen", slow=True
             )
 
-        if not self._near(px, py):
-            aisle_yaw = SOUTH if py < (self.pose() or (0, 5, 0))[1] else NORTH
-            if not self.drive_rail(px, py, aisle_yaw, "branch", slow=True):
-                return False
-
-        p = self.pose()
-        if p is None:
-            return False
-        face = math.atan2(float(dock["y"]) - p[1], float(dock["x"]) - p[0])
-        if not self.drive_rail(
-            float(dock["x"]), float(dock["y"]), face, "dock", slow=True
+        if not self.drive_to_pose_rolling(
+            float(dock["x"]),
+            float(dock["y"]),
+            float(dock["yaw"]),
+            "dock_roll",
         ):
             return False
 
