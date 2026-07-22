@@ -104,3 +104,101 @@ tasks" section for the full writeup):
   reads true regardless of reach timing) -- needs the ROI polygon
   tightened to exclude the gripper's resting position and/or a raised
   YOLO confidence threshold against the gripper hardware.
+
+## Pass 3 -- 2026-07-22 (commit 931d412)
+
+Tested:
+- Reach speed: HAND_TEST_TRAVEL_SECONDS 0.4 -> 0.8 (already applied blind
+  before this pass) observed on hardware across many reach cycles.
+- Whether F_Business_02's skeleton has a PhysX articulation, so the arm
+  could be driven via a joint drive instead of UsdSkel animation.
+- Repainting the RG2 gripper matte black to cut the hand-detector false
+  positive, per a reviewer's suggestion.
+- Root-caused the false-positive source properly: hid the wrist and fixed
+  D455 camera assemblies (`UsdGeom.Imageable.MakeInvisible()`) and
+  separately the whole kitchen -- the white object stayed visible through
+  both, ruling out both suspects from pass 2's writeup. Forced
+  `stage.Load()` and did a full unfiltered dump of every Mesh prim under
+  `/World/ServingRobot` (with `Usd.TraverseInstanceProxies()`) to find it
+  for real.
+- Tightening `TABLE_ROI_NORMALIZED` in `hand_safety/hand_safety/
+  roi_intrusion.py` to exclude the gripper's resting screen position,
+  using exact bbox pixel data read from `/hand_detection/detections`
+  (both with the test person forced to stay at rest for 120-180s, and
+  during an active reach) instead of guessing.
+- Final acceptance: `/hand_safety/roi_intrusion` over a 40s window with a
+  short (3-4s) reach period, and separately over a 20s window with the
+  person held at rest.
+
+Changed:
+- isaacpjt/mobile_manipulator_demo.py: `MOBILE_DEMO_MATTE_BLACK_GRIPPER`/
+  `paint_gripper_matte_black()` were added, then fully removed after
+  proving the approach doesn't work on this build (see Observed) --
+  matches how per-joint UsdSkel rotation was handled in pass 2. No net
+  change left in this file from the paint attempt.
+- hand_safety/hand_safety/roi_intrusion.py: `TABLE_ROI_NORMALIZED`'s
+  near-right corner moved from (0.731, 0.629) to (0.586, 0.629), pulling
+  the ROI's right edge in far enough to clear the gripper's bbox
+  (~x:786-831 px at 1280x960) while keeping the hand-test reach position
+  (YOLO-observed at ~x:535-684 px during a reach) inside.
+
+Observed:
+- Reach speed at 0.8s travel reads as a reasonably natural pace across
+  many observed cycles; no further change made.
+- F_Business_02 has **zero** `UsdPhysics.ArticulationRootAPI` prims,
+  `UsdPhysics.Joint`-derived prims, or `UsdPhysics.DriveAPI` prims
+  anywhere in its referenced hierarchy -- confirmed dead end, exactly the
+  "pose-only, no physics joints" case pass 2 flagged as a possibility.
+  Physics joint drive is not viable for this character asset; would need
+  a different, physics-rigged humanoid to try that path at all.
+- Matte-black gripper repaint: root-caused the actual false-positive
+  source properly this time (the RG2 gripper's own visual meshes --
+  specifically gripper_body / *_inner_finger / *_outer_knuckle /
+  *_inner_knuckle / quick_changer -- NOT the D455 camera housing as
+  pass 2's writeup guessed). These meshes sit behind USD payloads with a
+  generic "mesh" leaf name several levels down
+  (".../gripper_body/node_STL_BINARY_/mesh"), which `stage.Traverse()`
+  with the default predicate does not descend into, explaining why pass 2
+  concluded they "don't exist." Binding a matte-black UsdPreviewSurface
+  material was attempted three ways, each ruled out on hardware:
+    1. Binding the leaf mesh directly: raises "authoring to an instance
+       proxy is not allowed" (each STL part is instanced).
+    2. De-instancing the ancestor first (`SetInstanceable(False)`) then
+       binding: authoring succeeds, but the render is unaffected -- same
+       "late edit doesn't reach Hydra" class of problem as pass 2's
+       UsdSkel finding.
+    3. Binding on the actual instance root instead of de-instancing
+       anything (confirmed via `prim.IsInstance()`/`IsInstanceProxy()`
+       walking the ancestor chain: the instance root is the "visuals"
+       Xform two levels above "gripper_body", not "gripper_body" itself)
+       -- this is the textbook-correct USD way to override per-instance
+       material without touching the shared prototype, binding succeeds
+       with no errors, and the render *still* doesn't change.
+  All three were verified with matched before/after captures from the
+  same running process, so this isn't a capture-timing artifact like the
+  translate false-alarm in pass 2 -- material bindings on this specific
+  already-populated/instanced/payload-loaded geometry just do not reach
+  the renderer on this Isaac Sim build, regardless of API correctness.
+  Abandoned; reverted all paint-related code.
+- ROI tightening: fully resolved the false positive. With the person held
+  at rest for 20s, `/hand_safety/roi_intrusion` read `False` for 256/256
+  sampled messages (previously `True` continuously). With an active
+  3-4s-period reach cycle running for 40s, `roi_intrusion` alternated
+  cleanly between `False` (~25-37 samples, matching the wait/travel
+  portion) and `True` (~15-51 samples, matching the 6s hold) in sync with
+  each cycle -- the acceptance criterion from the original task prompt.
+
+Still broken / follow-up:
+- No natural per-joint arm reach exists for this character asset; the
+  whole-body-slide/sink remains the only working mechanism. If a
+  natural-looking reach is ever needed, it requires either a
+  physics-rigged humanoid (for a real articulation joint drive) or the
+  detached arm+hand prop fallback described in
+  docs/VISION_TEST_GPU_PROMPT.md's pass-3 section (not yet tried).
+- The broader "late edits to already-populated/instanced stage content
+  don't reach Hydra on this Isaac Sim 5.1.0-rc.19 build" pattern has now
+  been confirmed twice (UsdSkel joint rotation in pass 2, material
+  binding in pass 3). Worth flagging to NVIDIA/Isaac Sim support if this
+  keeps recurring -- it blocks a whole category of "tweak the already-
+  loaded scene at runtime" approaches, not just this project's two
+  attempts.

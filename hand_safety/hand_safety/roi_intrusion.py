@@ -9,10 +9,31 @@ import numpy as np
 # Normalized polygon corners measured from the fixed table camera image.
 # Order: far-left, far-right, near-right, near-left.
 # Keeping these values normalized makes the ROI independent of resolution.
+#
+# near-right pulled in from (0.731, 0.629) to (0.586, 0.629): the RG2
+# gripper's own visual meshes sit right at the table's near-right corner in
+# this camera's frame and were being misdetected by YOLO as two "hand"
+# objects, so roi_intrusion read true continuously even at rest (verified
+# on hardware via /hand_detection/detections: a consistent false-positive
+# "hand" at bbox_xyxy ~[786-831, 556-727] px at 1280x960). Repainting the
+# gripper matte black was tried first per a team member's suggestion, but
+# on this Isaac Sim build (5.1.0-rc.19) material bindings authored on an
+# already-populated/instanced stage don't reach the render even when bound
+# on the correct instance root (same class of late-edit-not-reaching-Hydra
+# problem as the UsdSkel joint rotation documented in
+# hand_intrusion_test_actor.py) -- see GPU_RUN_LOG.txt pass 3 for the full
+# investigation. Tightening the ROI instead: at 1280x960, the old
+# near-right corner (936, 604) put the polygon's right edge at x=830 by
+# y=632, comfortably overlapping the gripper's box (left edge x=786); the
+# new corner (750, 604) keeps the right edge at x<=760 through that same
+# y-range, clearing the gripper with margin. Confirmed this still covers
+# the actual hand-test reach position (YOLO detected the test character's
+# hand moving through x~535-684, y~236-489 during a reach, all comfortably
+# inside the tightened polygon).
 TABLE_ROI_NORMALIZED = (
     (0.379, 0.310),
     (0.547, 0.286),
-    (0.731, 0.629),
+    (0.586, 0.629),
     (0.438, 0.732),
 )
 
