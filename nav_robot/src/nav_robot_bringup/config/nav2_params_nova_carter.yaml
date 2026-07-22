@@ -1,12 +1,18 @@
+# Nav2 params for Isaac Nova_Carter_ROS.usd — costmap/AMCL frames match two-wheel (ridgeback_base_link).
+# Topics: /cmd_vel /odom /scan (nova_carter_topic_bridge)
+# Frames: map/odom/ridgeback_base_link (same as nav2_params.yaml)
 amcl:
   ros__parameters:
     use_sim_time: true
-    alpha1: 0.05
-    alpha2: 0.05
-    alpha3: 0.05
-    alpha4: 0.05
-    alpha5: 0.05
-    base_frame_id: base_link
+    # Bridged /odom is relative to spawn/teleport (not world GT).
+    # Keep motion-model noise small so scan-matching in this symmetric layout
+    # cannot drag the estimate to a mirrored false match.
+    alpha1: 0.02
+    alpha2: 0.02
+    alpha3: 0.02
+    alpha4: 0.02
+    alpha5: 0.02
+    base_frame_id: ridgeback_base_link
     beam_skip_distance: 0.5
     beam_skip_error_threshold: 0.9
     beam_skip_threshold: 0.3
@@ -49,11 +55,12 @@ bt_navigator:
   ros__parameters:
     use_sim_time: true
     global_frame: map
-    robot_base_frame: base_link
+    robot_base_frame: ridgeback_base_link
     odom_topic: /odom
     bt_loop_duration: 10
     default_server_timeout: 20
     wait_for_service_timeout: 1000
+    # Absolute path injected by nav2_nova_carter.launch.py at runtime.
     default_nav_to_pose_bt_xml: ""
     plugin_lib_names:
       - nav2_compute_path_to_pose_action_bt_node
@@ -118,34 +125,38 @@ controller_server:
     progress_checker:
       plugin: nav2_controller::SimpleProgressChecker
       required_movement_radius: 0.12
-      movement_time_allowance: 25.0
+      # Abort sooner when wedged against a wall/table instead of thrashing.
+      movement_time_allowance: 22.0
     general_goal_checker:
       plugin: nav2_controller::SimpleGoalChecker
-      xy_goal_tolerance: 0.12
-      yaw_goal_tolerance: 0.22
+      # Keep realistic dock tolerances (not 0.7m hide-the-bug values).
+      xy_goal_tolerance: 0.25
+      yaw_goal_tolerance: 0.40
       stateful: true
     FollowPath:
       plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
-      desired_linear_vel: 0.22
-      lookahead_dist: 0.95
-      min_lookahead_dist: 0.55
-      max_lookahead_dist: 1.35
-      lookahead_time: 2.0
-      rotate_to_heading_angular_vel: 0.55
+      desired_linear_vel: 0.40
+      lookahead_dist: 0.55
+      min_lookahead_dist: 0.3
+      max_lookahead_dist: 0.85
+      lookahead_time: 1.5
+      rotate_to_heading_angular_vel: 1.0
       transform_tolerance: 0.5
       use_velocity_scaled_lookahead_dist: true
       min_approach_linear_velocity: 0.05
-      approach_velocity_scaling_dist: 0.55
+      approach_velocity_scaling_dist: 0.9
+      # Re-enabled after fixing odom/TF; do not disable to mask self-hits.
       use_collision_detection: true
-      max_allowed_time_to_collision_up_to_target: 1.4
+      max_allowed_time_to_collision_up_to_target: 1.2
       use_regulated_linear_velocity_scaling: true
       use_cost_regulated_linear_velocity_scaling: false
-      regulated_linear_scaling_min_radius: 1.6
-      regulated_linear_scaling_min_speed: 0.10
+      regulated_linear_scaling_min_radius: 0.85
+      regulated_linear_scaling_min_speed: 0.08
+      # Two-wheel base cannot hold in-place rotate_to_heading reliably.
       use_rotate_to_heading: false
-      allow_reversing: true
+      allow_reversing: false
       rotate_to_heading_min_angle: 0.35
-      max_angular_accel: 8.0
+      max_angular_accel: 25.0
       max_robot_pose_search_dist: 10.0
 
 local_costmap:
@@ -154,14 +165,19 @@ local_costmap:
       use_sim_time: true
       update_frequency: 5.0
       publish_frequency: 2.0
+      # Axes fixed in odom. Rolling window follows robot XY; footprint rotates
+      # with base. If walls appear to spin with the robot, odom→base yaw is wrong
+      # or RViz Fixed Frame is base_link — do not set global_frame to base.
       global_frame: odom
-      robot_base_frame: base_link
+      robot_base_frame: ridgeback_base_link
       rolling_window: true
       width: 8
       height: 8
       resolution: 0.05
       transform_tolerance: 0.5
-      robot_radius: 0.38
+      robot_radius: 0.0
+      # Same footprint as two-wheel (nav2_params.yaml).
+      footprint: "[[0.50, 0.32], [0.50, -0.32], [-0.45, -0.32], [-0.45, 0.32]]"
       plugins: [obstacle_layer, inflation_layer]
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
@@ -177,6 +193,7 @@ local_costmap:
           raytrace_max_range: 3.5
           raytrace_min_range: 0.05
           obstacle_max_range: 3.0
+          # Front lidar ~0.40 m; ignore only mount/body returns, not real obstacles.
           obstacle_min_range: 0.30
           observation_persistence: 0.0
       inflation_layer:
@@ -192,9 +209,10 @@ global_costmap:
       update_frequency: 2.0
       publish_frequency: 1.0
       global_frame: map
-      robot_base_frame: base_link
+      robot_base_frame: ridgeback_base_link
       rolling_window: false
-      robot_radius: 0.38
+      robot_radius: 0.0
+      footprint: "[[0.50, 0.32], [0.50, -0.32], [-0.45, -0.32], [-0.45, 0.32]]"
       resolution: 0.05
       transform_tolerance: 0.5
       track_unknown_space: true
@@ -202,6 +220,8 @@ global_costmap:
       static_layer:
         plugin: nav2_costmap_2d::StaticLayer
         map_subscribe_transient_local: true
+      # Keep global static-only: kitchen meshes on a live obstacle layer mark
+      # the dock lethal. Local costmap still uses scan for short-range avoidance.
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         cost_scaling_factor: 3.0
@@ -227,6 +247,7 @@ planner_server:
     expected_planner_frequency: 5.0
     planner_plugins: [GridBased]
     GridBased:
+      # 2D grid + RPP rotate_to_heading (differential Isaac base).
       plugin: nav2_smac_planner/SmacPlanner2D
       tolerance: 0.25
       downsample_costmap: false
@@ -237,6 +258,11 @@ planner_server:
       max_planning_time: 5.0
       motion_model_for_search: MOORE
       cost_travel_multiplier: 2.0
+      # SmacPlanner2D has no heading in its search, so the final path pose's
+      # orientation is normally just the tangent of the last segment. That
+      # tangent jitters slightly on every 1Hz replan, which made the
+      # controller's rotate-to-heading target drift instead of converge.
+      # Pin the final pose to the actual goal orientation.
       use_final_approach_orientation: true
       smoother:
         max_iterations: 1000
@@ -268,7 +294,7 @@ behavior_server:
     wait:
       plugin: nav2_behaviors/Wait
     global_frame: odom
-    robot_base_frame: base_link
+    robot_base_frame: ridgeback_base_link
     transform_tolerance: 0.5
     simulate_ahead_time: 2.0
     max_rotational_vel: 1.0
@@ -292,10 +318,11 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: OPEN_LOOP
+    # Differential base (Isaac ignores linear.y).
     max_velocity: [0.45, 0.0, 1.0]
     min_velocity: [-0.35, 0.0, -1.0]
-    max_accel: [0.45, 0.0, 3.5]
-    max_decel: [-0.55, 0.0, -3.5]
+    max_accel: [0.8, 0.0, 8.0]
+    max_decel: [-1.0, 0.0, -8.0]
     odom_topic: /odom
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]

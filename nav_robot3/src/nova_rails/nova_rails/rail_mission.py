@@ -66,9 +66,13 @@ def main() -> None:
     rail = RailNavigator(nav, tf_buffer, tracker)
     ok = rail.follow_route(f"to_{args.table_id}", routes, label=f"to_{args.table_id}")
     if ok and args.return_kitchen:
-        ok = rail.follow_route(
-            f"from_{args.table_id}", routes, label=f"from_{args.table_id}"
-        )
+        ok = rail.reverse_parking_exit(routes, args.table_id)
+        if ok:
+            ok = rail.follow_route(
+                f"return_{args.table_id}",
+                routes,
+                label="return_kitchen",
+            )
 
     rclpy.shutdown()
     if not ok:

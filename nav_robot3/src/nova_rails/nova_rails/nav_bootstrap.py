@@ -6,7 +6,7 @@ import math
 import time
 
 import rclpy
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
 from nav2_simple_commander.robot_navigator import BasicNavigator
 from rosgraph_msgs.msg import Clock
 from rclpy.duration import Duration
@@ -171,6 +171,56 @@ def sync_spawn(
             print(f"[sync] OK ({xy[0]:.2f}, {xy[1]:.2f})")
             return True
     return False
+
+
+def reverse_open_loop(
+    nav: BasicNavigator,
+    tf_buffer: Buffer,
+    tracker: AmclPoseTracker | None,
+    *,
+    distance_m: float,
+    speed_mps: float,
+    timeout_extra_sec: float = 10.0,
+) -> tuple[bool, float]:
+    """base_link 직선 후진(linear.x<0). Nav2 없이 슬롯 이탈용."""
+    nav.cancelTask()
+    nav.result_future = None
+    time.sleep(0.15)
+
+    speed_mps = abs(float(speed_mps))
+    distance_m = max(0.1, float(distance_m))
+    xy0 = resolve_map_xy(nav, tf_buffer, tracker)
+    if xy0 is None:
+        xy0 = (0.0, 0.0)
+
+    pub = nav.create_publisher(Twist, "/cmd_vel", 10)
+    twist = Twist()
+    twist.linear.x = -speed_mps
+
+    period = 0.05
+    deadline = time.monotonic() + distance_m / speed_mps + timeout_extra_sec
+    traveled = 0.0
+    while time.monotonic() < deadline:
+        xy = resolve_map_xy(nav, tf_buffer, tracker)
+        if xy is not None:
+            traveled = math.hypot(xy[0] - xy0[0], xy[1] - xy0[1])
+            if traveled >= distance_m * 0.92:
+                break
+        twist.linear.x = -speed_mps
+        pub.publish(twist)
+        rclpy.spin_once(nav, timeout_sec=period)
+        time.sleep(period)
+
+    twist.linear.x = 0.0
+    for _ in range(20):
+        pub.publish(twist)
+        rclpy.spin_once(nav, timeout_sec=0.05)
+        time.sleep(0.05)
+    nav.destroy_publisher(pub)
+    time.sleep(0.25)
+    nav.clearAllCostmaps()
+    ok = traveled >= distance_m * 0.72
+    return ok, traveled
 
 
 def prepare_navigator(node_name: str = "rail_navigator") -> tuple[

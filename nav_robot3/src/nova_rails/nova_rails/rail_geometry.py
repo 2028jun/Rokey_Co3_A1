@@ -101,8 +101,11 @@ def prune_poses(
     kept = list(poses)
     while len(kept) > 1:
         wx, wy, _ = kept[0]
-        if math.hypot(px - wx, py - wy) <= near_m:
-            kept.pop(0)
-            continue
-        break
+        d = math.hypot(px - wx, py - wy)
+        if d > near_m:
+            break
+        # 주방(x≈0.21)에서 복도 정렬(x≈0) 웨이포인트는 가깝더라도 유지
+        if abs(wx) < 0.12 and abs(px) > 0.18:
+            break
+        kept.pop(0)
     return kept

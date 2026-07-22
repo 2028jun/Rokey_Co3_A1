@@ -1,5 +1,7 @@
 # nav_robot2 — Nova Carter + Occupancy Map + Nav2
 
+저장소 공통 안내: [`docs/NOVA_CARTER.md`](../docs/NOVA_CARTER.md) (`younggi` 브랜치)
+
 `nav_robot`와 분리된 워크스페이스입니다. **식당 USD/주방 자산만** 복사해 두었고, Nav2·미션·Isaac 실행은 이 디렉터리 기준으로만 사용합니다. **SLAM 없음** — AMCL + Occupancy Map.
 
 ## 1회 준비
