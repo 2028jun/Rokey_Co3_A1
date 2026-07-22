@@ -53,6 +53,33 @@ this constant for that asset's own right-hand joint (run
 `list_skeleton_joints()` to find the joint, then read its
 `bindTransforms` entry) rather than assuming this offset still applies.
 
+Hardware pass #4 tried the officially-supported route instead of this
+whole-body compromise: apply the `Biped_Setup` Animation Graph to a
+character's SkelRoot and trigger a built-in clip (`push_button.skelanim.usd`,
+registered as a custom "Timing" command via
+`omni.anim.people.scripts.custom_command.populate_anim_graph
+.populate_timing_template`) through `omni.anim.graph.core.get_character(...)
+.set_variable("Action", "push_button")`, per NVIDIA's documented Actor
+Control workflow. Enabling the `omni.anim.graph.core` extension in this
+headless standalone script reproducibly segfaults Isaac Sim
+5.1.0-rc.19 -- confirmed at the *minimal* possible repro (just enable the
+extension, reference `Biped_Setup.usd`, tick `simulation_app.update()` a
+few times; crashes inside `RunLoopThread::update()` before any
+Animation-Graph-specific API is even called). Not something fixable from
+this script. Per-joint animation via the runtime Animation Graph is
+therefore also ruled out on this build, same as pass 2's raw-`UsdSkel`
+attempt, for an unrelated reason (native crash vs. silently-ignored edit).
+The whole-body translate remains the only working reach mechanism.
+
+Pass 4 also compared three People characters with this mechanism and
+found meaningfully different YOLO hand-detection confidence for the same
+reach geometry: F_Business_02 ~0.52, F_Medical_01 ~0.82,
+male_adult_construction_01_new ~0.88-0.89 (its light-colored work glove
+reads as a cleaner "hand" shape to the HaGRIDv2 model). Switched the
+default to the construction character on that evidence; see
+`_RIGHT_HAND_REST_LOCAL_OFFSET` below for the other two characters'
+measured offsets if reverting.
+
 Usage (opt-in, from mobile_manipulator_demo.py):
 
     import hand_intrusion_test_actor as hand_test
@@ -83,18 +110,20 @@ import time
 from pxr import Gf, Usd, UsdGeom, UsdSkel
 
 
-# Verified against the bucket listing (S3 XML ListObjectsV2 on
-# omniverse-content-production, prefix
-# Assets/Isaac/5.1/Isaac/People/Characters/): the original guessed folder
-# name "female_adult_business_02" does not exist (404). The real folder is
-# "F_Business_02" (the textures inside it keep the female_adult_business_02
-# naming, which is why the original guess looked plausible). Confirmed
-# resolvable with `curl -I` -> 200 OK.
+# Pass 4 compared three People characters with the whole-body reach
+# mechanism (all share the same 101-joint Reallusion-style rig, joint [83]
+# ".../R_Clavicle/R_Upperarm/R_Forearm/R_Hand"): F_Business_02 (YOLO hand
+# confidence ~0.52), F_Medical_01 (~0.82), and this one, whose light-colored
+# work glove reads as a noticeably cleaner "hand" shape to the HaGRIDv2
+# model (~0.88-0.89, two reach cycles observed). Picked as the new default
+# on that basis. Override via HAND_TEST_PERSON_USD for any other character
+# -- re-measure _RIGHT_HAND_REST_LOCAL_OFFSET for it first (see that
+# constant's own comment).
 PERSON_USD = os.environ.get(
     "HAND_TEST_PERSON_USD",
     "https://omniverse-content-production.s3-us-west-2.amazonaws.com/"
-    "Assets/Isaac/5.1/Isaac/People/Characters/F_Business_02/"
-    "F_Business_02.usd",
+    "Assets/Isaac/5.1/Isaac/People/Characters/"
+    "male_adult_construction_01_new/male_adult_construction_01_new.usd",
 )
 
 # --- TableSet_00 geometry, read directly from
@@ -104,14 +133,21 @@ PERSON_USD = os.environ.get(
 # this workspace.
 TABLE_COLLIDER_CENTER = Gf.Vec3d(-3.2, -2.2, 0.365)
 TABLE_TOP_Z = 0.73  # collider center z (0.365) + half-height (0.365)
-TABLE_HAND_TARGET = Gf.Vec3d(-3.2, -2.2, TABLE_TOP_Z)
+# Pass 3/early pass 4 captures targeted the hand joint at exactly
+# TABLE_TOP_Z, which reads as resting right at the tabletop surface with
+# no visible clearance -- close enough to graze/clip depending on the
+# character's hand mesh thickness. Give it 10cm of headroom instead of
+# stacking a correction on top of a correction; overridable, but the
+# target is computed from TABLE_TOP_Z either way, never accumulated.
+HAND_TARGET_Z_OFFSET = float(os.environ.get("HAND_TEST_TARGET_Z_OFFSET", "0.10"))
+TABLE_HAND_TARGET = Gf.Vec3d(-3.2, -2.2, TABLE_TOP_Z + HAND_TARGET_Z_OFFSET)
 
 # Chair_01_Visual under TableSet_00: translate=(-2.7, -3.2, 0), rotateZ=180
 # (facing the table). Verified against a captured table_camera frame:
 # Chair_00 (-3.7, -3.2) sits at the far edge of the robot-mounted camera's
-# view and is mostly clipped; Chair_01 is well-centered in frame. This
-# character asset (F_Business_02) is a standing-pose People asset, not a
-# seated one, so SEAT_TORSO_Z is floor height (0.0), not chair-seat height.
+# view and is mostly clipped; Chair_01 is well-centered in frame. Every
+# People character tried so far is a standing-pose asset, not a seated
+# one, so SEAT_TORSO_Z is floor height (0.0), not chair-seat height.
 SEAT_XY = (
     float(os.environ.get("HAND_TEST_SEAT_X", "-2.7")),
     float(os.environ.get("HAND_TEST_SEAT_Y", "-3.2")),
@@ -205,14 +241,25 @@ def list_skeleton_joints(stage, root_path: str = PERSON_PRIM_PATH) -> None:
         print(f"  [{index}] {joint}", flush=True)
 
 
-# Rest-pose world offset of F_Business_02's right hand
-# (.../R_Clavicle/R_Upperarm/R_Forearm/R_Hand) from its own character root,
-# measured once via `skeleton.GetBindTransformsAttr()` in an isolated
-# script rather than queried at runtime (see module docstring for why:
-# keeps this module's runtime path simple; re-measure if PERSON_USD is
-# overridden to a different character).
+# Rest-pose world offset of the right hand joint (.../R_Clavicle/
+# R_Upperarm/R_Forearm/R_Hand -- confirmed identical joint path across all
+# People characters tried, they share a common Reallusion-style rig) from
+# its own character root, measured once per asset via
+# `skeleton.GetBindTransformsAttr()` in an isolated script rather than
+# queried at runtime (see module docstring for why: keeps this module's
+# runtime path simple). Defaults to male_adult_construction_01_new's
+# measured value (this module's default PERSON_USD, see above); override
+# all three via env vars for a different HAND_TEST_PERSON_USD rather than
+# editing this constant (measure with the same isolated-script technique:
+# open the character, find its Skeleton, read
+# bindTransforms[hand_index].ExtractTranslation()). Other measured values
+# from the pass 4 comparison, for reference:
+#   F_Business_02:  (-0.6220545196533204, 0.050855822563171386, 1.3136680603027344)
+#   F_Medical_01:   (-0.6411647033691407, 0.051522626876831054, 1.3579162597656251)
 _RIGHT_HAND_REST_LOCAL_OFFSET = Gf.Vec3d(
-    -0.6220545196533204, 0.050855822563171386, 1.3136680603027344
+    float(os.environ.get("HAND_TEST_HAND_OFFSET_X", "-0.6862501525878907")),
+    float(os.environ.get("HAND_TEST_HAND_OFFSET_Y", "0.07141963958740234")),
+    float(os.environ.get("HAND_TEST_HAND_OFFSET_Z", "1.432750244140625")),
 )
 
 

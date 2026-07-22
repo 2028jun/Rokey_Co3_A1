@@ -202,3 +202,123 @@ Still broken / follow-up:
   keeps recurring -- it blocks a whole category of "tweak the already-
   loaded scene at runtime" approaches, not just this project's two
   attempts.
+
+## Pass 4 -- 2026-07-22 (commit <fill in after committing>)
+
+Tested:
+- Whether F_Business_02 has a PhysX articulation/joint/drive at all (asked
+  again in the pass-4 prompt as a sanity check on pass 3's finding).
+- The officially-documented Animation Graph / omni.anim.people runtime
+  path for a per-joint arm reach: apply `Biped_Setup`'s AnimationGraph to
+  a character's SkelRoot via `ApplyAnimationGraphAPICommand`, register
+  `push_button.skelanim.usd` as a custom "Timing" command via
+  `omni.anim.people.scripts.custom_command.populate_anim_graph
+  .populate_timing_template()`, then trigger it with
+  `omni.anim.graph.core.get_character(path).set_variable("Action",
+  "push_button")` while the timeline plays -- the exact sequence
+  documented in the installed `omni.anim.graph.core`/`omni.anim.people`
+  0.7.9+107.3.3 extension source (verified against actual source in
+  `~/.local/share/ov/data/exts/v2/`, not docs/guesswork).
+- Whether enabling `omni.anim.graph.core` alone, with nothing else touched,
+  survives a headless standalone script at all (isolating the previous
+  test's crash).
+- Three People characters with the existing whole-body-translate
+  mechanism: `F_Business_02` (pass 1-3's default), `F_Medical_01`, and
+  `male_adult_construction_01_new`. All three resolve
+  (`Assets/Isaac/5.1/Isaac/People/Characters/<name>/<name>.usd`, verified
+  with `curl -I` -> 200) and share the identical 101-joint rig (same
+  `[83]` `.../R_Clavicle/R_Upperarm/R_Forearm/R_Hand` joint path), so each
+  only needed its own measured `_RIGHT_HAND_REST_LOCAL_OFFSET` -- no other
+  code changes to load or reach with a different character.
+- Whether the hand already clears the tabletop at the pass-3 target
+  (`TABLE_TOP_Z` exactly, no offset) before deciding whether to add
+  clearance.
+- Final acceptance: `roi_intrusion` over 45s with the *default* (shipped)
+  reach timing (5-10s period, 0.4s hold) -- not an artificially stretched
+  hold like earlier passes' verification runs -- and separately over 20s
+  with the person held at rest for 120-180s.
+
+Changed:
+- isaacpjt/hand_intrusion_test_actor.py: default `PERSON_USD` switched
+  from `F_Business_02` to `male_adult_construction_01_new` (see Observed
+  for why); `_RIGHT_HAND_REST_LOCAL_OFFSET` updated to that character's
+  measured value, with the other two characters' values kept in a comment
+  for anyone reverting; all three offset components already had
+  `HAND_TEST_HAND_OFFSET_X/Y/Z` env-var overrides added this pass so
+  swapping characters doesn't need a code edit.
+- isaacpjt/hand_intrusion_test_actor.py: added `HAND_TARGET_Z_OFFSET`
+  (env-overridable via `HAND_TEST_TARGET_Z_OFFSET`, default `0.10`);
+  `TABLE_HAND_TARGET`'s Z is now `TABLE_TOP_Z + HAND_TARGET_Z_OFFSET`
+  (0.83 m) instead of exactly `TABLE_TOP_Z` (0.73 m).
+- No functional change to mobile_manipulator_demo.py, hand_safety, or the
+  ROI polygon this pass.
+
+Observed:
+- F_Business_02: **zero** `UsdPhysics.ArticulationRootAPI`/`Joint`/
+  `DriveAPI` prims anywhere in its hierarchy -- reconfirms pass 3's
+  finding exactly, no new information.
+- Animation Graph path: **reproducible native segfault**, not a soft
+  failure. Isolated to the minimal possible repro -- enabling only
+  `omni.anim.graph.core` (no `omni.anim.people`, no custom command
+  registration, no `ApplyAnimationGraphAPICommand` call, nothing else)
+  and referencing `Biped_Setup.usd` alone crashes inside
+  `omni::kit::RunLoopThread::update()` within the first few
+  `simulation_app.update()` ticks, before any Animation-Graph-specific
+  Python API is ever called. Full crash backtrace in
+  `/tmp/.../anim_minimal.log` (not committed; native template-instance
+  symbols only, no actionable Python-level fix visible). This is a
+  different failure mode from pass 2's UsdSkel finding (that one rendered
+  wrong silently; this one crashes the whole process) and is not
+  something fixable from this script -- ruling out the officially
+  documented route entirely on this Isaac Sim 5.1.0-rc.19 build in
+  headless mode. The whole-body translate remains the only working
+  mechanism; per-joint rigged/rendered reach is out of reach on this
+  build via either code path tried across passes 2 and 4.
+- Three-character comparison (all via the existing whole-body-translate
+  reach, `/hand_detection/detections` confidence read during an active
+  reach hold):
+    - F_Business_02: confidence ~0.52 (single detection).
+    - F_Medical_01: confidence ~0.82 (occasionally two detections, second
+      ~0.60, likely the character's other hand/hair near the ROI edge).
+    - male_adult_construction_01_new: confidence ~0.88-0.89 across two
+      separate reach cycles, single clean detection each time. Visually,
+      this character's light-colored work glove gives a simpler, more
+      uniform silhouette than the other two characters' bare/gloveless
+      hands, which plausibly explains the consistently higher confidence
+      against the HaGRIDv2-trained model. Selected as the new default on
+      this evidence.
+- Table clearance: at the pass-3 target (`TABLE_TOP_Z` exactly), captured
+  frames showed the hand resting directly at the tabletop surface with no
+  visible gap -- consistent with "may clip," per the task's own
+  description of this exact scenario. Applied the instructed `+0.10 m`
+  (0.83 m total), computed from `TABLE_TOP_Z` with no prior offset to
+  stack on top of.
+- Final acceptance, default (untouched) timing over 45s: `roi_intrusion`
+  alternated `False` (five separate runs of 70/57/72/90/12 samples) with
+  brief `True` bursts (5/6/7/1/7 samples) matching each 0.4s hold --
+  correctly mostly-false with short true pulses, not the pass-2-era
+  always-true gripper artifact. Separately, held at rest for 20s (person
+  reach period forced to 120-180s): 418/418 samples `False`. Camera
+  confirmed still 1280x960; `table_arrived` gating confirmed still
+  required (`Hand inference enabled: table_arrived=True` seen before any
+  detection).
+
+Still broken / follow-up:
+- Per-joint/physically-actuated arm reach remains unsolved on this Isaac
+  Sim build via every officially-suggested route tried so far (raw
+  UsdSkel in pass 2, PhysX articulation ruled out by asset in pass 3,
+  Animation Graph crash in pass 4). The whole-body-translate compromise is
+  the shipped mechanism and is unlikely to become "natural-looking"
+  without either (a) a physics-rigged humanoid character (none identified
+  yet in the official 5.1 People library) or (b) the detached arm+hand
+  prop fallback from docs/VISION_TEST_GPU_PROMPT.md's pass-3 section,
+  neither attempted this pass.
+- The Animation Graph segfault was isolated but not root-caused inside
+  the compiled extension itself (no source-level fix available from a
+  standalone script) -- worth a support ticket/forum post to NVIDIA if
+  this path is worth pursuing further, referencing Isaac Sim
+  5.1.0-rc.19 + omni.anim.graph.core 107.3.4+107.3.3.
+- Digital Human (`People/DH_Characters/<uuid>/`) characters were not
+  tried this pass (out of scope given the three already tested were
+  sufficient to pick a clear winner and the Animation Graph crash makes
+  a fourth character unlikely to change the per-joint-reach conclusion).
