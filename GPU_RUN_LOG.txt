@@ -203,7 +203,7 @@ Still broken / follow-up:
   loaded scene at runtime" approaches, not just this project's two
   attempts.
 
-## Pass 4 -- 2026-07-22 (commit ba734b3)
+## Pass 4 -- 2026-07-22 (commit 0112808)
 
 Tested:
 - Whether F_Business_02 has a PhysX articulation/joint/drive at all (asked
