@@ -136,7 +136,7 @@ PERSON_PRIM_PATH = "/World/HandSafetyTestActor"
 # --- Reach timing. The task asks for a reach every 5-10 seconds.
 MIN_PERIOD_SECONDS = float(os.environ.get("HAND_TEST_MIN_PERIOD", "5.0"))
 MAX_PERIOD_SECONDS = float(os.environ.get("HAND_TEST_MAX_PERIOD", "10.0"))
-REACH_TRAVEL_SECONDS = float(os.environ.get("HAND_TEST_TRAVEL_SECONDS", "0.4"))
+REACH_TRAVEL_SECONDS = float(os.environ.get("HAND_TEST_TRAVEL_SECONDS", "0.8"))
 REACH_HOLD_SECONDS = float(os.environ.get("HAND_TEST_HOLD_SECONDS", "0.4"))
 # hand_safety requires confirmation_frames=3 consecutive detections at
 # process_rate=30 Hz (~0.1s) before it reports an intrusion -- the hold

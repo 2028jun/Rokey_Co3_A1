@@ -1,0 +1,106 @@
+Human-readable log of every hardware pass run on the GPU machine for the
+hand-safety intrusion test (see docs/VISION_TEST_GPU_PROMPT.md for the
+full task). Append a new dated entry each pass -- see that doc's "Keep
+GPU_RUN_LOG.txt updated" section for the template. Newest entry at the
+bottom.
+
+## Pass 1 -- 2026-07-22 (commit 6f8b848)
+
+Tested:
+- Full scaffold from the initial blind assembly (commit bdafc4a) on real
+  Isaac Sim 5.1 + ROS 2 Humble hardware for the first time.
+
+Changed:
+- lightweight_pizza_restaurant.usda: fixed a kitchen asset reference path
+  that resolved outside the repo (extra "..").
+- hand_intrusion_test_actor.py: replaced the guessed People asset path
+  (404) with the real, curl-verified F_Business_02 path.
+- hand_intrusion_test_actor.py: worked around an XformCommonAPI.SetRotate
+  collision with the referenced character's own rotateXYZ op by authoring
+  double-precision translate/rotateZ ops directly.
+- hand_intrusion_test_actor.py: switched seating from Chair_00 (clipped
+  out of camera frame) to Chair_01, floor-height seating instead of
+  chair-seat height (this People asset is a standing pose).
+- mobile_manipulator_demo.py: MOBILE_DEMO_HAND_TEST now defaults on.
+- hand_detector_node.py: publish_annotated_image/show_window now default
+  on.
+
+Observed:
+- Topic wiring, table_arrived gating, and ROI polygon placement all
+  confirmed working end to end.
+- The whole-body-slide reach never got a hand into frame: the character's
+  own baked idle animation kept overriding the pose regardless of where
+  the root prim was translated to.
+
+Still broken / follow-up:
+- Get an actual hand into the ROI (needs either a measured reach-target
+  offset or a different character asset/mechanism).
+
+## Pass 2 -- 2026-07-22 (commits ddc1627, a84d3bf)
+
+Tested:
+- Raising table camera resolution to reduce YOLO upscale blur.
+- A real per-joint arm reach via UsdSkel (rotate the forearm joint through
+  a freshly-bound, rest-pose-seeded SkelAnimation), replacing the
+  whole-body slide as the primary mechanism.
+- Whether the per-joint approach actually renders on hardware, with an
+  isolated pixel-diff repro (explicit simulation_app.update() ticks, a
+  single deterministic rep.orchestrator.step() render -- no live-timing
+  race possible).
+- A fallback analytic whole-body-translate reach, with a long (20s),
+  deliberately un-rushed hardware capture window.
+- hand_safety's intrusion reading with the test person held at rest for
+  120-180s (to isolate false positives from the reach mechanism itself).
+
+Changed:
+- mobile_manipulator_demo.py: connect_table_camera_ros2() RenderProduct
+  640x480 -> 1280x960 (the ROI crop YOLO runs on was only ~289x262px at
+  640x480, a ~4.4x upscale; at 1280x960 it's ~579x524px, ~2.2x upscale).
+- hand_intrusion_test_actor.py: added then removed a per-joint UsdSkel
+  reach (_setup_skeleton_reach() etc.) -- see "Observed" below for why.
+- hand_intrusion_test_actor.py: replaced it with an analytic reach --
+  compute the character's rest-pose right hand's world offset from its
+  own root (hardcoded, measured once via GetBindTransformsAttr()), rotate
+  by the placement yaw, and target the existing whole-body translate with
+  that offset so the hand lands on TABLE_HAND_TARGET.
+
+Observed:
+- Per-joint UsdSkel rotation: UsdSkel.Cache/SkelQuery confirmed the
+  joint's *computed* transform updated correctly, but the *rendered*
+  image never showed the arm move -- proven, not a timing artifact.
+  Writing through the Fabric-native usdrt.UsdSkel API instead of
+  pxr.UsdSkel made no difference. Matches a documented NVIDIA caveat
+  (omni.anim.graph.core changelog: "usdskel omnihydra does not handle
+  both fabric + USD change well") -- late-bound SkelAnimation joint
+  rotations don't appear to reach the Hydra skinning pipeline on this
+  Isaac Sim build (5.1.0-rc.19), regardless of which USD API authors
+  them. Per-joint rotation removed.
+- Analytic whole-body reach: confirmed on hardware -- the character's
+  hand lands squarely on the table during a reach. (Several earlier
+  same-session captures that looked like it "wasn't rendering" were
+  actually just mistimed, grabbed after a 2-4s reach window had already
+  ended, given this test harness's own multi-step capture latency -- not
+  a rendering bug.)
+- New problem found while verifying acceptance: hand_safety's YOLO hand
+  detector misdetects the robot's own RG2 gripper (permanently near the
+  ROI) as two "hand" objects, so /hand_safety/roi_intrusion reads true
+  continuously even with the test person held at rest the entire time.
+  Pre-existing ROI/detector calibration issue, not introduced by this
+  scaffold, but it currently masks any clean read of reach-correlated
+  intrusion timing.
+
+Still broken / follow-up (see docs/VISION_TEST_GPU_PROMPT.md's "Pass 3
+tasks" section for the full writeup):
+- Reach still looks unnatural: since this character's rest pose holds the
+  arm up near shoulder height, bringing the hand down to table height
+  means translating the whole body, so it visibly sinks/leans across the
+  table rather than just extending an arm. Next idea to try: drive the
+  arm via a PhysX articulation joint drive instead of UsdSkel animation
+  (a different subsystem that may not hit the same late-bound-Fabric
+  limitation) -- first needs checking whether this character asset even
+  has a physics articulation on its skeleton, since many People
+  background-crowd characters are pose-only with no physics joints.
+- Gripper false-positive still blocks a clean acceptance check (roi
+  reads true regardless of reach timing) -- needs the ROI polygon
+  tightened to exclude the gripper's resting position and/or a raised
+  YOLO confidence threshold against the gripper hardware.

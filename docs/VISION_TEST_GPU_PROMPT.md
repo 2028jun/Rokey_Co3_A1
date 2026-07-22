@@ -61,6 +61,103 @@ addressed here, neither verified on hardware yet:
    of the reach; increase it back if the joint drive turns out not to work
    at all on this asset.
 
+## Pass 3 tasks (read this first if you already ran passes 1-2)
+
+Pass 2's commit (`Fix pass-2 reach: UsdSkel per-joint rotation doesn't
+render, whole-body translate does; find a real ROI false-positive from the
+robot's gripper`) got a hand landing on the table via a whole-body
+translate, but flagged two open problems. Both are unaddressed as of this
+writing, plus one already applied blind (not yet hardware-verified):
+
+0. **Reach speed already halved, needs re-checking on hardware.**
+   `REACH_TRAVEL_SECONDS` default changed `0.4` -> `0.8`
+   (`hand_intrusion_test_actor.py`) per a reviewer's note that the
+   character's back-and-forth motion looked too fast. This was a blind
+   constant edit (no GPU access here), not re-verified on hardware —
+   confirm it actually reads as a natural pace and isn't, e.g., now too
+   slow to be believable, and tune `HAND_TEST_TRAVEL_SECONDS` further if
+   needed.
+
+1. **The reach still looks unnatural.** Because `F_Business_02`'s rest
+   pose holds its arm up near shoulder height, bringing its hand down to
+   table height means translating the *entire body*, so the character
+   visibly sinks/leans across the table instead of just extending an arm.
+   Per-joint `UsdSkel` rotation was already tried and ruled out (see
+   `hand_intrusion_test_actor.py`'s module docstring) — late-bound
+   `SkelAnimation` joint rotations don't reach the Hydra skinning pipeline
+   on this Isaac Sim build (5.1.0-rc.19), confirmed with an isolated
+   pixel-diff repro, regardless of whether you author through `pxr.UsdSkel`
+   or the Fabric-native `usdrt.UsdSkel` API.
+
+   **Try instead: drive the arm via a PhysX articulation joint (not
+   `UsdSkel` animation).** This is a genuinely different subsystem —
+   physics joint drives write joint state that PhysX itself resolves each
+   step, rather than authoring a `SkelAnimation` sample for Hydra to pick
+   up — so it may not hit the same late-bound-Fabric limitation.
+
+   - First check whether `F_Business_02` (or whatever `PERSON_USD` is
+     currently set to) actually has a PhysX articulation on its skeleton
+     at all. Many Isaac Sim "People" background-crowd characters are
+     posed/animated meshes only, with **no** `UsdPhysics.ArticulationRootAPI`
+     or joint-drive schemas — if that's the case here, this approach is a
+     dead end for this asset and you'll need a physics-ready humanoid
+     instead (check Isaac's character/robot library for one with an
+     actual articulation, not just a skeleton). Report which case you hit
+     either way — a confirmed dead end is still useful information.
+   - If an articulation exists: use
+     `omni.isaac.core.articulations.Articulation` /
+     `ArticulationView` to find the shoulder/elbow joint (fuzzy-match like
+     `_find_skeleton()` already does for joint names), and drive it via
+     joint position *drive targets* (respecting whatever stiffness/damping
+     the asset ships with) rather than snapping the transform directly, so
+     it moves like a physically actuated joint rather than teleporting.
+   - Keep the existing whole-body analytic reach
+     (`_compute_hand_reach_target()` / `ReachAnimator`) as the fallback if
+     this doesn't pan out on this asset, matching the try/except-and-fall-
+     back pattern already used for the pass-2 attempt.
+   - If the articulation drive *also* doesn't pan out (no physics joints
+     on any available character, or it renders with the same problem as
+     UsdSkel), don't stop at two failed attempts — keep looking for
+     another mechanism. One cruder but likely-reliable option: model/cut
+     just a small arm+hand prop (doesn't need to be attached to or even
+     resemble the seated character's own arm) and animate *that* prop
+     sliding in from off-table into the ROI and back out on the reach
+     cycle, independent of the body. It only needs to look plausible
+     in-frame and register as a hand to YOLO — it sidesteps the
+     skeleton/rendering problems entirely, since it's just a plain
+     `Xformable` translate on a simple prim, the one motion primitive
+     already confirmed to render reliably (pass 2's whole-body reach).
+     Treat this as one option among others, not the only fallback — if
+     you find a better mechanism, use it and document why in
+     `GPU_RUN_LOG.txt`.
+
+2. **The gripper false-positive still blocks a clean acceptance check.**
+   `hand_safety`'s YOLO hand detector misdetects the robot's own RG2
+   gripper as two "hand" objects, so `/hand_safety/roi_intrusion` reads
+   `true` continuously regardless of the test person's reach — this masks
+   whether intrusion timing actually correlates with the reach cycle.
+
+   **Try first: repaint the robot matte black.** A team member has
+   observed this cut down false positives significantly before (matte
+   dark surfaces reduce specular highlights/reflections that appear to
+   confuse the hand detector). Bind a matte-black `UsdPreviewSurface`
+   (`diffuseColor` ~`(0.02, 0.02, 0.02)`, `roughness` high e.g. `0.9`,
+   `metallic` `0`) to the robot's visual meshes — start with the RG2
+   gripper specifically, since that's what's triggering the false
+   positive, and extend to the rest of the robot if the gripper alone
+   isn't enough. This is a material/`UsdShade` change, not a code change
+   to `hand_safety` itself, so it's low-risk to try first.
+
+   If repainting doesn't fully clear it, layer on: tightening
+   `TABLE_ROI_NORMALIZED` in `hand_safety/hand_safety/roi_intrusion.py` to
+   exclude the gripper's resting position in frame, and/or raising the
+   YOLO confidence threshold against the gripper hardware. Either way,
+   re-run the acceptance check (step 6 below) and confirm `roi_intrusion`
+   actually flips in sync with the reach cycle, not just always-true.
+
+Before finishing, append your results to `GPU_RUN_LOG.txt` (repo root) —
+see "Keep GPU_RUN_LOG.txt updated" near the end of this doc.
+
 ## Goal
 
 At `TableSet_00` (the only table the fixed table camera ever frames — see
@@ -229,6 +326,37 @@ new, untested module for the reach animation.
    hand geometry may be too stylized/low-poly for the HaGRIDv2-trained
    model — try a different, more realistic-handed character asset before
    assuming the ROI/wiring is broken.
+
+## Keep GPU_RUN_LOG.txt updated
+
+`GPU_RUN_LOG.txt` (repo root) is a plain-text, human-readable log of every
+hardware pass, so anyone following this branch can see what was tried and
+what happened without reconstructing it from `git log`. It already has
+entries for passes 1-2 — read it for context before you start.
+
+Before you finish (or push any commit), append a new dated entry in the
+same format:
+
+```
+## Pass N -- YYYY-MM-DD (commit <short-hash-once-committed>)
+
+Tested:
+- <what you ran / checked>
+
+Changed:
+- <files and the substance of the change, one line each>
+
+Observed:
+- <actual results -- topic echo output, timing, screenshots described in
+  words, whatever you saw on hardware>
+
+Still broken / follow-up:
+- <anything left open for the next pass>
+```
+
+Commit `GPU_RUN_LOG.txt` together with (or right after) your code changes
+and push to `vision-test` so it's visible on the branch immediately —
+don't leave it for a later pass to backfill.
 
 Report back what you changed and the final observed `roi_intrusion` timing
 so the scaffold constants can be corrected for next time.
