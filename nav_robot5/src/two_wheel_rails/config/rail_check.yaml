@@ -1,0 +1,21 @@
+# Cross-track validation while Nav2 follows fixed rails (routes.yaml).
+max_lateral_error_m: 0.35
+max_lateral_error_branch_m: 0.40
+max_lateral_error_entry_m: 0.65
+max_lateral_error_dock_m: 0.35
+log_period_sec: 2.0
+require_nav_feedback_sec: 8.0
+cte_grace_sec: 3.0
+# 주차 슬롯 이탈: Nav2 BackUp 대신 /cmd_vel 직선 후진 (유턴 방지)
+park_out_open_loop: true
+aisle_x_max_m: 0.42
+park_reverse_min_travel_frac: 0.72
+aisle_margin_m: 0.22
+backup_speed_mps: 0.15
+backup_time_allowance_sec: 45
+parking_dwell_sec: 1.0
+# 최종 dock(테이블·주방): 위치 도달 후 Nav2 Spin으로 routes.yaml yaw 정렬
+align_heading_at_dock: true
+align_heading_yaw_tol_rad: 0.08
+spin_time_allowance_sec: 30
+max_spin_attempts: 3
