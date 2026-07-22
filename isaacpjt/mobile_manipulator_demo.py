@@ -729,7 +729,7 @@ def main():
     reach_animator = None
     if os.environ.get("MOBILE_DEMO_HAND_TEST", "1") == "1":
         person_prim = hand_test.spawn_seated_person(stage)
-        reach_animator = hand_test.ReachAnimator(person_prim, stage)
+        reach_animator = hand_test.ReachAnimator(person_prim)
     if os.environ.get("MOBILE_DEMO_PRINT_BOUNDS", "0") == "1":
         print_arm_visual_bounds(stage)
     run_optional_diagnostic(articulation, dof_names)

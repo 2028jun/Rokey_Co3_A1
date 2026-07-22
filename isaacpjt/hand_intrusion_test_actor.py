@@ -8,20 +8,50 @@ end, but the whole-body-slide reach never puts a recognizable hand in the
 ROI: the character's own baked idle animation keeps its hands at its sides
 regardless of where the root prim is translated to.
 
-This pass adds real per-joint arm control via UsdSkel: it replaces the
-skeleton's animation source with one seeded from its rest pose (so the idle
-loop stops fighting us), then rotates just the forearm joint toward the
-table over the same 5-10s cycle used before. The forearm joint is found by
-fuzzy name matching (see _find_reach_joint_index) since the actual joint
-names on F_Business_02's skeleton have never been inspected on real
-hardware. Nothing UsdSkel-related below has been run.
+Hardware pass #2 tried real per-joint arm control via UsdSkel (rotate the
+forearm joint through a freshly-bound, rest-pose-seeded SkelAnimation).
+That setup ran without exceptions and `UsdSkel.Cache`/`SkelQuery` confirmed
+the joint's *computed* local transform updated correctly -- but the
+*rendered* image never showed the arm move, proven with a pixel-diff on
+matched before/after renders (isolated repro, dome-lit, camera framed on
+the character, explicit `simulation_app.update()` ticks and a single
+deterministic `rep.orchestrator.step()` render -- no live-timing race
+possible). Writing through the Fabric-native `usdrt.UsdSkel.Animation` API
+instead of `pxr.UsdSkel` made no difference either. This matches a
+documented NVIDIA caveat (`omni.anim.graph.core` changelog: "usdskel
+omnihydra does not handle both fabric + USD change well") -- late-bound
+SkelAnimation joint rotations on Isaac Sim 5.1.0-rc.19 do not appear to
+reach the Hydra skinning pipeline in this build, regardless of which USD
+API authors them. Per-joint rotation is not used here anymore.
 
-`ReachAnimator` still authors the small whole-body lean from pass #1
-(distance reduced -- the arm is now expected to do the real work) and now
-also drives the forearm joint if skeleton setup succeeds; if it doesn't
-(wrong API call for this USD build, no skeleton found, no forearm-like
-joint name), it prints why and silently falls back to lean-only, matching
-pass #1's behavior exactly.
+This pass instead computes, analytically, the rest-pose *world* offset of
+the character's right hand from its own root Xform, rotates that offset by
+`SEAT_YAW_DEGREES` to match how the character is placed, and picks the
+whole-body translate target so that offset lands exactly on
+`TABLE_HAND_TARGET`. This only relies on `Xformable.Set()` on a plain
+translate op (confirmed on hardware: a 20s hold with a long, deliberately
+un-rushed capture window shows the character's hand landing squarely on
+the table -- earlier same-session captures that looked like translate
+"wasn't rendering" were simply mistimed, grabbed after a 2-4s reach window
+had already ended given this script's own multi-step capture latency, not
+a real rendering bug). It is a known visual compromise, not a real arm
+reach: since this character's rest pose holds the arm out and up near
+shoulder height, the whole body has to translate low enough to bring that
+hand down to table height, so during the reach the character visibly
+sinks/lies across the table. Acceptable for exercising the detector;
+revisit with a seated/lower-rest-pose character if a natural-looking
+reach is ever needed.
+
+The hand offset below is hardcoded (measured once via
+`skeleton.GetBindTransformsAttr()` in an isolated script) rather than
+queried from the live spawned prim each run, purely to keep this module's
+runtime path simple -- not because live UsdSkel queries were shown to
+cause any problem (they weren't retested after the capture-timing bug
+above was found, so that earlier suspicion is unconfirmed). If
+`HAND_TEST_PERSON_USD` is overridden to a different character, re-measure
+this constant for that asset's own right-hand joint (run
+`list_skeleton_joints()` to find the joint, then read its
+`bindTransforms` entry) rather than assuming this offset still applies.
 
 Usage (opt-in, from mobile_manipulator_demo.py):
 
@@ -29,7 +59,7 @@ Usage (opt-in, from mobile_manipulator_demo.py):
     ...
     if os.environ.get("MOBILE_DEMO_HAND_TEST", "1") == "1":
         person_prim = hand_test.spawn_seated_person(stage)
-        reach_animator = hand_test.ReachAnimator(person_prim, stage)
+        reach_animator = hand_test.ReachAnimator(person_prim)
     ...
     while simulation_app.is_running():
         simulation_app.update()
@@ -37,14 +67,11 @@ Usage (opt-in, from mobile_manipulator_demo.py):
             reach_animator.update()
         time.sleep(0.010)
 
-Debugging on hardware: if the reach still doesn't reach, run
+Debugging on hardware: if the reach target still looks wrong, run
 `hand_test.list_skeleton_joints(stage, hand_test.PERSON_PRIM_PATH)` from
-the Isaac Sim script console after spawning, find the real forearm/hand
-joint in the printed list, and set:
-
-    export HAND_TEST_REACH_JOINT_NAME="<substring from the printed path>"
-    export HAND_TEST_REACH_JOINT_AXIS=X   # or Y / Z -- try each
-    export HAND_TEST_REACH_JOINT_ANGLE_DEG=-70  # sign/magnitude, tune visually
+the Isaac Sim script console after spawning to see every joint path, and
+compare against `_RIGHT_HAND_REST_LOCAL_OFFSET` below (logged at startup
+as `[hand_test] reach target from hardcoded rest-pose hand offset ...`).
 """
 
 from __future__ import annotations
@@ -93,10 +120,8 @@ SEAT_YAW_DEGREES = float(os.environ.get("HAND_TEST_SEAT_YAW", "180.0"))
 SEAT_TORSO_Z = float(os.environ.get("HAND_TEST_SEAT_Z", "0.0"))
 SEAT_POSITION = Gf.Vec3d(SEAT_XY[0], SEAT_XY[1], SEAT_TORSO_Z)
 
-# How far the whole body leans toward the table on top of whatever the arm
-# joint contributes. Pass #1 used the full seat-to-table distance (~1m) and
-# that alone never got a hand over the table; this is now just a small
-# assist, not the primary mechanism.
+# Fallback lean target (small nudge toward the table) used only if the
+# skeleton/hand-joint lookup below fails -- matches pass #1's mechanism.
 LEAN_DISTANCE = float(os.environ.get("HAND_TEST_LEAN_DISTANCE", "0.15"))
 _seat_to_table = TABLE_HAND_TARGET - SEAT_POSITION
 _seat_to_table_length = _seat_to_table.GetLength()
@@ -118,20 +143,8 @@ REACH_HOLD_SECONDS = float(os.environ.get("HAND_TEST_HOLD_SECONDS", "0.4"))
 # time above must stay comfortably longer than that or every reach will be
 # invisible to the detector.
 
-# --- Forearm joint search/drive. All overridable once the real skeleton
-# has been inspected on hardware (see module docstring).
-_REACH_JOINT_NAME_OVERRIDE = os.environ.get("HAND_TEST_REACH_JOINT_NAME", "")
-_REACH_JOINT_AXIS = os.environ.get("HAND_TEST_REACH_JOINT_AXIS", "X").upper()
-REACH_JOINT_ANGLE_DEG = float(
-    os.environ.get("HAND_TEST_REACH_JOINT_ANGLE_DEG", "-70.0")
-)
-_FOREARM_NAME_HINTS = ("forearm", "lowerarm", "lower_arm", "elbow")
 _RIGHT_SIDE_HINTS = ("right", "_r_", "r_hand", "r_arm", "rt_")
-_AXIS_VECTORS = {
-    "X": Gf.Vec3d(1.0, 0.0, 0.0),
-    "Y": Gf.Vec3d(0.0, 1.0, 0.0),
-    "Z": Gf.Vec3d(0.0, 0.0, 1.0),
-}
+_HAND_EXCLUDE_HINTS = ("thumb", "index", "mid", "ring", "pinky")
 
 
 def _smoothstep(t: float) -> float:
@@ -176,19 +189,10 @@ def _find_skeleton(root_prim) -> UsdSkel.Skeleton | None:
     return None
 
 
-def _find_skel_root(root_prim):
-    if root_prim.IsA(UsdSkel.Root):
-        return root_prim
-    for prim in Usd.PrimRange(root_prim):
-        if prim.IsA(UsdSkel.Root):
-            return prim
-    return None
-
-
 def list_skeleton_joints(stage, root_path: str = PERSON_PRIM_PATH) -> None:
     """Print every joint path under root_path's skeleton. Run this from the
-    Isaac Sim script console after spawn_seated_person() to find the real
-    forearm/hand joint name if auto-detection picks the wrong one.
+    Isaac Sim script console after spawn_seated_person() to sanity-check
+    which joint ReachAnimator picked as "the right hand".
     """
     root_prim = stage.GetPrimAtPath(root_path)
     skeleton = _find_skeleton(root_prim)
@@ -201,124 +205,45 @@ def list_skeleton_joints(stage, root_path: str = PERSON_PRIM_PATH) -> None:
         print(f"  [{index}] {joint}", flush=True)
 
 
-def _find_reach_joint_index(joint_strs: list[str]) -> int | None:
-    if _REACH_JOINT_NAME_OVERRIDE:
-        for index, path_str in enumerate(joint_strs):
-            if _REACH_JOINT_NAME_OVERRIDE.lower() in path_str.lower():
-                return index
-        print(
-            f"[hand_test] HAND_TEST_REACH_JOINT_NAME={_REACH_JOINT_NAME_OVERRIDE!r} "
-            "matched no joint; falling back to auto-detection",
-            flush=True,
-        )
-
-    candidates = []
-    for index, path_str in enumerate(joint_strs):
-        lowered = path_str.lower()
-        if any(hint in lowered for hint in _FOREARM_NAME_HINTS):
-            side_score = 1 if any(hint in lowered for hint in _RIGHT_SIDE_HINTS) else 0
-            candidates.append((side_score, index, path_str))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: -item[0])
-    return candidates[0][1]
+# Rest-pose world offset of F_Business_02's right hand
+# (.../R_Clavicle/R_Upperarm/R_Forearm/R_Hand) from its own character root,
+# measured once via `skeleton.GetBindTransformsAttr()` in an isolated
+# script rather than queried at runtime (see module docstring for why:
+# keeps this module's runtime path simple; re-measure if PERSON_USD is
+# overridden to a different character).
+_RIGHT_HAND_REST_LOCAL_OFFSET = Gf.Vec3d(
+    -0.6220545196533204, 0.050855822563171386, 1.3136680603027344
+)
 
 
-def _setup_skeleton_reach(stage, root_path: str) -> dict | None:
-    """Replace the skeleton's animation source with one seeded from its
-    rest pose, and return the bits ReachAnimator needs to drive the
-    forearm joint's rotation each frame. Returns None (with a printed
-    reason) if anything about the asset doesn't match what this function
-    assumes -- callers must treat that as "fall back to lean-only", not
-    an error.
+def _compute_hand_reach_target() -> Gf.Vec3d:
+    """World-space whole-body translate target that puts the character's
+    rest-pose right hand on TABLE_HAND_TARGET, given the character is
+    yawed by SEAT_YAW_DEGREES. Pure Gf math against the hardcoded offset
+    above.
     """
-    root_prim = stage.GetPrimAtPath(root_path)
-    skeleton = _find_skeleton(root_prim)
-    if skeleton is None:
-        print(f"[hand_test] no skeleton under {root_path}; lean-only reach", flush=True)
-        return None
-
-    skel_root_prim = _find_skel_root(root_prim)
-    if skel_root_prim is None:
-        print(f"[hand_test] no UsdSkel.Root under {root_path}; lean-only reach", flush=True)
-        return None
-
-    joints_attr = skeleton.GetJointsAttr().Get()
-    joints = list(joints_attr or [])
-    if not joints:
-        print("[hand_test] skeleton has no joints; lean-only reach", flush=True)
-        return None
-    joint_strs = [str(joint) for joint in joints]
-
-    reach_index = _find_reach_joint_index(joint_strs)
-    if reach_index is None:
-        print(
-            "[hand_test] no forearm-like joint name matched (tried "
-            f"{_FOREARM_NAME_HINTS}); run list_skeleton_joints() and set "
-            "HAND_TEST_REACH_JOINT_NAME. Lean-only reach for now.",
-            flush=True,
-        )
-        return None
-
-    rest_matrices = skeleton.GetRestTransformsAttr().Get()
-    if not rest_matrices or len(rest_matrices) != len(joints):
-        print(
-            "[hand_test] restTransforms missing or joint-count mismatch; "
-            "lean-only reach",
-            flush=True,
-        )
-        return None
-
-    anim_path = root_path + "/HandTestReachAnimation"
-    animation = UsdSkel.Animation.Define(stage, anim_path)
-    animation.CreateJointsAttr().Set(joints_attr)
-
-    translations, rotations, scales = [], [], []
-    for matrix in rest_matrices:
-        translation, rotation, scale = UsdSkel.DecomposeTransform(matrix)
-        translations.append(translation)
-        rotations.append(rotation)
-        scales.append(scale)
-    animation.CreateTranslationsAttr().Set(translations)
-    rotations_attr = animation.CreateRotationsAttr()
-    rotations_attr.Set(rotations)
-    animation.CreateScalesAttr().Set(scales)
-
-    binding_api = UsdSkel.BindingAPI.Apply(skel_root_prim)
-    binding_api.CreateAnimationSourceRel().SetTargets([animation.GetPath()])
-
-    axis_vector = _AXIS_VECTORS.get(_REACH_JOINT_AXIS)
-    if axis_vector is None:
-        print(
-            f"[hand_test] HAND_TEST_REACH_JOINT_AXIS={_REACH_JOINT_AXIS!r} "
-            "invalid (use X/Y/Z); defaulting to X",
-            flush=True,
-        )
-        axis_vector = _AXIS_VECTORS["X"]
-
+    yaw = Gf.Rotation(Gf.Vec3d(0.0, 0.0, 1.0), SEAT_YAW_DEGREES)
+    world_offset = yaw.TransformDir(_RIGHT_HAND_REST_LOCAL_OFFSET)
+    target = TABLE_HAND_TARGET - world_offset
     print(
-        f"[hand_test] driving joint [{reach_index}] {joint_strs[reach_index]} "
-        f"around local {_REACH_JOINT_AXIS} up to {REACH_JOINT_ANGLE_DEG} deg "
-        f"(seeded {len(joints)}-joint rest-pose animation at {anim_path})",
+        f"[hand_test] reach target from hardcoded rest-pose hand offset "
+        f"{tuple(_RIGHT_HAND_REST_LOCAL_OFFSET)} (yawed {tuple(world_offset)}): "
+        f"body root -> {tuple(target)}",
         flush=True,
     )
-    return {
-        "rotations_attr": rotations_attr,
-        "rest_rotations": rotations,
-        "reach_index": reach_index,
-        "axis_vector": axis_vector,
-    }
+    return target
 
 
 class ReachAnimator:
-    """Drives PERSON_PRIM_PATH's whole-body lean and (if skeleton setup
-    succeeds) its forearm joint's rotation, on a randomized 5-10s period.
-    Call update() once per simulation_app frame; timing is wall-clock
+    """Drives PERSON_PRIM_PATH's whole body between SEAT_POSITION and a
+    reach target on a randomized 5-10s period, via a plain translate op
+    (see module docstring for why per-joint rotation isn't used). Call
+    update() once per simulation_app frame; timing is wall-clock
     (time.time()), matching this demo's non-headless real-time frame
     pacing.
     """
 
-    def __init__(self, prim, stage=None):
+    def __init__(self, prim):
         # Matches the double-precision translateOp spawn_seated_person()
         # authors directly (see its comment on why XformCommonAPI can't be
         # used here). GetOrderedXformOps()[0] is that translate op, since
@@ -330,20 +255,16 @@ class ReachAnimator:
             MIN_PERIOD_SECONDS, MAX_PERIOD_SECONDS
         )
 
-        self.skeleton_reach = None
-        if stage is not None:
-            try:
-                self.skeleton_reach = _setup_skeleton_reach(
-                    stage, str(prim.GetPath())
-                )
-            except Exception as exc:  # noqa: BLE001 -- see module docstring
-                print(
-                    "[hand_test] skeleton reach setup raised "
-                    f"{type(exc).__name__}: {exc}; falling back to "
-                    "lean-only reach",
-                    flush=True,
-                )
-                self.skeleton_reach = None
+        try:
+            self.reach_target = _compute_hand_reach_target()
+        except Exception as exc:  # noqa: BLE001 -- see module docstring
+            print(
+                "[hand_test] reach target computation raised "
+                f"{type(exc).__name__}: {exc}; falling back to "
+                "lean-only reach",
+                flush=True,
+            )
+            self.reach_target = LEAN_TARGET
 
     def _cycle_progress(self, elapsed: float) -> float:
         if elapsed < REACH_TRAVEL_SECONDS:
@@ -354,29 +275,8 @@ class ReachAnimator:
         return 1.0 - _smoothstep(retract_elapsed / REACH_TRAVEL_SECONDS)
 
     def _apply_progress(self, progress: float) -> None:
-        position = SEAT_POSITION + (LEAN_TARGET - SEAT_POSITION) * progress
+        position = SEAT_POSITION + (self.reach_target - SEAT_POSITION) * progress
         self.translate_op.Set(position)
-
-        if self.skeleton_reach is None:
-            return
-        try:
-            angle_deg = REACH_JOINT_ANGLE_DEG * progress
-            delta = Gf.Rotation(self.skeleton_reach["axis_vector"], angle_deg)
-            delta_quat = Gf.Quatf(delta.GetQuat())
-            rest_rotation = self.skeleton_reach["rest_rotations"][
-                self.skeleton_reach["reach_index"]
-            ]
-            rotations = list(self.skeleton_reach["rest_rotations"])
-            rotations[self.skeleton_reach["reach_index"]] = rest_rotation * delta_quat
-            self.skeleton_reach["rotations_attr"].Set(rotations)
-        except Exception as exc:  # noqa: BLE001 -- see module docstring
-            print(
-                "[hand_test] skeleton reach update raised "
-                f"{type(exc).__name__}: {exc}; disabling joint drive for "
-                "the rest of this run (lean continues)",
-                flush=True,
-            )
-            self.skeleton_reach = None
 
     def update(self) -> None:
         now = time.time()
