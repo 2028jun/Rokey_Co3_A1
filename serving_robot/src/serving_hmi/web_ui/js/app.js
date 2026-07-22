@@ -143,7 +143,7 @@ function updateSystemTelemetry(data) {
     const camPlaceholder = document.getElementById('camera-placeholder');
     const camStatus = document.getElementById('camera-status-text');
 
-    if (camImgData && camImgData.length > 0) {
+    if (data.camera_connected && camImgData && camImgData.length > 0) {
         if (camImgEl) {
             camImgEl.src = camImgData;
             camImgEl.style.display = 'block';
@@ -324,11 +324,20 @@ function submitOrder() {
 
 function cancelOrder(orderId) {
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    if (currentDriveMode === 'LIVE') {
+        alert("LIVE 모드 주문 취소는 manager 취소 API가 없어 지원되지 않습니다.");
+        return;
+    }
     socket.send(JSON.stringify({
         type: "UPDATE_ORDER_STATUS",
         order_id: orderId,
         status: "CANCELLED"
     }));
+}
+
+function resetManagerFault() {
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({ type: "RESET_FAULT" }));
 }
 
 function toggleEmergencyStop() {

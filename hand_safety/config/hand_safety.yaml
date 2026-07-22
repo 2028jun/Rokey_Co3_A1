@@ -20,7 +20,12 @@ hand_detector_node:
     device: "0"
     half: false
     process_rate: 30.0
-    confirmation_frames: 3
+    confirmation_frames: 5
+    # Simulator-first dynamic mask for the robot's dark, neutral material.
+    self_mask_enabled: true
+    self_mask_value_max: 70
+    self_mask_saturation_max: 100
+    self_mask_min_box_overlap: 0.50
     # Large debug images and OpenCV HighGUI can make the process appear hung.
     publish_annotated_image: false
     show_window: false

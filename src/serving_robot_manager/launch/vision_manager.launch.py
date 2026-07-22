@@ -45,6 +45,11 @@ def generate_launch_description():
                         "confidence": 0.60,
                         "image_size": 1280,
                         "half": False,
+                        "confirmation_frames": 5,
+                        "self_mask_enabled": True,
+                        "self_mask_value_max": 70,
+                        "self_mask_saturation_max": 100,
+                        "self_mask_min_box_overlap": 0.50,
                         "publish_annotated_image": ParameterValue(
                             vision_debug, value_type=bool
                         ),

@@ -1081,7 +1081,10 @@ class NavBridge(Node):
         self._spawned_serving_tasks = {}
         self._direct_nav = None
         self._direct_nav_request = None
+        self._navigation_paused = False
+        self._navigation_pause_started = None
         self._navigation_location = 4
+        self._last_navigation_heartbeat = 0.0
         self._active_delivery_table = None
         self._completed_delivery_table = None
         self._delivered_trip_counts = {}
@@ -1312,6 +1315,28 @@ class NavBridge(Node):
         self._queue_navigation(int(msg.data))
 
     def _queue_navigation(self, target):
+        if target == 99:
+            with self._lock:
+                if self._direct_nav is None and self._direct_nav_request is None:
+                    return False
+                if not self._navigation_paused:
+                    self._navigation_paused = True
+                    self._navigation_pause_started = time.monotonic()
+                self._target_vx = self._target_wz = 0.0
+                self._cmd_vx = self._cmd_wz = 0.0
+            self.get_logger().warning("direct navigation paused")
+            return True
+        if target == 98:
+            with self._lock:
+                if not self._navigation_paused:
+                    return False
+                paused_for = time.monotonic() - self._navigation_pause_started
+                if self._direct_nav is not None:
+                    self._direct_nav["stage_start"] += paused_for
+                self._navigation_paused = False
+                self._navigation_pause_started = None
+            self.get_logger().info("direct navigation resumed")
+            return True
         if target not in (0, 1, 2, 3, 4):
             self.get_logger().warning(f"unknown navigation command: {target}")
             return False
@@ -1520,6 +1545,8 @@ class NavBridge(Node):
         mission = self._direct_nav
         if mission is None:
             return None
+        if self._navigation_paused:
+            return 0.0, 0.0
         if mission["mode"] == "legacy_table":
             return self._update_legacy_table_navigation(mission, x, y, yaw)
 
@@ -1814,6 +1841,20 @@ class NavBridge(Node):
 
     def tick(self, _sim_time_sec: float = 0.0):
         self._apply_pending_teleport()
+
+        now_monotonic = time.monotonic()
+        if now_monotonic - self._last_navigation_heartbeat >= 1.0:
+            self._last_navigation_heartbeat = now_monotonic
+            navigation_active = (
+                self._direct_nav is not None
+                or self._direct_nav_request is not None
+            )
+            self.navigation_location_pub.publish(
+                Int32(data=self._navigation_location)
+            )
+            self.navigation_status_pub.publish(
+                Int32(data=1 if navigation_active else 2)
+            )
 
         position, orientation = self.articulation.get_world_pose()
         x = float(position[0])

@@ -41,7 +41,7 @@
                     <span class="status-dot offline" id="robot-dot"></span>
                     <span class="label">Robot (M0609):</span>
                     <strong id="robot-state-text">OFFLINE</strong>
-                    <span class="domain-tag" id="domain-id-tag">Domain 101</span>
+                    <span class="domain-tag" id="domain-id-tag">Domain 102</span>
                 </div>
 
                 <div class="status-badge">
@@ -52,6 +52,9 @@
 
                 <button class="estop-btn" id="estop-btn" onclick="toggleEmergencyStop()">
                     <i class="fa-solid fa-triangle-exclamation"></i> EMERGENCY STOP
+                </button>
+                <button class="mode-toggle-btn" id="reset-fault-btn" onclick="resetManagerFault()">
+                    <i class="fa-solid fa-rotate-right"></i> RESET FAULT
                 </button>
             </div>
         </header>
@@ -174,7 +177,7 @@
                         <img id="camera-stream-img" src="" alt="Camera Feed Waiting..." onerror="this.style.display='none'; document.getElementById('camera-placeholder').style.display='flex';">
                         <div class="camera-placeholder" id="camera-placeholder">
                             <i class="fa-solid fa-camera-retro"></i>
-                            <p>/serving_robot/table_camera/color/image_raw 대기 중</p>
+                            <p>/camera/color/image_raw 대기 중</p>
                         </div>
                     </div>
                 </div>

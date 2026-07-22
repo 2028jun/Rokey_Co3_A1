@@ -8,7 +8,13 @@ from typing import Set
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data, QoSProfile
+from rclpy.qos import (
+    qos_profile_sensor_data,
+    DurabilityPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
+from nav_msgs.msg import Odometry
 from rosgraph_msgs.msg import Clock
 from std_msgs.msg import String, Bool, Int32
 from std_srvs.srv import Trigger
@@ -16,9 +22,12 @@ from std_srvs.srv import Trigger
 try:
     from serving_robot_interfaces.srv import OrderRequest
     ORDER_REQUEST_SRV_AVAILABLE = True
-except ImportError:
+except ImportError as exc:
     OrderRequest = None
     ORDER_REQUEST_SRV_AVAILABLE = False
+    ORDER_REQUEST_IMPORT_ERROR = str(exc)
+else:
+    ORDER_REQUEST_IMPORT_ERROR = ""
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -60,6 +69,12 @@ class HMIBridgeNode(Node):
         # Publishers
         self.order_pub = self.create_publisher(String, '/serving_robot/order', 10)
         self.estop_pub = self.create_publisher(Bool, '/serving_robot/emergency_stop', 10)
+
+        status_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
         
         # ROS 2 Subscribers
         self.clock_sub = self.create_subscription(
@@ -94,11 +109,19 @@ class HMIBridgeNode(Node):
         # Table Camera Subscription
         from sensor_msgs.msg import Image
         self.last_camera_base64 = ""
+        self.last_camera_recv_time = 0.0
+        self.last_camera_error_time = 0.0
         self.camera_sub = self.create_subscription(
             Image,
-            '/serving_robot/table_camera/color/image_raw',
+            '/camera/color/image_raw',
             self.table_camera_callback,
             qos_profile_sensor_data
+        )
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            '/nav_robot/odom',
+            self.odom_callback,
+            qos_profile_sensor_data,
         )
 
         # Serving Robot Manager Integration Clients & Subscribers
@@ -106,12 +129,25 @@ class HMIBridgeNode(Node):
             Int32,
             '/system/status',
             self.system_status_callback,
-            10
+            status_qos
+        )
+        self.order_cancelled_sub = self.create_subscription(
+            Int32,
+            '/manager/order_cancelled',
+            self.order_cancelled_callback,
+            10,
         )
         self.manager_reset_client = self.create_client(Trigger, '/manager/reset_fault')
         if ORDER_REQUEST_SRV_AVAILABLE:
             self.manager_order_client = self.create_client(OrderRequest, '/manager/order')
             self.get_logger().info("Manager /manager/order Service Client created.")
+        else:
+            self.get_logger().error(
+                f"OrderRequest interface import failed: {ORDER_REQUEST_IMPORT_ERROR}")
+
+        # Periodic timer for checking liveness and driving mock navigation (20 Hz)
+        self.create_timer(0.05, self.check_liveness_timer)
+        self.get_logger().info("HMI ROS 2 Bridge Node initialized.")
 
     def table_camera_callback(self, msg):
         try:
@@ -119,24 +155,45 @@ class HMIBridgeNode(Node):
             import numpy as np
             import base64
 
-            # Convert ROS Image to OpenCV BGR
             height = msg.height
             width = msg.width
-            if msg.encoding in ['rgb8', 'bgr8']:
-                img = np.frombuffer(msg.data, dtype=np.uint8).reshape((height, width, 3))
-                if msg.encoding == 'rgb8':
-                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                
-                # Compress to JPEG Base64
-                _, buffer = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 60])
-                b64_str = base64.b64encode(buffer).decode('utf-8')
-                self.last_camera_base64 = f"data:image/jpeg;base64,{b64_str}"
+            encoding = msg.encoding.lower()
+            channels = {
+                'mono8': 1,
+                'rgb8': 3,
+                'bgr8': 3,
+                'rgba8': 4,
+                'bgra8': 4,
+            }.get(encoding)
+            if channels is None:
+                raise ValueError(f"unsupported image encoding: {msg.encoding}")
+
+            row_bytes = int(msg.step) if msg.step else width * channels
+            rows = np.frombuffer(msg.data, dtype=np.uint8).reshape(height, row_bytes)
+            pixels = rows[:, :width * channels]
+            if channels == 1:
+                img = pixels.reshape(height, width)
+            else:
+                img = pixels.reshape(height, width, channels)
+            if encoding == 'rgb8':
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            elif encoding == 'rgba8':
+                img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+            elif encoding == 'bgra8':
+                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+            ok, buffer = cv2.imencode(
+                '.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            if not ok:
+                raise RuntimeError("JPEG encoding failed")
+            b64_str = base64.b64encode(buffer).decode('utf-8')
+            self.last_camera_base64 = f"data:image/jpeg;base64,{b64_str}"
+            self.last_camera_recv_time = time.time()
         except Exception as e:
-            pass
-        
-        # Periodic timer for checking liveness and driving mock navigation (20 Hz)
-        self.create_timer(0.05, self.check_liveness_timer)
-        self.get_logger().info("HMI ROS 2 Bridge Node initialized.")
+            now = time.time()
+            if now - self.last_camera_error_time >= 5.0:
+                self.last_camera_error_time = now
+                self.get_logger().warning(f"Camera frame conversion failed: {e}")
 
     def clock_callback(self, msg: Clock):
         now_wall = time.time()
@@ -150,6 +207,23 @@ class HMIBridgeNode(Node):
         self.last_clock_time = sim_sec
         self.last_clock_recv_wall_time = now_wall
         self.isaac_sim_connected = True
+
+    def odom_callback(self, msg: Odometry):
+        orientation = msg.pose.pose.orientation
+        siny_cosp = 2.0 * (
+            orientation.w * orientation.z + orientation.x * orientation.y)
+        cosy_cosp = 1.0 - 2.0 * (
+            orientation.y * orientation.y + orientation.z * orientation.z)
+        import math
+        self.robot_pose = {
+            "x": float(msg.pose.pose.position.x),
+            "y": float(msg.pose.pose.position.y),
+            "yaw": math.atan2(siny_cosp, cosy_cosp),
+        }
+        self.last_robot_status_recv_time = time.time()
+        self.robot_connected = True
+        if self.drive_mode != "LIVE":
+            self.drive_mode = "LIVE"
 
     def robot_status_callback(self, msg: String):
         self.last_robot_status_recv_time = time.time()
@@ -239,8 +313,22 @@ class HMIBridgeNode(Node):
             elif status_code == 6:
                 order_manager.update_status(active_id, OrderStatus.COMPLETED)
                 self.parking_brake = True
+            elif status_code == 7:
+                order_manager.update_status(active_id, OrderStatus.CANCELLED)
+                self.parking_brake = True
 
-    def send_order_to_manager(self, table_num: int, items: list):
+    def order_cancelled_callback(self, msg: Int32):
+        hmi_table_number = int(msg.data) + 1
+        for order in order_manager.orders.values():
+            if (order.table_number == hmi_table_number
+                    and order.status not in (OrderStatus.COMPLETED,
+                                             OrderStatus.CANCELLED)):
+                order_manager.update_status(order.order_id, OrderStatus.CANCELLED)
+                self.get_logger().warning(
+                    f"Manager cancelled queued HMI order {order.order_id}")
+                return
+
+    def send_order_to_manager(self, order_id: str, table_num: int, items: list):
         if not ORDER_REQUEST_SRV_AVAILABLE or not hasattr(self, 'manager_order_client'):
             return False, "OrderRequest srv not loaded"
         if not self.manager_order_client.service_is_ready():
@@ -248,30 +336,66 @@ class HMIBridgeNode(Node):
 
         pizza1, pizza2, pizza3, drink, cutlery = 0, 0, 0, 0, 0
         for item in items:
+            menu_id = str(item.get("menu_id", "")).strip().lower()
             name = item.get("name", "").lower()
             qty = int(item.get("quantity", 1))
-            if "pizza 1" in name or "supreme" in name or name == "pizza1":
+            if qty <= 0:
+                continue
+            if menu_id == "m1" or "pizza 1" in name or "supreme" in name or name == "pizza1":
                 pizza1 += qty
-            elif "pizza 2" in name or "pepperoni" in name or name == "pizza2":
+            elif menu_id == "m2" or "pizza 2" in name or "pepperoni" in name or name == "pizza2":
                 pizza2 += qty
-            elif "pizza 3" in name or "cheese" in name or name == "pizza3" or "pizza" in name:
+            elif menu_id == "m3" or "pizza 3" in name or "cheese" in name or name == "pizza3" or "pizza" in name:
                 pizza3 += qty
-            elif "soda" in name or "drink" in name or "beverage" in name:
+            elif menu_id == "m4" or "soda" in name or "drink" in name or "beverage" in name:
                 drink += qty
-            elif "cutlery" in name or "fork" in name or "spoon" in name:
+            elif menu_id == "m5" or "cutlery" in name or "fork" in name or "spoon" in name:
                 cutlery += qty
 
+        if not any((pizza1, pizza2, pizza3, drink, cutlery)):
+            return False, "No supported menu items in order"
+
+        hmi_table_number = int(table_num)
+        if not 1 <= hmi_table_number <= 4:
+            return False, f"Invalid HMI table number: {hmi_table_number}"
+
+        # The web UI labels tables 1..4, while manager/axis routes use the
+        # zero-based IDs 0..3. Keep the user-facing number unchanged and only
+        # translate at the ROS service boundary.
+        manager_table_id = hmi_table_number - 1
         req = OrderRequest.Request()
-        req.table_id = int(table_num)
+        req.table_id = manager_table_id
         req.pizza1_count = pizza1
         req.pizza2_count = pizza2
         req.pizza3_count = pizza3
         req.drink_count = drink
         req.cutlery_count = cutlery
 
-        print(f"🚀 [HMI Backend] Sending OrderRequest to Manager: Table={table_num}, P1={pizza1}, P2={pizza2}, P3={pizza3}, Drink={drink}, Cutlery={cutlery}", flush=True)
-        self.manager_order_client.call_async(req)
+        print(
+            "🚀 [HMI Backend] Sending OrderRequest to Manager: "
+            f"HMI Table={hmi_table_number} -> route_id={manager_table_id}, "
+            f"P1={pizza1}, P2={pizza2}, P3={pizza3}, "
+            f"Drink={drink}, Cutlery={cutlery}",
+            flush=True,
+        )
+        future = self.manager_order_client.call_async(req)
+        future.add_done_callback(
+            lambda completed, oid=order_id: self._on_manager_order_response(oid, completed)
+        )
         return True, "Order dispatched to Manager via /manager/order"
+
+    def _on_manager_order_response(self, order_id, future):
+        try:
+            response = future.result()
+            if response is not None and response.success:
+                self.get_logger().info(f"Manager accepted HMI order {order_id}")
+                return
+            reason = "manager rejected the order"
+        except Exception as exc:
+            reason = f"service call failed: {exc}"
+
+        order_manager.update_status(order_id, OrderStatus.CANCELLED)
+        self.get_logger().error(f"HMI order {order_id} cancelled: {reason}")
 
     def reset_manager_fault(self):
         if hasattr(self, 'manager_reset_client') and self.manager_reset_client.service_is_ready():
@@ -403,6 +527,11 @@ ros_node: HMIBridgeNode = None
 
 def get_system_status_payload():
     is_mock = (ros_node.drive_mode == "MOCK") if ros_node else True
+    camera_connected = bool(
+        ros_node
+        and ros_node.last_camera_recv_time > 0.0
+        and time.time() - ros_node.last_camera_recv_time <= 2.0
+    )
     return {
         "type": "SYSTEM_STATUS",
         "timestamp": time.time(),
@@ -420,7 +549,9 @@ def get_system_status_payload():
             "battery": ros_node.battery_level if ros_node else 100.0,
             "domain_id": os.environ.get("ROS_DOMAIN_ID", "101")
         },
-        "camera_image": ros_node.last_camera_base64 if ros_node else "",
+        "camera_connected": camera_connected,
+        "camera_image": (
+            ros_node.last_camera_base64 if camera_connected else ""),
         "orders": order_manager.get_all_orders_dict(),
         "active_order_id": order_manager.active_order_id
     }
@@ -474,10 +605,16 @@ async def websocket_endpoint(websocket: WebSocket):
                         "status": new_order.status
                     }
                     if ros_node:
-                        sent, msg = ros_node.send_order_to_manager(table_num, items)
-                        if not sent:
+                        if ros_node.drive_mode == "LIVE":
+                            sent, msg = ros_node.send_order_to_manager(
+                                new_order.order_id, table_num, items)
+                            if not sent:
+                                order_manager.update_status(
+                                    new_order.order_id, OrderStatus.CANCELLED)
+                                ros_node.get_logger().error(
+                                    f"HMI order {new_order.order_id} cancelled: {msg}")
+                        else:
                             ros_node.publish_order(order_payload)
-                        if ros_node.drive_mode == "MOCK":
                             ros_node.update_mock_navigation()
 
                     # Immediate broadcast to all clients

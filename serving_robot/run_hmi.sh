@@ -3,11 +3,13 @@
 set -e
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+WORKSPACE_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 source /opt/ros/humble/setup.bash || true
-if [ -f "$SCRIPT_DIR/install/setup.bash" ]; then
-    source "$SCRIPT_DIR/install/setup.bash"
-elif [ -f "/home/rokey/cobot3_ws/install/setup.bash" ]; then
-    source "/home/rokey/cobot3_ws/install/setup.bash"
+if [ -f "$WORKSPACE_DIR/install/setup.bash" ]; then
+    source "$WORKSPACE_DIR/install/setup.bash"
+else
+    echo "ERROR: $WORKSPACE_DIR/install/setup.bash not found. Build the ROS workspace first." >&2
+    exit 1
 fi
 
 export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-102}
@@ -19,6 +21,5 @@ echo " ROS_DOMAIN_ID : $ROS_DOMAIN_ID"
 echo " HMI Web Access: http://localhost:$HMI_PORT"
 echo "=========================================================="
 
-WORKSPACE_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
-export PYTHONPATH=$SCRIPT_DIR/src/serving_hmi:$WORKSPACE_DIR/src/serving_robot_manager:$WORKSPACE_DIR/src/serving_robot_interfaces:$PYTHONPATH
+export PYTHONPATH=$SCRIPT_DIR/src/serving_hmi:$PYTHONPATH
 python3 -m serving_hmi.hmi_backend_node

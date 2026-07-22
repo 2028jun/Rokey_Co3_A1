@@ -35,7 +35,7 @@ class DirectNavServer(Node):
 
     def _on_command(self, request, response):
         target = int(request.command)
-        if target not in (0, 1, 2, 3, 4):
+        if target not in (0, 1, 2, 3, 4, 98, 99):
             self.get_logger().warning(f"unknown navigation command: {target}")
             response.success = False
             return response

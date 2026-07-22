@@ -73,7 +73,12 @@ class HandDetectorNode(Node):
         self.declare_parameter("device", "0")
         self.declare_parameter("half", False)
         self.declare_parameter("process_rate", 30.0)
-        self.declare_parameter("confirmation_frames", 3)
+        self.declare_parameter("confirmation_frames", 5)
+        # Simulator-first dynamic self-mask for the robot's dark material.
+        self.declare_parameter("self_mask_enabled", True)
+        self.declare_parameter("self_mask_value_max", 70)
+        self.declare_parameter("self_mask_saturation_max", 100)
+        self.declare_parameter("self_mask_min_box_overlap", 0.50)
         # Defaulted on for the vision GPU test: `ros2 run hand_safety
         # hand_detector_node` alone now opens a live cv2 window and
         # publishes the annotated stream, no --ros-args needed.
@@ -127,6 +132,18 @@ class HandDetectorNode(Node):
         self.confirmation_frames = int(
             self.get_parameter("confirmation_frames").value
         )
+        self.self_mask_enabled = bool(
+            self.get_parameter("self_mask_enabled").value
+        )
+        self.self_mask_value_max = int(
+            self.get_parameter("self_mask_value_max").value
+        )
+        self.self_mask_saturation_max = int(
+            self.get_parameter("self_mask_saturation_max").value
+        )
+        self.self_mask_min_box_overlap = float(
+            self.get_parameter("self_mask_min_box_overlap").value
+        )
         self.publish_annotated_image = bool(
             self.get_parameter("publish_annotated_image").value
         )
@@ -153,6 +170,16 @@ class HandDetectorNode(Node):
         if self.confirmation_frames <= 0:
             raise ValueError(
                 "confirmation_frames must be greater than zero"
+            )
+        if not 0 <= self.self_mask_value_max <= 255:
+            raise ValueError("self_mask_value_max must be between 0 and 255")
+        if not 0 <= self.self_mask_saturation_max <= 255:
+            raise ValueError(
+                "self_mask_saturation_max must be between 0 and 255"
+            )
+        if not 0.0 <= self.self_mask_min_box_overlap <= 1.0:
+            raise ValueError(
+                "self_mask_min_box_overlap must be between 0.0 and 1.0"
             )
         if self.device != "cpu" and not torch.cuda.is_available():
             raise RuntimeError(
@@ -350,11 +377,26 @@ class HandDetectorNode(Node):
             frame_height, frame_width = frame.shape[:2]
             roi_polygon = get_roi_polygon(frame_width, frame_height)
             roi_detections = []
+            self_masked_detections = []
+            robot_self_mask = (
+                self.build_robot_self_mask(frame)
+                if self.self_mask_enabled and candidate_detections
+                else None
+            )
             for detection in candidate_detections:
                 if box_intrudes_roi(
                     detection["bbox_xyxy"], roi_polygon
                 ):
                     detection["roi_intrusion"] = True
+                    mask_overlap = self.box_mask_overlap(
+                        detection["bbox_xyxy"], robot_self_mask
+                    )
+                    detection["self_mask_overlap"] = mask_overlap
+                    if mask_overlap >= self.self_mask_min_box_overlap:
+                        detection["self_masked"] = True
+                        self_masked_detections.append(detection)
+                        continue
+                    detection["self_masked"] = False
                     roi_detections.append(detection)
 
             # Recheck the arrival state after GPU inference before confirming
@@ -453,6 +495,8 @@ class HandDetectorNode(Node):
                 "roi_polygon": [list(point) for point in roi_polygon],
                 "roi_intrusion": intrusion_detected,
                 "detections": detections,
+                "self_mask_enabled": self.self_mask_enabled,
+                "self_masked_detections": self_masked_detections,
             }
             with self.detection_state_lock:
                 # Recheck at the publication boundary. The callback uses this
@@ -492,6 +536,41 @@ class HandDetectorNode(Node):
                 f"Inference failed: {type(exc).__name__}: {exc}\n"
                 f"{traceback.format_exc()}"
             )
+
+    def build_robot_self_mask(self, frame: Any) -> Any:
+        """Return a per-frame mask of dark, low-saturation robot pixels."""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(
+            hsv,
+            np.asarray([0, 0, 0], dtype=np.uint8),
+            np.asarray(
+                [
+                    179,
+                    self.self_mask_saturation_max,
+                    self.self_mask_value_max,
+                ],
+                dtype=np.uint8,
+            ),
+        )
+        # Close small specular gaps without dilating over a nearby hand.
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    @staticmethod
+    def box_mask_overlap(box_xyxy: list[int], mask: Any) -> float:
+        """Return the fraction of a detection box covered by a binary mask."""
+        if mask is None or getattr(mask, "ndim", 0) != 2:
+            return 0.0
+        height, width = mask.shape
+        x1, y1, x2, y2 = box_xyxy
+        x1 = max(0, min(width, int(x1)))
+        x2 = max(0, min(width, int(x2)))
+        y1 = max(0, min(height, int(y1)))
+        y2 = max(0, min(height, int(y2)))
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+        crop = mask[y1:y2, x1:x2]
+        return float(cv2.countNonZero(crop)) / float(crop.size)
 
     def warn_throttled(
         self, key: str, message: str, period: float = 5.0

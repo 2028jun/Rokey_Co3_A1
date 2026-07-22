@@ -119,6 +119,36 @@ def test_spawn_completion_waits_for_command_acceptance():
     manager._call_nav_command.assert_called_once_with(2)
 
 
+def test_new_order_at_confirmed_kitchen_skips_return_navigation():
+    """주방 도착 상태가 확인된 새 주문은 command=4를 다시 보내지 않는다."""
+    manager = _bare_manager()
+    manager._nav_location = 4
+    manager._nav_status = 2
+    manager._serve_queue = [Trip(1, 0, False)]
+    manager._call_nav_command = Mock()
+    manager._start_next_trip = Mock()
+
+    manager._return_to_kitchen_for_next_trip()
+
+    manager._call_nav_command.assert_not_called()
+    manager._start_next_trip.assert_called_once_with()
+
+
+def test_unknown_kitchen_state_still_requests_return_navigation():
+    """위치 또는 상태가 불확실하면 안전하게 기존 주방 복귀를 수행한다."""
+    manager = _bare_manager()
+    manager._nav_location = 4
+    manager._nav_status = None
+    manager._set_state_deadline = Mock()
+    manager._publish_system_status = Mock()
+    manager._call_nav_command = Mock()
+
+    manager._return_to_kitchen_for_next_trip()
+
+    assert manager._state == _State.RETURNING_TO_KITCHEN
+    manager._call_nav_command.assert_called_once_with(4)
+
+
 def test_failure_requests_arm_and_navigation_pause():
     """실패 시 동작 중인 Arm과 Navigation에 pause를 보내는지 확인한다."""
     manager = _bare_manager(_State.ARM_SERVING)
@@ -135,6 +165,16 @@ def test_failure_requests_arm_and_navigation_pause():
     nav_request = manager._nav_client.call_async.call_args.args[0]
     assert arm_request.command == 99
     assert nav_request.command == 99
+
+
+def test_hmi_emergency_stop_enters_failed_state():
+    """HMI 비상정지는 manager의 안전 실패 처리를 즉시 시작한다."""
+    manager = _bare_manager(_State.MOVING_TO_TABLE)
+    manager._fail = Mock()
+
+    manager._on_emergency_stop(type('Message', (), {'data': True})())
+
+    manager._fail.assert_called_once_with()
 
 
 def test_inactive_navigation_moving_does_not_refresh_deadline():

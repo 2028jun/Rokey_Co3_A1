@@ -233,6 +233,8 @@ class ManagerNode(Node):
             Int32, '/navigation/current_location', self._on_nav_location, 10)
         self.create_subscription(Int32, '/food_spawn/status', self._on_spawn_status, 10)
         self.create_subscription(Bool, '/hand_safety/intrusion', self._on_hand_intrusion, 10)
+        self.create_subscription(
+            Bool, '/serving_robot/emergency_stop', self._on_emergency_stop, 10)
 
         # 늦게 연결된 UI도 마지막 시스템 상태를 즉시 받을 수 있게 상태 토픽은 latched QoS로
         # 발행한다. 일반 volatile 구독자와도 현재 이후의 발행은 호환된다.
@@ -349,6 +351,16 @@ class ManagerNode(Node):
         response.message = 'IDLE로 초기화되었습니다.'
         return response
 
+    def _on_emergency_stop(self, msg):
+        if not msg.data:
+            self.get_logger().info(
+                '비상정지 해제 요청 수신; 안전 확인 후 /manager/reset_fault가 필요합니다.')
+            return
+        if self._state == _State.FAILED:
+            return
+        self.get_logger().error('HMI 비상정지 요청을 수신했습니다.')
+        self._fail()
+
     @staticmethod
     def _build_serve_queue(pizza1_count, pizza2_count, pizza3_count, drink_total, cutlery_count):
         # 피자는 종류별로 한 개씩 나열해 트립을 나눌 때도 어떤 종류인지 잃지 않게 한다.
@@ -377,9 +389,15 @@ class ManagerNode(Node):
     # 트립 진행 (주방 확인 -> 스폰 -> 이동 -> 서빙 -> 주방 복귀)
     # ------------------------------------------------------------------
     def _return_to_kitchen_for_next_trip(self):
-        # 다음 트립을 스폰하기 전에 자율주행이 실제로 주방에 도착했는지 확인한다. 이미
-        # 주방이어도 매번 이동 명령을 보내 상태를 능동적으로 재확인한다 (주문 시작 시점,
-        # Manager 재시작 직후 등 캐시를 신뢰할 수 없는 경우까지 같은 경로로 처리하기 위함).
+        # 직전 주행에서 주방 도착 위치와 ARRIVED 상태를 모두 확인했다면 중복 command=4를
+        # 보내지 않는다. 위치나 상태 중 하나라도 불확실한 Manager 재시작 직후에는 기존처럼
+        # 주방 복귀 명령으로 능동 확인한다.
+        if (self._nav_location == NAV_LOCATION_KITCHEN
+                and self._nav_status == NAV_STATUS_ARRIVED):
+            self.get_logger().info(
+                '🏠 현재 위치가 주방으로 확인되어 중복 주방 복귀를 생략합니다.')
+            self._start_next_trip()
+            return
         self._state = _State.RETURNING_TO_KITCHEN
         self._set_state_deadline()
         self._publish_system_status()
