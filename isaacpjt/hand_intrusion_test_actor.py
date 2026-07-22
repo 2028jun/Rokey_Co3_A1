@@ -32,19 +32,18 @@ import time
 from pxr import Gf, UsdGeom
 
 
-# --- VERIFY: no human/character USD asset exists anywhere in this repo or
-# in any sibling branch (checked hmi-web, jaehyeon, main, test, woduq,
-# younggi). This placeholder path is a guess at NVIDIA's Isaac Sim 5.1
-# People asset layout (mirrors the pattern already used for the D455
-# sensor asset in mobile_manipulator_demo.py's D455_ASSET_USD). Open the
-# Isaac Sim content browser, find an actual seated/standing People
-# character under .../Isaac/People/Characters/, and either edit this
-# default or export HAND_TEST_PERSON_USD before running.
+# Verified against the bucket listing (S3 XML ListObjectsV2 on
+# omniverse-content-production, prefix
+# Assets/Isaac/5.1/Isaac/People/Characters/): the original guessed folder
+# name "female_adult_business_02" does not exist (404). The real folder is
+# "F_Business_02" (the textures inside it keep the female_adult_business_02
+# naming, which is why the original guess looked plausible). Confirmed
+# resolvable with `curl -I` -> 200 OK.
 PERSON_USD = os.environ.get(
     "HAND_TEST_PERSON_USD",
     "https://omniverse-content-production.s3-us-west-2.amazonaws.com/"
-    "Assets/Isaac/5.1/Isaac/People/Characters/female_adult_business_02/"
-    "female_adult_business_02.usd",
+    "Assets/Isaac/5.1/Isaac/People/Characters/F_Business_02/"
+    "F_Business_02.usd",
 )
 
 # --- TableSet_00 geometry, read directly from
@@ -56,18 +55,18 @@ TABLE_COLLIDER_CENTER = Gf.Vec3d(-3.2, -2.2, 0.365)
 TABLE_TOP_Z = 0.73  # collider center z (0.365) + half-height (0.365)
 TABLE_HAND_TARGET = Gf.Vec3d(-3.2, -2.2, TABLE_TOP_Z)
 
-# Chair_00_Visual under TableSet_00: translate=(-3.7, -3.2, 0), rotateZ=180
-# (facing the table). VERIFY this is the chair actually inside the
-# robot-mounted camera's field of view -- pick a different Chair_0N under
-# TableSet_00 if Chair_00 turns out to be off-frame or occluded by the
-# robot's docking side (robot docks near x=-1.82, i.e. the table's +X/east
-# side).
-SEAT_XY = (-3.7, -3.2)
-SEAT_YAW_DEGREES = 180.0  # VERIFY: faces table if the asset's forward
-# axis matches the restaurant's chair convention; Isaac People assets vary,
-# rotate in 90-degree steps if the person spawns facing away/sideways.
-SEAT_TORSO_Z = 0.55  # approximate seated-hand resting height; VERIFY
-# against the actual character's proportions once loaded.
+# Chair_01_Visual under TableSet_00: translate=(-2.7, -3.2, 0), rotateZ=180
+# (facing the table). Verified against a captured table_camera frame:
+# Chair_00 (-3.7, -3.2) sits at the far edge of the robot-mounted camera's
+# view and is mostly clipped; Chair_01 is well-centered in frame. This
+# character asset (F_Business_02) is a standing-pose People asset, not a
+# seated one, so SEAT_TORSO_Z is floor height (0.0), not chair-seat height.
+SEAT_XY = (
+    float(os.environ.get("HAND_TEST_SEAT_X", "-2.7")),
+    float(os.environ.get("HAND_TEST_SEAT_Y", "-3.2")),
+)
+SEAT_YAW_DEGREES = float(os.environ.get("HAND_TEST_SEAT_YAW", "180.0"))
+SEAT_TORSO_Z = float(os.environ.get("HAND_TEST_SEAT_Z", "0.0"))
 SEAT_POSITION = Gf.Vec3d(SEAT_XY[0], SEAT_XY[1], SEAT_TORSO_Z)
 
 PERSON_PRIM_PATH = "/World/HandSafetyTestActor"
@@ -106,9 +105,22 @@ def spawn_seated_person(stage):
     prim = xform.GetPrim()
     prim.GetReferences().AddReference(PERSON_USD)
 
-    api = UsdGeom.XformCommonAPI(prim)
-    api.SetTranslate(SEAT_POSITION)
-    api.SetRotate(Gf.Vec3f(0.0, 0.0, SEAT_YAW_DEGREES))
+    # The referenced character asset's own root prim already authors an
+    # `xformOp:rotateXYZ` attribute with double3 precision. Once an
+    # attribute name/type is defined in any layer contributing to this
+    # prim, USD holds every layer to that same type -- XformCommonAPI
+    # always names its rotate op "xformOp:rotateXYZ" and only writes
+    # GfVec3f, so it collides no matter what (ClearXformOpOrder only
+    # clears the *order* list, not the pre-existing attribute spec).
+    # Sidestep by authoring our own double-precision ops directly, using
+    # a differently-named rotateZ op (this test only ever needs a
+    # yaw-around-Z, so RotateXYZ was never necessary).
+    xformable = UsdGeom.Xformable(prim)
+    xformable.ClearXformOpOrder()
+    translate_op = xformable.AddTranslateOp(precision=UsdGeom.XformOp.PrecisionDouble)
+    translate_op.Set(SEAT_POSITION)
+    rotate_op = xformable.AddRotateZOp(precision=UsdGeom.XformOp.PrecisionDouble)
+    rotate_op.Set(SEAT_YAW_DEGREES)
     print(
         f"[hand_test] spawned {PERSON_USD} at {PERSON_PRIM_PATH}, "
         f"seat={tuple(SEAT_POSITION)} yaw={SEAT_YAW_DEGREES}",
@@ -125,7 +137,11 @@ class ReachAnimator:
     """
 
     def __init__(self, prim):
-        self.api = UsdGeom.XformCommonAPI(prim)
+        # Matches the double-precision translateOp spawn_seated_person()
+        # authors directly (see its comment on why XformCommonAPI can't be
+        # used here). GetOrderedXformOps()[0] is that translate op, since
+        # it was the first (and only translate) op added.
+        self.translate_op = UsdGeom.Xformable(prim).GetOrderedXformOps()[0]
         self.active = False
         self.event_start: float | None = None
         self.next_event_time = time.time() + random.uniform(
@@ -153,7 +169,7 @@ class ReachAnimator:
         total_duration = 2.0 * REACH_TRAVEL_SECONDS + REACH_HOLD_SECONDS
         if elapsed >= total_duration:
             self.active = False
-            self.api.SetTranslate(SEAT_POSITION)
+            self.translate_op.Set(SEAT_POSITION)
             self.next_event_time = now + random.uniform(
                 MIN_PERIOD_SECONDS, MAX_PERIOD_SECONDS
             )
@@ -166,4 +182,4 @@ class ReachAnimator:
 
         progress = self._cycle_progress(elapsed)
         position = SEAT_POSITION + (TABLE_HAND_TARGET - SEAT_POSITION) * progress
-        self.api.SetTranslate(position)
+        self.translate_op.Set(position)

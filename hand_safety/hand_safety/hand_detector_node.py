@@ -76,8 +76,11 @@ class HandDetectorNode(Node):
         self.declare_parameter("device", "0")
         self.declare_parameter("process_rate", 30.0)
         self.declare_parameter("confirmation_frames", 3)
-        self.declare_parameter("publish_annotated_image", False)
-        self.declare_parameter("show_window", False)
+        # Defaulted on for the vision GPU test: `ros2 run hand_safety
+        # hand_detector_node` alone now opens a live cv2 window and
+        # publishes the annotated stream, no --ros-args needed.
+        self.declare_parameter("publish_annotated_image", True)
+        self.declare_parameter("show_window", True)
 
         self.input_topic = str(
             self.get_parameter("input_topic").value

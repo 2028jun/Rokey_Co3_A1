@@ -720,7 +720,7 @@ def main():
     open_table_camera_preview()
 
     reach_animator = None
-    if os.environ.get("MOBILE_DEMO_HAND_TEST", "0") == "1":
+    if os.environ.get("MOBILE_DEMO_HAND_TEST", "1") == "1":
         person_prim = hand_test.spawn_seated_person(stage)
         reach_animator = hand_test.ReachAnimator(person_prim)
     if os.environ.get("MOBILE_DEMO_PRINT_BOUNDS", "0") == "1":
