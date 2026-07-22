@@ -1,0 +1,7 @@
+# Cross-track validation while Nav2 follows fixed rails (routes.yaml).
+max_lateral_error_m: 0.28
+max_lateral_error_branch_m: 0.40
+max_lateral_error_dock_m: 0.35
+log_period_sec: 2.0
+require_nav_feedback_sec: 8.0
+cte_grace_sec: 1.5
