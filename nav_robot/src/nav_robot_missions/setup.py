@@ -21,7 +21,6 @@ setup(
     license="BSD-3-Clause",
     entry_points={
         "console_scripts": [
-            "go_to_table = nav_robot_missions.go_to_table:main",
             "return_to_kitchen = nav_robot_missions.return_to_kitchen:main",
             "nav_server_node = nav_robot_missions.nav_server_node:main",
             "hybrid_nav_server_node = nav_robot_missions.hybrid_nav_server_node:main",

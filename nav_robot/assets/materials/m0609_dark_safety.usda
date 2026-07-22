@@ -1,0 +1,20 @@
+#usda 1.0
+(
+    defaultPrim = "M0609DarkSafety"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Material "M0609DarkSafety"
+{
+    token outputs:surface.connect = </M0609DarkSafety/PreviewSurface.outputs:surface>
+
+    def Shader "PreviewSurface"
+    {
+        uniform token info:id = "UsdPreviewSurface"
+        color3f inputs:diffuseColor = (0.025, 0.035, 0.045)
+        float inputs:metallic = 0.05
+        float inputs:roughness = 0.82
+        token outputs:surface
+    }
+}

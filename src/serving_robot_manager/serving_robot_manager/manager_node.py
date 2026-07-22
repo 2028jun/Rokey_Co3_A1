@@ -154,12 +154,21 @@ class ManagerNode(Node):
         super().__init__('manager_node')
 
         self._state_timeout_sec = self.declare_parameter('state_timeout_sec', 30.0).value
+        self._navigation_timeout_sec = self.declare_parameter(
+            'navigation_timeout_sec', 120.0).value
+        self._spawn_timeout_sec = self.declare_parameter(
+            'spawn_timeout_sec', 60.0).value
+        self._arm_timeout_sec = self.declare_parameter(
+            'arm_timeout_sec', 600.0).value
         self._safety_cmd_timeout_sec = self.declare_parameter(
             'safety_cmd_timeout_sec', 5.0).value
         self._hand_safety_heartbeat_sec = self.declare_parameter(
             'hand_safety_heartbeat_sec', 2.0).value
         timeout_parameters = {
             'state_timeout_sec': self._state_timeout_sec,
+            'navigation_timeout_sec': self._navigation_timeout_sec,
+            'spawn_timeout_sec': self._spawn_timeout_sec,
+            'arm_timeout_sec': self._arm_timeout_sec,
             'safety_cmd_timeout_sec': self._safety_cmd_timeout_sec,
             'hand_safety_heartbeat_sec': self._hand_safety_heartbeat_sec,
         }
@@ -171,6 +180,9 @@ class ManagerNode(Node):
             raise ValueError(
                 f'타임아웃 파라미터는 0보다 큰 숫자여야 합니다: {invalid_parameters}')
         self._state_timeout_sec = float(self._state_timeout_sec)
+        self._navigation_timeout_sec = float(self._navigation_timeout_sec)
+        self._spawn_timeout_sec = float(self._spawn_timeout_sec)
+        self._arm_timeout_sec = float(self._arm_timeout_sec)
         self._safety_cmd_timeout_sec = float(self._safety_cmd_timeout_sec)
         self._hand_safety_heartbeat_sec = float(self._hand_safety_heartbeat_sec)
 
@@ -199,6 +211,7 @@ class ManagerNode(Node):
 
         self._hand_intrusion = False
         self._last_hand_intrusion_stamp = None
+        self._table_arrived = False
         # 아직 Arm에 명령을 보내지 않은 트립이 손 침입 때문에 대기 중인지 여부.
         # True면 재개 시 98(재개)이 아니라 새 트립 명령을 보내야 한다.
         self._waiting_to_start_trip = False
@@ -230,6 +243,8 @@ class ManagerNode(Node):
         )
         self._system_status_pub = self.create_publisher(
             Int32, '/system/status', status_qos)
+        self._table_arrived_pub = self.create_publisher(
+            Bool, '/serving_robot/table_arrived', status_qos)
         self._order_cancelled_pub = self.create_publisher(Int32, '/manager/order_cancelled', 10)
         self.create_service(OrderRequest, '/manager/order', self._on_order_request)
         self.create_service(Trigger, '/manager/reset_fault', self._on_reset_fault)
@@ -657,9 +672,14 @@ class ManagerNode(Node):
     # ------------------------------------------------------------------
     def _begin_arm_serving(self):
         if not self._hand_safety_is_fresh():
-            self.get_logger().error(
-                '❌ [SAFETY ERROR] 최근 손 침입 감지 신호가 없어 로봇팔을 안전하게 시작할 수 없습니다.')
-            self._fail()
+            self.get_logger().warn(
+                '⏳ [SAFETY WAIT] 테이블 도착 신호를 보내고 첫 손 침입 감지 '
+                '샘플을 기다립니다.')
+            self._waiting_to_start_trip = True
+            self._arm_working_confirmed = False
+            self._state = _State.ARM_PAUSED
+            self._state_deadline = None
+            self._publish_system_status()
             return
         if self._hand_intrusion:
             self.get_logger().warn('✋ [HAND INTRUSION] ROI 손 침입 감지 상태 -> 서빙 동작 일시 대기')
@@ -744,13 +764,25 @@ class ManagerNode(Node):
     # 타임아웃 워치독
     # ------------------------------------------------------------------
     def _set_state_deadline(self):
-        self._state_deadline = self.get_clock().now() + Duration(seconds=self._state_timeout_sec)
+        if self._state in (_State.RETURNING_TO_KITCHEN, _State.MOVING_TO_TABLE):
+            timeout = getattr(
+                self, '_navigation_timeout_sec', self._state_timeout_sec)
+        elif self._state == _State.SPAWNING:
+            timeout = getattr(self, '_spawn_timeout_sec', self._state_timeout_sec)
+        elif self._state == _State.ARM_SERVING:
+            timeout = getattr(self, '_arm_timeout_sec', self._state_timeout_sec)
+        else:
+            timeout = self._state_timeout_sec
+        self._active_state_timeout_sec = float(timeout)
+        self._state_deadline = self.get_clock().now() + Duration(seconds=timeout)
 
     def _check_timeouts(self):
         now = self.get_clock().now()
         if self._state_deadline is not None and now > self._state_deadline:
+            timeout = getattr(
+                self, '_active_state_timeout_sec', self._state_timeout_sec)
             self.get_logger().error(
-                f'{self._state.name} 상태에서 {self._state_timeout_sec}초간 진행 신호가 없어 '
+                f'{self._state.name} 상태에서 {timeout}초간 진행 신호가 없어 '
                 '실패 처리합니다.')
             self._fail()
             return
@@ -855,6 +887,24 @@ class ManagerNode(Node):
         msg.data = int(_STATE_TO_SYSTEM_STATUS[self._state])
         self.get_logger().info(f'📤 [송신/SEND Topic] /system/status = {msg.data} ({self._state.name})')
         self._system_status_pub.publish(msg)
+        self._publish_table_arrived(
+            self._state in (_State.ARM_SERVING, _State.ARM_PAUSED))
+
+    def _publish_table_arrived(self, arrived):
+        """Gate vision while the robot is docked and the arm may operate."""
+        arrived = bool(arrived)
+        if not hasattr(self, '_table_arrived_pub'):
+            return
+        if arrived != self._table_arrived:
+            self.get_logger().info(
+                f'📤 [송신/SEND Topic] /serving_robot/table_arrived = {arrived}')
+        if not arrived and self._table_arrived:
+            # A sample from the previous docking window must not authorize the
+            # next arm trip before the detector has processed a new image.
+            self._last_hand_intrusion_stamp = None
+            self._hand_intrusion = False
+        self._table_arrived = arrived
+        self._table_arrived_pub.publish(Bool(data=arrived))
 
 
 def _split_future_result(future):

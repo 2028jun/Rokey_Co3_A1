@@ -33,6 +33,18 @@ def _load_params(b: Node) -> tuple[int, str, dict]:
 
 
 def main(argv=None) -> int:
+    """Reject the retired standalone rolling-dock controller."""
+    print(
+        "ERROR: go_to_table is disabled. Use /navigation/command so the "
+        "Isaac integrated route performs stop/pivot/straight docking.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return 2
+
+
+def _retired_main(argv=None) -> int:
+    """Former standalone rail mission, retained only for source history."""
     os.environ.setdefault("ROS_DOMAIN_ID", "103")
     rclpy.init(args=None)
     node = None

@@ -79,7 +79,8 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rosgraph_msgs.msg import Clock
 from builtin_interfaces.msg import Time as TimeMsg
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
-from std_msgs.msg import Bool, Int32
+from std_msgs.msg import Int32
+from std_srvs.srv import SetBool
 
 # The colcon workspace builds this custom interface for system Python 3.10,
 # while Isaac Sim 5.1 embeds Python 3.11.  Do not abort the entire navigation
@@ -146,6 +147,9 @@ ROBOT_ASSET_ROOT = "/two_wheel_ridgeback_serving_robot"
 M0609_VISUAL_USD = (
     SERVING_WORKSPACE
     / "isaacpjt/M0609/Collected_m0609_camera2/m0609_gripper.usd"
+)
+M0609_DARK_SAFETY_MATERIAL_USD = (
+    WORKSPACE / "assets/materials/m0609_dark_safety.usda"
 )
 D455_ASSET_USD = (
     SERVING_WORKSPACE
@@ -308,6 +312,57 @@ def attach_m0609_visuals(stage):
         attached.append(str(visual_path))
     print(
         f"[nav_robot] attached M0609 visual meshes from {M0609_VISUAL_USD} links={len(attached)}",
+        flush=True,
+    )
+
+    if os.environ.get("M0609_DARK_SAFETY_VISUALS", "1") != "1":
+        return
+    if not M0609_DARK_SAFETY_MATERIAL_USD.is_file():
+        print(
+            f"[warn] dark M0609 safety material missing at "
+            f"{M0609_DARK_SAFETY_MATERIAL_USD}",
+            flush=True,
+        )
+        return
+
+    material_path = Sdf.Path("/World/Looks/M0609DarkSafety")
+    stage.DefinePrim(material_path.GetParentPath(), "Scope")
+    material_prim = stage.OverridePrim(material_path)
+    material_prim.GetReferences().SetReferences(
+        [
+            Sdf.Reference(
+                str(M0609_DARK_SAFETY_MATERIAL_USD),
+                Sdf.Path("/M0609DarkSafety"),
+            )
+        ]
+    )
+    dark_material = UsdShade.Material(material_prim)
+    darkened = []
+    # Override every M0609 visual link.  Binding at each ``visuals`` prim with
+    # stronger-than-descendants also covers the meshes nested below it (for
+    # example the wrist/end-effector geometry under the final arm link).
+    for link_name in wanted:
+        matches = [
+            prim
+            for prim in stage.Traverse()
+            if prim.GetName() == link_name
+            and str(prim.GetPath()).startswith(ROBOT_ROOT)
+        ]
+        if len(matches) != 1:
+            continue
+        visual_prim = stage.GetPrimAtPath(
+            matches[0].GetPath().AppendChild("visuals")
+        )
+        if not visual_prim.IsValid():
+            continue
+        UsdShade.MaterialBindingAPI.Apply(visual_prim).Bind(
+            dark_material,
+            UsdShade.Tokens.strongerThanDescendants,
+        )
+        darkened.append(str(visual_prim.GetPath()))
+    print(
+        f"[vision-safety] dark material bound to all M0609 arm visuals: "
+        f"{darkened}",
         flush=True,
     )
 
@@ -864,6 +919,12 @@ def create_sensor_ros_graph(lidar_path: str, camera_path: str):
 def connect_embedded_sensor_ros(stage):
     """Connect the D455/RPLIDAR already contained in the two-wheel USD."""
     global _embedded_lidar_render_product, _embedded_lidar_writer
+    camera_width = int(os.environ.get("NAV_CAMERA_WIDTH", "1280"))
+    camera_height = int(os.environ.get("NAV_CAMERA_HEIGHT", "960"))
+    if camera_width <= 0 or camera_height <= 0:
+        raise ValueError(
+            "NAV_CAMERA_WIDTH and NAV_CAMERA_HEIGHT must be positive"
+        )
     base_path = (
         f"{ROBOT_ROOT}/Robot/ridgeback_base_link/ridgeback_base_link"
     )
@@ -889,18 +950,22 @@ def connect_embedded_sensor_ros(stage):
             ],
             keys.SET_VALUES: [
                 ("RenderProduct.inputs:cameraPrim", [usdrt.Sdf.Path(depth_camera)]),
-                ("RenderProduct.inputs:width", 320),
-                ("RenderProduct.inputs:height", 240),
+                ("RenderProduct.inputs:width", camera_width),
+                ("RenderProduct.inputs:height", camera_height),
                 ("ColorPub.inputs:nodeNamespace", "camera/color"),
                 ("ColorPub.inputs:topicName", "image_raw"),
                 ("ColorPub.inputs:frameId", "d455_color_optical_frame"),
                 ("ColorPub.inputs:type", "rgb"),
-                ("ColorPub.inputs:frameSkipCount", 3),
+                # Publish every rendered frame.  The previous value of 3
+                # capped the RGB stream to one image per four sim frames.
+                ("ColorPub.inputs:frameSkipCount", 0),
                 ("DepthPub.inputs:nodeNamespace", "camera/depth"),
                 ("DepthPub.inputs:topicName", "image_raw"),
                 ("DepthPub.inputs:frameId", "d455_depth_optical_frame"),
                 ("DepthPub.inputs:type", "depth"),
-                ("DepthPub.inputs:frameSkipCount", 3),
+                # Depth is not consumed by hand_safety. Keep it at a low rate
+                # so RGB inference gets the shared GPU budget.
+                ("DepthPub.inputs:frameSkipCount", 29),
             ],
             keys.CONNECT: [
                 ("OnPlaybackTick.outputs:tick", "PublishClock.inputs:execIn"),
@@ -926,7 +991,8 @@ def connect_embedded_sensor_ros(stage):
     _embedded_lidar_writer.initialize(topicName="/scan", frameId="base_scan")
     _embedded_lidar_writer.attach([_embedded_lidar_render_product])
     print(
-        "[ros] embedded D455 RGB/depth, RPLIDAR /scan and /clock connected",
+        f"[ros] embedded D455 RGB/depth {camera_width}x{camera_height}, "
+        "RPLIDAR /scan and /clock connected",
         flush=True,
     )
 
@@ -1019,6 +1085,7 @@ class NavBridge(Node):
         self._active_delivery_table = None
         self._completed_delivery_table = None
         self._delivered_trip_counts = {}
+        self._hand_test_controller = None
 
         qos = QoSProfile(
             depth=10,
@@ -1043,13 +1110,17 @@ class NavBridge(Node):
         self.navigation_location_pub = self.create_publisher(
             Int32, "/navigation/current_location", qos
         )
-        self.hand_safety_pub = self.create_publisher(Bool, "/hand_safety/intrusion", qos)
 
         # Standard Int32 topic subscribers for Isaac Sim food spawning & arm serving
         self.create_subscription(Int32, "/food_spawn/trigger", self._on_food_spawn_trigger, qos)
         self.create_subscription(Int32, "/arm/trigger", self._on_arm_trigger, qos)
         self.create_subscription(
             Int32, "/navigation/trigger", self._on_navigation_trigger, qos
+        )
+        self.create_service(
+            SetBool,
+            "/hand_test/set_visible",
+            self._on_hand_test_set_visible,
         )
 
         if TaskCommand is not None:
@@ -1063,9 +1134,6 @@ class NavBridge(Node):
                 "/arm/command",
                 self._on_arm_command,
             )
-
-        # Publish hand safety heartbeat (False = safe, no hand intrusion)
-        self.create_timer(0.2, self._publish_hand_safety)
 
         # RTX sensor timestamps are based on the ROS /clock graph.  The Python
         # subscriber receives that clock a few render frames later, so the
@@ -1101,12 +1169,25 @@ class NavBridge(Node):
         print(
             f"[ros] active services: /navigation/command{subsystem_services}\n"
             "[ros] active status topics: /navigation/status, "
-            "/food_spawn/status, /arm/status, /hand_safety/intrusion",
+            "/food_spawn/status, /arm/status",
             flush=True,
         )
 
-    def _publish_hand_safety(self):
-        self.hand_safety_pub.publish(Bool(data=False))
+    def set_hand_test_controller(self, controller):
+        self._hand_test_controller = controller
+
+    def _on_hand_test_set_visible(self, request, response):
+        controller = self._hand_test_controller
+        if controller is None:
+            response.success = False
+            response.message = "hand-only test controller is not ready"
+            return response
+        controller.request_visible(bool(request.data))
+        response.success = True
+        response.message = (
+            "hand spawn queued" if request.data else "hand removal queued"
+        )
+        return response
 
     def _archive_delivered_payloads(self, payload_paths):
         """Preserve a visual-only snapshot without moving live physics prims."""
@@ -1755,11 +1836,21 @@ class NavBridge(Node):
             )
             try:
                 spawn_command = int(pending_spawn)
-                cutlery_requested = spawn_command >= 20
-                remainder = spawn_command - (20 if cutlery_requested else 0)
-                pizza_requested = remainder >= 10
-                drink_count = remainder - (10 if pizza_requested else 0)
-                if drink_count < 0 or drink_count > 2:
+                if spawn_command >= 40:
+                    cutlery_requested = True
+                    remainder = spawn_command - 40
+                elif spawn_command >= 20:
+                    cutlery_requested = True
+                    remainder = spawn_command - 20
+                else:
+                    cutlery_requested = False
+                    remainder = spawn_command
+
+                pizza_type = remainder // 10
+                pizza_requested = pizza_type > 0
+                drink_count = remainder % 10
+
+                if drink_count < 0 or drink_count > 4:
                     raise ValueError(
                         f"unsupported food spawn command={spawn_command}"
                     )
@@ -2208,9 +2299,28 @@ def main():
         flush=True,
     )
 
+    reach_animator = None
+    if os.environ.get("MOBILE_DEMO_HAND_TEST", "1") == "1":
+        try:
+            import hand_intrusion_test_actor as hand_test
+            reach_animator = hand_test.HandSpawnAnimator(stage)
+            bridge.set_hand_test_controller(reach_animator)
+            print(
+                "[hand_test] enabled service-controlled hand-only test: "
+                "/hand_test/set_visible",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[hand_test] actor setup warning: {exc}", flush=True)
+
     try:
         while simulation_app.is_running():
             simulation_app.update()
+            if reach_animator is not None:
+                try:
+                    reach_animator.update()
+                except Exception:
+                    pass
             sim_time = timeline.get_current_time()
             bridge.tick(float(sim_time))
     finally:
