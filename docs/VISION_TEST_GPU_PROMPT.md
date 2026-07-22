@@ -2,10 +2,12 @@
 
 Paste this whole document to a Claude Code (or equivalent coding agent) session
 running **on the GPU machine that has Isaac Sim 5.1.0-rc.19 and ROS 2 Humble
-installed**. It was written on a machine with no GPU/Isaac Sim access, so
-nothing in the scaffold below has been run or visually checked. Your job is to
-verify it, fix whatever is wrong, and confirm the hand_safety pipeline
-actually fires on the simulated reach.
+installed**. Passes 1-3 have already been run and documented on that hardware;
+the current assignment is **Pass 4**. Read `GPU_RUN_LOG.txt` and the "Pass 4
+tasks" section first. The older pass sections remain below as historical
+context and must not be mistaken for still-open work. This Pass-4 plan was
+written on a machine with no GPU/Isaac Sim access, so verify every new runtime
+assumption against the installed 5.1 source and actual render.
 
 ## Pass 2 changes (read this first if you already ran pass 1)
 
@@ -154,6 +156,171 @@ writing, plus one already applied blind (not yet hardware-verified):
    YOLO confidence threshold against the gripper hardware. Either way,
    re-run the acceptance check (step 6 below) and confirm `roi_intrusion`
    actually flips in sync with the reach cycle, not just always-true.
+
+## Pass 4 tasks (read this first if you already ran passes 1-3)
+
+Pass 3 (`bb6ea4b`) fixed the RG2 false positive by tightening the table ROI
+and confirmed the end-to-end acceptance signal, but the test actor still
+moves its entire body to put a hand on the table. Do not repeat pass 2's
+late-bound `pxr.UsdSkel`/`usdrt.UsdSkel` attribute-writing experiment or
+pass 3's matte-black material experiment: both were already isolated and
+ruled out on this exact Isaac Sim build.
+
+The important distinction for this pass is:
+
+- Isaac's People characters do have a `UsdSkel` skeleton and can perform
+  per-joint skeletal animations. The official asset library contains
+  `Sit.skelanim.usd`, `stand_walk_*.skelanim.usd`,
+  `push_button.skelanim.usd`, `type_keyboard.skelanim.usd`, and other
+  joint-animation clips.
+- Those skinning joints are not PhysX articulation joints. A scan of the
+  official Isaac Sim 5.1 `People/Characters` models and representative
+  `People/DH_Characters` assets found `Skel`, `ControlRigAPI`, and
+  Animation Graph data, but no PhysX articulation/joint/drive schemas.
+- Therefore the missing PhysX articulation does **not** mean an arm cannot
+  move independently. It means the supported route is the People/Animation
+  Graph runtime, not an `ArticulationView` and not late USD attribute edits.
+- The character's existing idle animation already renders, while pass 2's
+  newly rebound `SkelAnimation` only changed `SkelQuery` results without
+  changing pixels. Treat that as evidence that the runtime Animation Graph
+  path is worth testing, not as evidence that the character is unrigged.
+
+Official 5.1 asset locations (prepend the GPU machine's Isaac asset root):
+
+```text
+/Isaac/People/Characters/Biped_Setup.usd
+/Isaac/People/Animations/Sit.skelanim.usd
+/Isaac/People/Animations/push_button.skelanim.usd
+/Isaac/People/Animations/type_keyboard.skelanim.usd
+/Isaac/People/Animations/stand_walk_loop.skelanim.usd
+```
+
+The official Isaac Sim 5.1 Actor Control documentation specifically uses
+`push_button.skelanim.usd` as the custom-command example and documents
+`CustomCommandFilterJoint`. Use the APIs and extension sources actually
+installed on this GPU machine (`omni.anim.people` 0.7.9 and the 107.3.x
+Animation Graph extensions in Isaac Sim 5.1.0-rc.19); do not copy a current
+Isaac Sim 6.x example and assume its names or signatures are compatible.
+
+### 1. Replace the whole-body reach with a supported skeletal-animation path
+
+1. Inspect the installed extension source and sample graph first. Useful
+   places are the `omni.anim.people`, `omni.anim.graph.core`, and
+   `omni.anim.skelJoint` extension folders plus `Biped_Setup.usd`. Log the
+   exact extension versions and the actual character `SkelRoot` path.
+2. Enable/setup the People character the same way the 5.1 People system
+   does: apply the `Biped_Setup` Animation Graph to the character's
+   `SkelRoot` and let the runtime graph own the output pose. Do not bind a
+   freshly-created `UsdSkelAnimation` to the already-running character.
+3. Try `push_button.skelanim.usd` first. It is the closest built-in motion
+   to a forward arm/hand reach and is the official custom-command example.
+   Register/play it through `omni.anim.people`/Animation Graph using the
+   5.1 mechanism found in the installed source. If the official asset needs
+   custom-command attributes, copy or overlay it into a repo-local test
+   asset; never edit the remote NVIDIA asset in place.
+4. Position and yaw the person so the animated hand travels over
+   `TableSet_00`. The torso/root should remain plausibly at the chair while
+   the arm supplies the visible reach. Do not declare success just because
+   a command state changes: confirm the rendered arm pixels move and YOLO's
+   bbox follows the hand.
+5. If a seated reach is required, test `Sit` as the lower-body/base pose and
+   layer the reach clip on the upper body with the graph's Filter/Blend
+   mechanism (or the installed equivalent). If available in this 107.3.x
+   build, a Two Bone IK arm chain targeting the tabletop is also a valid
+   next experiment. Verify node availability in the installed build first.
+6. If `push_button` is unsuitable, try `type_keyboard` and other compatible
+   built-in People animations before falling back to the current analytic
+   whole-body translation. Record each clip tried and why it passed or
+   failed. Keep the existing whole-body implementation available only as a
+   diagnostic fallback while the new path is being validated.
+
+### 2. Test multiple human models, not only F_Business_02
+
+Run the same reach experiment with **at least three** visibly different
+People assets, including `F_Business_02` and at least two of the following
+official 5.1 candidates:
+
+```text
+/Isaac/People/Characters/F_Business_02/F_Business_02.usd
+/Isaac/People/Characters/F_Medical_01/F_Medical_01.usd
+/Isaac/People/Characters/M_Medical_01/M_Medical_01.usd
+/Isaac/People/Characters/female_adult_police_01_new/female_adult_police_01_new.usd
+/Isaac/People/Characters/female_adult_police_03_new/female_adult_police_03_new.usd
+/Isaac/People/Characters/male_adult_construction_01_new/male_adult_construction_01_new.usd
+/Isaac/People/Characters/male_adult_construction_05_new/male_adult_construction_05_new.usd
+```
+
+Optionally include one `People/DH_Characters/<uuid>/<uuid>.usd` Digital
+Human if it loads within the available GPU/memory budget. Do not spend the
+whole pass downloading every Digital Human variant.
+
+For every tested model, record:
+
+- whether the URL/path resolves and the model fully loads;
+- its `SkelRoot` and whether `Biped_Setup`/retargeting accepts it;
+- whether the selected clip visibly moves the arm without translating the
+  whole body;
+- whether the rendered hand is realistic/large enough for the HaGRIDv2
+  model and the observed `/hand_detection/detections` confidence/bbox;
+- whether the hand enters the tightened ROI without reintroducing the RG2
+  false positive; and
+- whether the hand/table geometry visibly intersects.
+
+Do not reuse F_Business_02's hardcoded `_RIGHT_HAND_REST_LOCAL_OFFSET` for
+another character. The Animation Graph path should not need that constant;
+if any fallback still does, measure and store a per-asset value. Select the
+best-performing model as the new default only after comparing the results,
+and keep `HAND_TEST_PERSON_USD` override support for the others.
+
+### 3. Give the hand up to 10 cm of table clearance, but only if needed
+
+The table surface is `TABLE_TOP_Z = 0.73`. The current analytic fallback's
+`TABLE_HAND_TARGET` places the measured hand-joint origin at exactly that Z,
+which can put the lower part of the hand mesh inside the tabletop.
+
+Before changing height, inspect the current code, the actual animation/IK
+target, and a side/close camera capture. If the hand is already visibly
+clear of the table (or an earlier change already targets about
+`TABLE_TOP_Z + 0.10`), **do not add another 10 cm** and do not make a
+height-only churn commit.
+
+If the hand intersects or nearly intersects the tabletop, make its final
+reach height exactly 10 cm above the tabletop:
+
+```text
+desired hand target Z = TABLE_TOP_Z + 0.10 = 0.83 m
+```
+
+Apply this to the hand/IK/interaction target, not to the whole chair, table,
+or resting character root. For the analytic fallback, prefer one clearly
+named, environment-overridable clearance such as
+`HAND_TEST_TARGET_Z_OFFSET` and compute the target from `TABLE_TOP_Z`; do
+not stack an extra `+0.10` on top of an already-raised target. Capture the
+before/after view and report the actual world-space target Z used.
+
+### 4. Pass-4 acceptance and deliverables
+
+Acceptance requires all of the following:
+
+- At least three People models were actually rendered and compared.
+- At least one model performs a visibly arm-driven reach; the whole torso
+  must not sink/slide onto the table as the primary motion.
+- The chosen model's hand clears the tabletop without an excessive gap. If
+  a height correction was required, its target is `0.83 m`, not 10 cm on
+  top of some other correction.
+- With the person held at rest for at least 20 seconds,
+  `/hand_safety/roi_intrusion` remains false and the old RG2 false positive
+  stays excluded.
+- Across several reach cycles, `roi_intrusion` becomes true in sync with
+  the rendered hand entering the ROI and returns false after retraction.
+- Camera input remains 1280x960 and `table_arrived` gating still works.
+
+Append a detailed **Pass 4** entry to `GPU_RUN_LOG.txt`. Include the exact
+asset paths and clip/graph mechanism for every tested person, the table
+clearance decision (changed or deliberately left unchanged), observed
+detection confidences/bboxes, intrusion timing, failed attempts, and the
+final chosen default. Commit the log with the implementation and push it to
+`vision-test`; do not leave successful GPU-only changes uncommitted.
 
 Before finishing, append your results to `GPU_RUN_LOG.txt` (repo root) —
 see "Keep GPU_RUN_LOG.txt updated" near the end of this doc.
