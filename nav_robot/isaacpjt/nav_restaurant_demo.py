@@ -16,6 +16,7 @@ import os
 import sys
 import threading
 import time
+import gc
 from pathlib import Path
 
 WORKSPACE = Path(
@@ -111,6 +112,9 @@ try:
 except Exception as _food_import_exc:
     print(f"[warn] food spawn module import: {_food_import_exc}", flush=True)
 
+from kitchen_return_module import build_kitchen_route
+from table_route_module import build_table_route
+
 
 _package_roots = [
     WORKSPACE / "install/m0609_isaac_description/share",
@@ -136,8 +140,9 @@ RESTAURANT_USD = (
     WORKSPACE / "assets/lightweight_restaurant/lightweight_pizza_restaurant.usda"
 )
 ROBOT_USD = (
-    SERVING_WORKSPACE / "assets/mobile_manipulator/ridgeback_m0609_v2.usd"
+    WORKSPACE / "assets/diagnostics/two_wheel_serving_robot_v2.usd"
 )
+ROBOT_ASSET_ROOT = "/two_wheel_ridgeback_serving_robot"
 M0609_VISUAL_USD = (
     SERVING_WORKSPACE
     / "isaacpjt/M0609/Collected_m0609_camera2/m0609_gripper.usd"
@@ -203,16 +208,11 @@ def import_robot_usd():
 SPAWN_POSITION = Gf.Vec3d(
     float(os.environ.get("NAV_SPAWN_X", "0.00")),
     float(os.environ.get("NAV_SPAWN_Y", "5.25")),
-    float(os.environ.get("NAV_SPAWN_Z", "0.002")),
+    float(os.environ.get("NAV_SPAWN_Z", "0.01")),
 )
 SPAWN_YAW = float(os.environ.get("NAV_SPAWN_YAW", str(-math.pi / 2.0)))
 
-WHEEL_JOINTS = [
-    "front_left_wheel_joint",
-    "front_right_wheel_joint",
-    "rear_left_wheel_joint",
-    "rear_right_wheel_joint",
-]
+WHEEL_JOINTS = ["left_wheel_joint", "right_wheel_joint"]
 ARM_JOINTS = [f"joint_{index}" for index in range(1, 7)]
 SLIDING_TRAY_JOINTS = [
     "upper_tray_left_slide_joint",
@@ -220,33 +220,28 @@ SLIDING_TRAY_JOINTS = [
 ]
 STOW_CONFIGURATION = list(np.deg2rad([90.0, 0.0, -90.0, 0.0, -60.0, 90.0]))
 
-WHEEL_RADIUS = 0.0759
-# A physical four-wheel skid steer needs extra differential wheel speed to
-# overcome tire scrub.  Geometric half-track (0.2755 m) under-steered badly in
-# rolling Nav2 curves, while the old mecanum L+W term (0.5945 m) over-commanded
-# pivots.  Use a conservative empirical effective turn radius between them.
-DIFFERENTIAL_HALF_TRACK = float(
-    os.environ.get("NAV_SKID_STEER_EFFECTIVE_HALF_TRACK", "0.40")
-)
+WHEEL_RADIUS = 0.10
+# Geometry of the stable two-drive-wheel/caster base.
+DIFFERENTIAL_HALF_TRACK = float(os.environ.get("NAV_HALF_TRACK", "0.315"))
 MAX_WHEEL_SPEED = 16.0
-DIRECT_CONTROL_HALF_TRACK = 0.5945
+DIRECT_CONTROL_HALF_TRACK = DIFFERENTIAL_HALF_TRACK
 LINEAR_ACCEL_LIMIT = 0.80
 LINEAR_DECEL_LIMIT = 1.00
 ANGULAR_ACCEL_LIMIT = 3.0
 ANGULAR_DECEL_LIMIT = 3.5
-WHEEL_DRIVE_DAMPING = 1500.0
-WHEEL_DRIVE_MAX_FORCE = 2000.0
-TIRE_STATIC_FRICTION = float(os.environ.get("NAV_TIRE_STATIC_FRICTION", "0.55"))
-TIRE_DYNAMIC_FRICTION = float(os.environ.get("NAV_TIRE_DYNAMIC_FRICTION", "0.40"))
-BASE_ANGULAR_DAMPING = float(
-    os.environ.get("NAV_BASE_ANGULAR_DAMPING", "3.0")
-)
+WHEEL_DRIVE_DAMPING = 140.0
+WHEEL_DRIVE_MAX_FORCE = 350.0
+TIRE_STATIC_FRICTION = float(os.environ.get("NAV_TIRE_STATIC_FRICTION", "0.50"))
+TIRE_DYNAMIC_FRICTION = float(os.environ.get("NAV_TIRE_DYNAMIC_FRICTION", "0.50"))
 ARM_DRIVE_STIFFNESS = 200000.0
 ARM_DRIVE_DAMPING = 20000.0
 ARM_DRIVE_MAX_FORCE = 10000.0
+ARM_STOW_SPEED = float(os.environ.get("NAV_ARM_STOW_SPEED", "0.45"))
+ARM_STOW_TOLERANCE = math.radians(5.0)
 TRAY_DRIVE_STIFFNESS = 4000.0
 TRAY_DRIVE_DAMPING = 500.0
 TRAY_DRIVE_MAX_FORCE = 400.0
+TRAY_RETRACT_STEPS = 360
 
 ROBOT_ROOT = "/World/NavRobot"
 ARTICULATION_CANDIDATES = [
@@ -262,6 +257,8 @@ FRONT_LIDAR_TOPIC = "/scan"
 
 _front_lidar_render_product = None
 _front_lidar_writer = None
+_embedded_lidar_render_product = None
+_embedded_lidar_writer = None
 
 
 def quaternion_to_yaw(orientation) -> float:
@@ -433,8 +430,6 @@ def open_restaurant_and_robot():
     if not RESTAURANT_USD.is_file():
         raise FileNotFoundError(RESTAURANT_USD)
 
-    import_robot_usd()
-
     if not ROBOT_USD.is_file():
         raise FileNotFoundError(ROBOT_USD)
 
@@ -450,7 +445,7 @@ def open_restaurant_and_robot():
     spawn.AddOrientOp().Set(yaw_to_quat(SPAWN_YAW))
     robot = UsdGeom.Xform.Define(stage, f"{ROBOT_ROOT}/Robot")
     robot.GetPrim().GetReferences().AddReference(
-        str(ROBOT_USD), Sdf.Path("/ridgeback_m0609")
+        str(ROBOT_USD), Sdf.Path(ROBOT_ASSET_ROOT)
     )
     for _ in range(5):
         simulation_app.update()
@@ -471,9 +466,12 @@ def open_restaurant_and_robot():
         f"[nav_robot] verified v2 sliding-tray USD={ROBOT_USD}",
         flush=True,
     )
+    # Keep the two-wheel robot's physics/articulation layers, but replace the
+    # imported M0609 visual references with the canonical collected visual
+    # asset.  Without this composition fix link_2's visual pieces can resolve
+    # at the layer origin even though the physical link/joint poses are valid.
     attach_m0609_visuals(stage)
-    attach_fixed_table_depth_camera(stage)
-    attach_front_rplidar_ros2(stage)
+    print("[nav_robot] using embedded D455 and RPLIDAR sensor layer", flush=True)
     return stage
 
 
@@ -497,16 +495,6 @@ def configure_joint_drives(stage):
             drive.CreateDampingAttr(WHEEL_DRIVE_DAMPING)
             drive.CreateMaxForceAttr(WHEEL_DRIVE_MAX_FORCE)
             drive.CreateTargetVelocityAttr(0.0)
-            angle = 45.0 if name in {
-                "front_left_wheel_joint",
-                "rear_right_wheel_joint",
-            } else -45.0
-            prim.CreateAttribute(
-                "isaacmecanumwheel:radius", Sdf.ValueTypeNames.Float
-            ).Set(WHEEL_RADIUS)
-            prim.CreateAttribute(
-                "isaacmecanumwheel:angle", Sdf.ValueTypeNames.Float
-            ).Set(angle)
 
 
 def configure_physics_stability(stage, articulation_path: str):
@@ -524,27 +512,18 @@ def configure_physics_stability(stage, articulation_path: str):
     articulation_api = PhysxSchema.PhysxArticulationAPI.Apply(
         stage.GetPrimAtPath(articulation_path)
     )
-    articulation_api.CreateSolverPositionIterationCountAttr(64)
-    articulation_api.CreateSolverVelocityIterationCountAttr(16)
+    articulation_api.CreateSolverPositionIterationCountAttr(32)
+    articulation_api.CreateSolverVelocityIterationCountAttr(4)
     articulation_api.CreateStabilizationThresholdAttr(0.01)
-    articulation_api.CreateSleepThresholdAttr(0.5)
-
-    base_prim = stage.GetPrimAtPath(articulation_path)
-    rigid_body_api = PhysxSchema.PhysxRigidBodyAPI.Apply(base_prim)
-    rigid_body_api.CreateLinearDampingAttr(5.0)
-    # Four cylindrical wheel contacts otherwise resist skid-steer pivots too
-    # strongly.  Keep enough damping for stable stops without suppressing yaw.
-    rigid_body_api.CreateAngularDampingAttr(BASE_ANGULAR_DAMPING)
-    rigid_body_api.CreateMaxDepenetrationVelocityAttr(0.2)
+    articulation_api.CreateSleepThresholdAttr(0.05)
     print(
-        "[nav_robot] physics=CPU/120Hz stabilization=on solver=64/16 "
-        f"base_angular_damping={BASE_ANGULAR_DAMPING:.2f}",
+        "[nav_robot] physics=CPU/120Hz stabilization=on solver=32/4",
         flush=True,
     )
 
 
 def configure_wheel_contact_material(stage):
-    """Bind moderate tire friction so mecanum wheels grip the floor."""
+    """Bind moderate tire friction so the two drive wheels grip the floor."""
     material = UsdShade.Material.Define(
         stage, "/World/PhysicsMaterials/RidgebackTire"
     )
@@ -556,12 +535,7 @@ def configure_wheel_contact_material(stage):
     physx_material.CreateFrictionCombineModeAttr("average")
     physx_material.CreateRestitutionCombineModeAttr("average")
 
-    wheel_links = {
-        "front_left_wheel_link",
-        "front_right_wheel_link",
-        "rear_left_wheel_link",
-        "rear_right_wheel_link",
-    }
+    wheel_links = {"left_wheel_link", "right_wheel_link"}
     bound_colliders = []
     for prim in stage.Traverse():
         if (
@@ -577,7 +551,7 @@ def configure_wheel_contact_material(stage):
             )
             bound_colliders.append(str(prim.GetPath()))
 
-    if len(bound_colliders) != 4:
+    if len(bound_colliders) != 2:
         wheel_candidates = [
             (
                 str(prim.GetPath()),
@@ -588,7 +562,7 @@ def configure_wheel_contact_material(stage):
             if any(link in str(prim.GetPath()) for link in wheel_links)
         ]
         raise RuntimeError(
-            "expected four wheel colliders for tire material, got "
+            "expected two wheel colliders for tire material, got "
             f"{bound_colliders}; candidates={wheel_candidates}"
         )
     print(
@@ -598,6 +572,35 @@ def configure_wheel_contact_material(stage):
         f"colliders={len(bound_colliders)}",
         flush=True,
     )
+
+    caster_material = UsdShade.Material.Define(
+        stage, "/World/PhysicsMaterials/ServingCaster"
+    )
+    caster_api = UsdPhysics.MaterialAPI.Apply(caster_material.GetPrim())
+    caster_api.CreateStaticFrictionAttr(0.03)
+    caster_api.CreateDynamicFrictionAttr(0.03)
+    caster_api.CreateRestitutionAttr(0.0)
+    PhysxSchema.PhysxMaterialAPI.Apply(
+        caster_material.GetPrim()
+    ).CreateFrictionCombineModeAttr("min")
+    caster_links = {"front_caster_link", "rear_caster_link"}
+    caster_colliders = []
+    for prim in stage.Traverse():
+        if (
+            prim.GetName() == "collisions"
+            and prim.GetParent().GetName() in caster_links
+            and str(prim.GetPath()).startswith(ROBOT_ROOT)
+        ):
+            UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+                caster_material,
+                UsdShade.Tokens.weakerThanDescendants,
+                "physics",
+            )
+            caster_colliders.append(str(prim.GetPath()))
+    if len(caster_colliders) != 2:
+        raise RuntimeError(
+            f"expected two caster colliders, got {caster_colliders}"
+        )
 
 
 def find_articulation_path(stage) -> str:
@@ -610,6 +613,71 @@ def find_articulation_path(stage) -> str:
         if path.startswith(ROBOT_ROOT) and prim.HasAPI(UsdPhysics.ArticulationRootAPI):
             return path
     raise RuntimeError("could not find robot articulation prim")
+
+
+def log_arm_chain(stage, label):
+    """Print M0609 link world poses to pinpoint the first separated body."""
+    cache = UsdGeom.XformCache()
+    root = f"{ROBOT_ROOT}/Robot/ridgeback_base_link"
+    rows = []
+    for name in ("base_link", *(f"link_{index}" for index in range(1, 7))):
+        prim = stage.GetPrimAtPath(f"{root}/{name}")
+        if not prim.IsValid():
+            rows.append(f"{name}=MISSING")
+            continue
+        position = cache.GetLocalToWorldTransform(prim).ExtractTranslation()
+        rows.append(
+            f"{name}=({float(position[0]):.3f},"
+            f"{float(position[1]):.3f},{float(position[2]):.3f})"
+        )
+    joint_2 = stage.GetPrimAtPath(f"{root}/joints/joint_2")
+    joint_state = "missing"
+    if joint_2.IsValid():
+        joint = UsdPhysics.Joint(joint_2)
+        joint_state = (
+            f"enabled={joint.GetJointEnabledAttr().Get()} "
+            f"body0={joint.GetBody0Rel().GetTargets()} "
+            f"body1={joint.GetBody1Rel().GetTargets()}"
+        )
+    print(
+        f"[arm-chain:{label}] {' '.join(rows)} joint_2[{joint_state}]",
+        flush=True,
+    )
+
+
+def log_stray_robot_geometry(stage):
+    """List robot geometry rendered near the world origin, away from the robot."""
+    cache = UsdGeom.BBoxCache(
+        Usd.TimeCode.Default(),
+        [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
+    )
+    candidates = []
+    for prim in stage.Traverse():
+        path = str(prim.GetPath())
+        if not path.startswith(ROBOT_ROOT) or not prim.IsA(UsdGeom.Boundable):
+            continue
+        try:
+            bound = cache.ComputeWorldBound(prim).ComputeAlignedRange()
+            center = bound.GetMidpoint()
+            size = bound.GetSize()
+        except Exception:
+            continue
+        if (
+            abs(float(center[0])) <= 1.5
+            and abs(float(center[1])) <= 1.5
+            and -0.2 <= float(center[2]) <= 1.5
+        ):
+            candidates.append(
+                f"{path} type={prim.GetTypeName()} "
+                f"center=({float(center[0]):.3f},{float(center[1]):.3f},"
+                f"{float(center[2]):.3f}) size=({float(size[0]):.3f},"
+                f"{float(size[1]):.3f},{float(size[2]):.3f})"
+            )
+    if candidates:
+        for candidate in candidates:
+            print(f"[stray-geometry] {candidate}", flush=True)
+    else:
+        print("[stray-geometry] no USD Boundable under NavRobot near origin", flush=True)
 
 
 def initialize_robot(articulation_path: str):
@@ -793,6 +861,76 @@ def create_sensor_ros_graph(lidar_path: str, camera_path: str):
     )
 
 
+def connect_embedded_sensor_ros(stage):
+    """Connect the D455/RPLIDAR already contained in the two-wheel USD."""
+    global _embedded_lidar_render_product, _embedded_lidar_writer
+    base_path = (
+        f"{ROBOT_ROOT}/Robot/ridgeback_base_link/ridgeback_base_link"
+    )
+    sensor_mount = f"{base_path}/fixed_table_depth_camera/realsense_d455"
+    depth_camera = f"{sensor_mount}/RSD455/Camera_Pseudo_Depth"
+    lidar_path = f"{base_path}/base_scan/RPLIDAR_S2E"
+    for required in (depth_camera, lidar_path):
+        if not stage.GetPrimAtPath(required).IsValid():
+            raise RuntimeError(f"embedded sensor prim is missing: {required}")
+
+    keys = og.Controller.Keys
+    og.Controller.edit(
+        {"graph_path": f"{ROBOT_ROOT}/EmbeddedSensorsROS2", "evaluator_name": "execution"},
+        {
+            keys.CREATE_NODES: [
+                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                ("Context", "isaacsim.ros2.bridge.ROS2Context"),
+                ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
+                ("PublishClock", "isaacsim.ros2.bridge.ROS2PublishClock"),
+                ("RenderProduct", "isaacsim.core.nodes.IsaacCreateRenderProduct"),
+                ("ColorPub", "isaacsim.ros2.bridge.ROS2CameraHelper"),
+                ("DepthPub", "isaacsim.ros2.bridge.ROS2CameraHelper"),
+            ],
+            keys.SET_VALUES: [
+                ("RenderProduct.inputs:cameraPrim", [usdrt.Sdf.Path(depth_camera)]),
+                ("RenderProduct.inputs:width", 320),
+                ("RenderProduct.inputs:height", 240),
+                ("ColorPub.inputs:nodeNamespace", "camera/color"),
+                ("ColorPub.inputs:topicName", "image_raw"),
+                ("ColorPub.inputs:frameId", "d455_color_optical_frame"),
+                ("ColorPub.inputs:type", "rgb"),
+                ("ColorPub.inputs:frameSkipCount", 3),
+                ("DepthPub.inputs:nodeNamespace", "camera/depth"),
+                ("DepthPub.inputs:topicName", "image_raw"),
+                ("DepthPub.inputs:frameId", "d455_depth_optical_frame"),
+                ("DepthPub.inputs:type", "depth"),
+                ("DepthPub.inputs:frameSkipCount", 3),
+            ],
+            keys.CONNECT: [
+                ("OnPlaybackTick.outputs:tick", "PublishClock.inputs:execIn"),
+                ("OnPlaybackTick.outputs:tick", "RenderProduct.inputs:execIn"),
+                ("Context.outputs:context", "PublishClock.inputs:context"),
+                ("Context.outputs:context", "ColorPub.inputs:context"),
+                ("Context.outputs:context", "DepthPub.inputs:context"),
+                ("ReadSimTime.outputs:simulationTime", "PublishClock.inputs:timeStamp"),
+                ("RenderProduct.outputs:execOut", "ColorPub.inputs:execIn"),
+                ("RenderProduct.outputs:renderProductPath", "ColorPub.inputs:renderProductPath"),
+                ("RenderProduct.outputs:execOut", "DepthPub.inputs:execIn"),
+                ("RenderProduct.outputs:renderProductPath", "DepthPub.inputs:renderProductPath"),
+            ],
+        },
+    )
+
+    import omni.replicator.core as rep
+
+    _embedded_lidar_render_product = rep.create.render_product(
+        lidar_path, [1, 1], name="IntegratedServingRPLidar"
+    )
+    _embedded_lidar_writer = rep.writers.get("RtxLidarROS2PublishLaserScan")
+    _embedded_lidar_writer.initialize(topicName="/scan", frameId="base_scan")
+    _embedded_lidar_writer.attach([_embedded_lidar_render_product])
+    print(
+        "[ros] embedded D455 RGB/depth, RPLIDAR /scan and /clock connected",
+        flush=True,
+    )
+
+
 def create_sensor_static_tf(stage, lidar_path: str, camera_path: str, node: Node, broadcaster):
     # Published every odom tick as well; initial helper keeps frames available.
     pass
@@ -859,13 +997,28 @@ class NavBridge(Node):
         self._last_pose = None
         self._odom_initialized = False
         self._pending_teleport = None  # (x, y, z, yaw) applied on sim thread
-        self._pending_food_spawn = False
+        self._pending_food_spawn = None
         self._pending_arm_command = None
         self._active_serving_task = None
         self._serving_paused = False
+        self._arm_returning_to_stow = False
+        self._arm_stow_started_at = None
+        self._arm_stow_settle_count = 0
+        self._arm_stow_command = None
+        self._arm_stow_last_update = None
+        self._arm_stow_last_log = None
+        self._tray_returning_home = False
+        self._tray_home_started_at = None
+        self._tray_home_settle_count = 0
+        self._tray_home_step = 0
+        self._tray_home_start = None
         self._spawned_serving_tasks = {}
         self._direct_nav = None
         self._direct_nav_request = None
+        self._navigation_location = 4
+        self._active_delivery_table = None
+        self._completed_delivery_table = None
+        self._delivered_trip_counts = {}
 
         qos = QoSProfile(
             depth=10,
@@ -955,6 +1108,54 @@ class NavBridge(Node):
     def _publish_hand_safety(self):
         self.hand_safety_pub.publish(Bool(data=False))
 
+    def _archive_delivered_payloads(self, payload_paths):
+        """Preserve a visual-only snapshot without moving live physics prims."""
+        table_id = self._completed_delivery_table
+        if table_id not in (0, 1, 2, 3):
+            return False
+        trip_number = self._delivered_trip_counts.get(table_id, 0) + 1
+        archive_root = f"/World/Delivered/Table{table_id}/Trip{trip_number}"
+        UsdGeom.Scope.Define(self.stage, "/World/Delivered")
+        UsdGeom.Scope.Define(self.stage, f"/World/Delivered/Table{table_id}")
+        UsdGeom.Scope.Define(self.stage, archive_root)
+        root_layer = self.stage.GetRootLayer()
+        for source_path in payload_paths:
+            if not self.stage.GetPrimAtPath(source_path).IsValid():
+                continue
+            target_path = f"{archive_root}/{source_path.rsplit('/', 1)[-1]}"
+            Sdf.CopySpec(
+                root_layer,
+                Sdf.Path(source_path),
+                root_layer,
+                Sdf.Path(target_path),
+            )
+        # Strip every copied physics body, collider and joint before the next
+        # simulation update.  The archive is only a rendered snapshot.  The
+        # original physics prims stay at their stable paths and are reused by
+        # the next spawn, so existing tensor views are never invalidated.
+        archive_prim = self.stage.GetPrimAtPath(archive_root)
+        copied_prims = list(Usd.PrimRange(archive_prim))
+        joint_paths = [
+            prim.GetPath() for prim in copied_prims if prim.IsA(UsdPhysics.Joint)
+        ]
+        for joint_path in reversed(joint_paths):
+            self.stage.RemovePrim(joint_path)
+        for prim in copied_prims:
+            if not prim.IsValid():
+                continue
+            if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                prim.RemoveAPI(UsdPhysics.RigidBodyAPI)
+            if prim.HasAPI(UsdPhysics.CollisionAPI):
+                prim.RemoveAPI(UsdPhysics.CollisionAPI)
+            if prim.HasAPI(UsdPhysics.MassAPI):
+                prim.RemoveAPI(UsdPhysics.MassAPI)
+        self._delivered_trip_counts[table_id] = trip_number
+        self._completed_delivery_table = None
+        self.get_logger().info(
+            f"archived delivered payloads at {archive_root}"
+        )
+        return True
+
     def _on_clock(self, msg: Clock):
         self._sim_stamp = msg.clock
 
@@ -962,7 +1163,7 @@ class NavBridge(Node):
         self.get_logger().info(f"📥 [FoodSpawn Trigger] Received spawn trigger topic: {msg.data}")
         self.spawn_status_pub.publish(Int32(data=1))  # 1 = WORKING
         with self._lock:
-            self._pending_food_spawn = True
+            self._pending_food_spawn = int(msg.data)
 
     def _on_food_spawn_command(self, request, response):
         cmd = request.command
@@ -973,7 +1174,7 @@ class NavBridge(Node):
             self.spawn_status_pub.publish(Int32(data=1))  # 1 = WORKING
             time.sleep(0.3)
             with self._lock:
-                self._pending_food_spawn = True
+                self._pending_food_spawn = int(cmd)
 
         threading.Thread(target=run_spawn, daemon=True).start()
         return response
@@ -991,20 +1192,38 @@ class NavBridge(Node):
     def _queue_arm_command(self, command):
         with self._lock:
             if command == 99:
-                if self._active_serving_task is None:
+                if (
+                    self._active_serving_task is None
+                    and not self._arm_returning_to_stow
+                    and not self._tray_returning_home
+                ):
                     return False
                 self._serving_paused = True
                 self.get_logger().warning("integrated serving paused")
                 return True
             if command == 98:
-                if self._active_serving_task is None:
+                if (
+                    self._active_serving_task is None
+                    and not self._arm_returning_to_stow
+                    and not self._tray_returning_home
+                ):
                     return False
                 self._serving_paused = False
                 self.get_logger().info("integrated serving resumed")
                 return True
-            if command <= 0 or self._active_serving_task is not None:
+            if (
+                command <= 0
+                or self._active_serving_task is not None
+                or self._arm_returning_to_stow
+                or self._tray_returning_home
+            ):
                 return False
             self._pending_arm_command = command
+            self._active_delivery_table = (
+                self._navigation_location
+                if self._navigation_location in (0, 1, 2, 3)
+                else None
+            )
         self.arm_status_pub.publish(Int32(data=1))
         return True
 
@@ -1012,7 +1231,7 @@ class NavBridge(Node):
         self._queue_navigation(int(msg.data))
 
     def _queue_navigation(self, target):
-        if target not in (1, 2, 3, 4):
+        if target not in (0, 1, 2, 3, 4):
             self.get_logger().warning(f"unknown navigation command: {target}")
             return False
         with self._lock:
@@ -1107,7 +1326,7 @@ class NavBridge(Node):
         n_dof = len(self.dof_names)
         self.articulation.set_joint_velocities(np.zeros(n_dof, dtype=float))
         # Zero wheel command so physics does not immediately push away.
-        wheels_zero = np.zeros(4, dtype=float)
+        wheels_zero = np.zeros(len(self.wheel_indices), dtype=float)
         self.articulation.apply_action(
             ArticulationAction(
                 joint_velocities=wheels_zero,
@@ -1129,12 +1348,10 @@ class NavBridge(Node):
         return current + math.copysign(max_delta, delta)
 
     def _differential_ik(self, vx, wz):
-        # FL, FR, RL, RR — longitudinal + yaw only (serving_robot pattern).
+        # Left/right differential drive used by the stable two-wheel base.
         turn = DIFFERENTIAL_HALF_TRACK * wz
         wheels = np.asarray(
             [
-                (vx - turn) / WHEEL_RADIUS,
-                (vx + turn) / WHEEL_RADIUS,
                 (vx - turn) / WHEEL_RADIUS,
                 (vx + turn) / WHEEL_RADIUS,
             ],
@@ -1147,12 +1364,10 @@ class NavBridge(Node):
         return math.atan2(math.sin(target - actual), math.cos(target - actual))
 
     def _direct_wheel_ik(self, vx, wz):
-        """Legacy controller calibration that already pivoted this robot reliably."""
+        """Wheel command for the stable two-wheel serving base."""
         turn = DIRECT_CONTROL_HALF_TRACK * wz
         wheels = np.asarray(
             [
-                (vx - turn) / WHEEL_RADIUS,
-                (vx + turn) / WHEEL_RADIUS,
                 (vx - turn) / WHEEL_RADIUS,
                 (vx + turn) / WHEEL_RADIUS,
             ],
@@ -1162,75 +1377,38 @@ class NavBridge(Node):
         return np.clip(wheels, -8.0, 8.0)
 
     def _start_direct_navigation(self, target, x, y, yaw):
-        docks = {
-            1: (1.82, -2.20, 0.0),
-            2: (-1.82, 0.70, math.pi),
-            3: (1.82, 0.70, 0.0),
+        # The manager deliberately sends target=4 again at the beginning of a
+        # new order even after the previous return already reported kitchen.
+        # Treat that verification request as an arrival acknowledgement.  A
+        # second route here could pivot the base despite no position change.
+        if (
+            target == 4
+            and self._navigation_location == 4
+            and math.hypot(x - 0.0, y - 5.25) <= 0.10
+        ):
+            self._direct_nav = None
+            self._cmd_vx = self._cmd_wz = 0.0
+            self._target_vx = self._target_wz = 0.0
+            self.navigation_location_pub.publish(Int32(data=4))
+            self.navigation_status_pub.publish(Int32(data=2))
+            self.get_logger().info(
+                "already at kitchen; acknowledged redundant target=4 "
+                "without moving"
+            )
+            return
+        stages = (
+            build_kitchen_route(x, y)
+            if target == 4
+            else build_table_route(target, x, y)
+        )
+        self._direct_nav = {
+            "mode": "axis_route",
+            "target": target,
+            "stages": stages,
+            "index": 0,
+            "stage_start": time.monotonic(),
+            "last_log": 0.0,
         }
-        if target == 4:
-            # Leave a table backwards to the centre aisle, pivot north, then
-            # drive straight to the kitchen spawn point.
-            if abs(x) > 0.80:
-                escape_yaw = 0.0 if x > 0.0 else math.pi
-                stages = [
-                    {"kind": "pivot", "yaw": escape_yaw},
-                    {"kind": "axis_x", "value": 0.0, "speed": -0.16,
-                     "yaw": escape_yaw},
-                    {"kind": "pivot", "yaw": math.pi / 2.0},
-                    {"kind": "axis_y", "value": 5.25, "speed": 0.35,
-                     "yaw": math.pi / 2.0},
-                    {"kind": "pivot", "yaw": -math.pi / 2.0},
-                ]
-            elif abs(y - 5.25) > 0.05:
-                stages = [
-                    {"kind": "pivot", "yaw": math.pi / 2.0},
-                    {"kind": "axis_y", "value": 5.25, "speed": 0.35,
-                     "yaw": math.pi / 2.0},
-                    {"kind": "pivot", "yaw": -math.pi / 2.0},
-                ]
-            else:
-                stages = [{"kind": "pivot", "yaw": -math.pi / 2.0}]
-            self._direct_nav = {
-                "mode": "return_route",
-                "target": target,
-                "stages": stages,
-                "index": 0,
-                "stage_start": time.monotonic(),
-                "last_log": 0.0,
-            }
-        elif abs(x) > 0.80:
-            # A new table command received while docked must first back out of
-            # the table bay.  The original single-trip demo had no such state,
-            # so a second table request could not establish a safe approach.
-            goal_y = docks[target][1]
-            aisle_yaw = -math.pi / 2.0 if goal_y < y else math.pi / 2.0
-            stages = [
-                {"kind": "axis_x", "value": 0.0, "speed": -0.14,
-                 "yaw": (0.0 if x > 0.0 else math.pi)},
-                {"kind": "pivot", "yaw": aisle_yaw},
-                {"kind": "axis_y", "value": goal_y, "speed": 0.30,
-                 "yaw": aisle_yaw},
-            ]
-            self._direct_nav = {
-                "mode": "table_transfer",
-                "target": target,
-                "goal": docks[target],
-                "stages": stages,
-                "index": 0,
-                "stage_start": time.monotonic(),
-                "last_log": 0.0,
-            }
-        else:
-            self._direct_nav = {
-                "mode": "legacy_table",
-                "target": target,
-                "goal": docks[target],
-                "stage": "move_to_pre_dock",
-                "path_aligned": False,
-                "recovery_count": 0,
-                "stage_start": time.monotonic(),
-                "last_log": 0.0,
-            }
         self._cmd_vx = 0.0
         self._cmd_wz = 0.0
         self.get_logger().info(
@@ -1247,6 +1425,7 @@ class NavBridge(Node):
         self._cmd_vx = self._cmd_wz = 0.0
         self._target_vx = self._target_wz = 0.0
         if success:
+            self._navigation_location = target
             self.navigation_location_pub.publish(Int32(data=target))
             self.navigation_status_pub.publish(Int32(data=2))
             self.get_logger().info(f"direct navigation complete target={target}")
@@ -1568,16 +1747,27 @@ class NavBridge(Node):
 
         with self._lock:
             pending_spawn = self._pending_food_spawn
-            self._pending_food_spawn = False
+            self._pending_food_spawn = None
 
-        if pending_spawn and self.stage is not None:
-            self.get_logger().info("Spawning Pizza, 4 Soda Cans, and Cutlery Box on robot tray in Isaac Sim...")
+        if pending_spawn is not None and self.stage is not None:
+            self.get_logger().info(
+                f"Spawning requested payload command={pending_spawn} in Isaac Sim..."
+            )
             try:
-                # A completed trip leaves its payload on the destination
-                # table.  The authoring helpers use stable prim paths, so
-                # remove only those dedicated payload roots before loading
-                # the next trip at the kitchen.
-                for payload_path in (
+                spawn_command = int(pending_spawn)
+                cutlery_requested = spawn_command >= 20
+                remainder = spawn_command - (20 if cutlery_requested else 0)
+                pizza_requested = remainder >= 10
+                drink_count = remainder - (10 if pizza_requested else 0)
+                if drink_count < 0 or drink_count > 2:
+                    raise ValueError(
+                        f"unsupported food spawn command={spawn_command}"
+                    )
+                # Preserve the completed trip as visual-only USD geometry.
+                # Live payload physics remains at stable paths and is reused;
+                # deleting or moving it invalidates Isaac's tensor views.
+                gc.collect()
+                payload_paths = (
                     "/World/ServingDish",
                     "/World/PizzaBoardBail",
                     "/World/PizzaBoardBailHinge",
@@ -1585,15 +1775,44 @@ class NavBridge(Node):
                     "/World/PizzaBoardGripBlock",
                     "/World/ServingDrinks",
                     "/World/ServingCutlery",
-                ):
-                    if self.stage.GetPrimAtPath(payload_path).IsValid():
-                        self.stage.RemovePrim(payload_path)
+                )
+                reused_payload_paths = set()
+                if pizza_requested:
+                    reused_payload_paths.update(payload_paths[:5])
+                if drink_count:
+                    reused_payload_paths.add("/World/ServingDrinks")
+                if cutlery_requested:
+                    reused_payload_paths.add("/World/ServingCutlery")
+                existing_payloads = [
+                    path
+                    for path in payload_paths
+                    if self.stage.GetPrimAtPath(path).IsValid()
+                ]
+                archived = self._archive_delivered_payloads(existing_payloads)
+                if existing_payloads and not archived:
+                    self.get_logger().warning(
+                        "previous payload was not archived; reusing its stable prims"
+                    )
+                # Authoring helpers use AddXformOp.  On a reused prim the old
+                # op order must be cleared first, otherwise USD rejects a
+                # duplicate xformOp:translate.  This changes no physics prim
+                # topology and therefore keeps tensor views valid.
+                for payload_path in existing_payloads:
+                    if payload_path not in reused_payload_paths:
+                        continue
+                    payload_prim = self.stage.GetPrimAtPath(payload_path)
+                    if not payload_prim.IsValid():
+                        continue
+                    for prim in Usd.PrimRange(payload_prim):
+                        xformable = UsdGeom.Xformable(prim)
+                        if xformable:
+                            xformable.ClearXformOpOrder()
                 self._spawned_serving_tasks = {}
-                if 'spawn_soda_cans' in globals():
-                    spawn_soda_cans(self.stage)
-                if 'spawn_cutlery_box' in globals():
+                if drink_count and 'spawn_soda_cans' in globals():
+                    spawn_soda_cans(self.stage, count=drink_count)
+                if cutlery_requested and 'spawn_cutlery_box' in globals():
                     spawn_cutlery_box(self.stage)
-                if 'TrayPizzaPickPlace' in globals():
+                if pizza_requested and 'TrayPizzaPickPlace' in globals():
                     # Constructor authors the physical dish at the kitchen.
                     # Keep this exact object for delivery: constructing it a
                     # second time would re-author the same USD prim hierarchy.
@@ -1676,7 +1895,7 @@ class NavBridge(Node):
             self._cmd_vx = self._cmd_wz = 0.0
             self.articulation.apply_action(
                 ArticulationAction(
-                    joint_velocities=np.zeros(4, dtype=float),
+                    joint_velocities=np.zeros(len(self.wheel_indices), dtype=float),
                     joint_indices=self.wheel_indices,
                 )
             )
@@ -1685,6 +1904,8 @@ class NavBridge(Node):
             if self._active_serving_task.failed:
                 self._active_serving_task.close()
                 self._active_serving_task = None
+                self._active_delivery_table = None
+                gc.collect()
                 remove_parking_brake(self.stage)
                 self.arm_status_pub.publish(Int32(data=3))
                 self.get_logger().error("[integrated-serving] delivery failed")
@@ -1692,9 +1913,175 @@ class NavBridge(Node):
                 self._active_serving_task.close()
                 self._active_serving_task = None
                 self._spawned_serving_tasks = {}
+                gc.collect()
+                self._arm_returning_to_stow = True
+                self._arm_stow_started_at = time.monotonic()
+                self._arm_stow_settle_count = 0
+                arm_indices = np.asarray(
+                    [self.dof_names.index(name) for name in ARM_JOINTS],
+                    dtype=np.int32,
+                )
+                self._arm_stow_command = self.articulation.get_joint_positions()[
+                    arm_indices
+                ].copy()
+                self._arm_stow_last_update = self._arm_stow_started_at
+                self._arm_stow_last_log = self._arm_stow_started_at
+                self.get_logger().info(
+                    "[integrated-serving] delivery complete; returning arm to stow"
+                )
+
+        if self._arm_returning_to_stow:
+            self._target_vx = self._target_wz = 0.0
+            self._cmd_vx = self._cmd_wz = 0.0
+            self.articulation.apply_action(
+                ArticulationAction(
+                    joint_velocities=np.zeros(len(self.wheel_indices), dtype=float),
+                    joint_indices=self.wheel_indices,
+                )
+            )
+            arm_indices = np.asarray(
+                [self.dof_names.index(name) for name in ARM_JOINTS],
+                dtype=np.int32,
+            )
+            stow = np.asarray(STOW_CONFIGURATION, dtype=float)
+            if not self._serving_paused:
+                now = time.monotonic()
+                dt = min(max(now - self._arm_stow_last_update, 1.0 / 240.0), 0.05)
+                self._arm_stow_last_update = now
+                command_error = np.arctan2(
+                    np.sin(stow - self._arm_stow_command),
+                    np.cos(stow - self._arm_stow_command),
+                )
+                max_step = ARM_STOW_SPEED * dt
+                self._arm_stow_command += np.clip(
+                    command_error, -max_step, max_step
+                )
+                self.articulation.apply_action(
+                    ArticulationAction(
+                        joint_positions=self._arm_stow_command,
+                        joint_indices=arm_indices,
+                    )
+                )
+            current = self.articulation.get_joint_positions()[arm_indices]
+            error = np.arctan2(np.sin(stow - current), np.cos(stow - current))
+            max_error = float(np.max(np.abs(error)))
+            if (
+                not self._serving_paused
+                and time.monotonic() - self._arm_stow_last_log >= 2.0
+            ):
+                self._arm_stow_last_log = time.monotonic()
+                self.get_logger().info(
+                    "[integrated-serving] arm stow "
+                    f"actual_deg={np.round(np.rad2deg(current), 1).tolist()} "
+                    f"max_error={math.degrees(max_error):.1f}deg"
+                )
+            if max_error <= ARM_STOW_TOLERANCE:
+                self._arm_stow_settle_count += 1
+            else:
+                self._arm_stow_settle_count = 0
+
+            if self._arm_stow_settle_count >= 15:
+                self._arm_returning_to_stow = False
+                self._arm_stow_started_at = None
+                self._arm_stow_command = None
+                self._arm_stow_last_update = None
+                self._arm_stow_last_log = None
+                self._tray_returning_home = True
+                self._tray_home_started_at = time.monotonic()
+                self._tray_home_settle_count = 0
+                self._tray_home_step = 0
+                tray_indices = np.asarray(
+                    [self.dof_names.index(name) for name in SLIDING_TRAY_JOINTS],
+                    dtype=np.int32,
+                )
+                self._tray_home_start = self.articulation.get_joint_positions()[
+                    tray_indices
+                ].copy()
+                self.get_logger().info(
+                    "[integrated-serving] arm stowed; retracting trays from "
+                    f"{np.round(self._tray_home_start, 3).tolist()}m"
+                )
+            elif (
+                not self._serving_paused
+                and time.monotonic() - self._arm_stow_started_at > 30.0
+            ):
+                self._arm_returning_to_stow = False
+                self._arm_stow_started_at = None
+                self._arm_stow_command = None
+                self._arm_stow_last_update = None
+                self._arm_stow_last_log = None
+                remove_parking_brake(self.stage)
+                self.arm_status_pub.publish(Int32(data=3))
+                self.get_logger().error(
+                    "[integrated-serving] arm failed to reach stow within 30s"
+                )
+
+        if self._tray_returning_home:
+            self._target_vx = self._target_wz = 0.0
+            self._cmd_vx = self._cmd_wz = 0.0
+            self.articulation.apply_action(
+                ArticulationAction(
+                    joint_velocities=np.zeros(len(self.wheel_indices), dtype=float),
+                    joint_indices=self.wheel_indices,
+                )
+            )
+            tray_indices = np.asarray(
+                [self.dof_names.index(name) for name in SLIDING_TRAY_JOINTS],
+                dtype=np.int32,
+            )
+            tray_home = np.zeros(len(tray_indices), dtype=float)
+            if not self._serving_paused:
+                self._tray_home_step += 1
+                raw_amount = min(1.0, self._tray_home_step / TRAY_RETRACT_STEPS)
+                amount = raw_amount * raw_amount * (3.0 - 2.0 * raw_amount)
+                tray_target = self._tray_home_start * (1.0 - amount)
+                self.articulation.apply_action(
+                    ArticulationAction(
+                        joint_positions=tray_target,
+                        joint_indices=tray_indices,
+                    )
+                )
+            current_trays = self.articulation.get_joint_positions()[tray_indices]
+            if not self._serving_paused and self._tray_home_step % 60 == 0:
+                self.get_logger().info(
+                    "[integrated-serving] tray retract "
+                    f"target={np.round(tray_target, 3).tolist()}m "
+                    f"actual={np.round(current_trays, 3).tolist()}m"
+                )
+            if (
+                self._tray_home_step >= TRAY_RETRACT_STEPS
+                and np.max(np.abs(current_trays - tray_home)) <= 0.005
+            ):
+                self._tray_home_settle_count += 1
+            else:
+                self._tray_home_settle_count = 0
+
+            if self._tray_home_settle_count >= 15:
+                self._tray_returning_home = False
+                self._tray_home_started_at = None
+                self._tray_home_start = None
+                self._tray_home_step = 0
+                self._completed_delivery_table = self._active_delivery_table
+                self._active_delivery_table = None
                 remove_parking_brake(self.stage)
                 self.arm_status_pub.publish(Int32(data=2))
-                self.get_logger().info("[integrated-serving] delivery complete")
+                self.get_logger().info(
+                    "[integrated-serving] trays retracted; delivery complete"
+                )
+            elif (
+                not self._serving_paused
+                and time.monotonic() - self._tray_home_started_at > 20.0
+            ):
+                self._tray_returning_home = False
+                self._tray_home_started_at = None
+                self._tray_home_start = None
+                self._tray_home_step = 0
+                self._active_delivery_table = None
+                remove_parking_brake(self.stage)
+                self.arm_status_pub.publish(Int32(data=3))
+                self.get_logger().error(
+                    "[integrated-serving] trays failed to retract within 20s"
+                )
 
         now = time.monotonic()
         dt = min(max(now - self._last_cmd_time, 1.0 / 240.0), 0.05)
@@ -1792,16 +2179,10 @@ def main():
     configure_physics_stability(stage, articulation_path)
     articulation, dof_names = initialize_robot(articulation_path)
 
-    # Resolve base link path for sensors
-    base_path = articulation_path
-    for prim in stage.Traverse():
-        if prim.GetName() == BASE_LINK_NAME and str(prim.GetPath()).startswith(ROBOT_ROOT):
-            base_path = str(prim.GetPath())
-            break
-
-    lidar_path = create_lidar(stage, base_path)
-    camera_path = create_depth_camera(stage, base_path)
-    create_sensor_ros_graph(lidar_path, camera_path)
+    # The robot USD already contains its D455 and RTX RPLIDAR.  Creating the
+    # old PhysX nav_lidar here produced a second white lidar body at the world
+    # origin, which looked like a detached M0609 link.
+    connect_embedded_sensor_ros(stage)
 
     if not rclpy.ok():
         rclpy.init(args=[])

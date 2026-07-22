@@ -189,8 +189,8 @@ def _author_dynamic_can(
     return root_path
 
 
-def spawn_soda_cans(stage):
-    """Place four graspable cans on the retracted right-front upper tray."""
+def spawn_soda_cans(stage, count=4):
+    """Place the requested delivery cans on the right-front upper tray."""
     if os.environ.get("MOBILE_DEMO_SODA_CANS", "1") != "1":
         print("[drinks] soda cans disabled by MOBILE_DEMO_SODA_CANS=0", flush=True)
         return []
@@ -211,8 +211,15 @@ def spawn_soda_cans(stage):
     # The link origin is at the plate mid-plane.  Raise the can above its
     # 12.5 mm top face with a 1 mm initial separation for stable contact.
     local_z = 0.5 * 0.025 + 0.5 * CAN_HEIGHT + 0.001
+    count = int(count)
+    if count < 0 or count > 4:
+        raise ValueError(f"soda count must be 0..4, got {count}")
+    # Delivery tasks address SodaCan_03 first and SodaCan_02 second.
+    selected_positions = (
+        list(enumerate(RIGHT_FRONT_CAN_POSITIONS))[-count:] if count else []
+    )
     paths = []
-    for index, (local_x, local_y) in enumerate(RIGHT_FRONT_CAN_POSITIONS):
+    for index, (local_x, local_y) in selected_positions:
         world = tray_to_world.Transform(
             Gf.Vec3d(local_x, local_y, local_z)
         )
@@ -229,7 +236,7 @@ def spawn_soda_cans(stage):
             )
         )
     print(
-        "[drinks] loaded 4 dynamic soda cans on upper right-front tray "
+        f"[drinks] loaded {count} dynamic soda cans on upper right-front tray "
         f"size={2.0 * CAN_RADIUS:.3f}x{CAN_HEIGHT:.3f}m mass={CAN_MASS:.2f}kg",
         flush=True,
     )

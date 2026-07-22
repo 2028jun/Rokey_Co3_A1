@@ -195,7 +195,7 @@ class ServingRoute(diagnostic.Route):
         )
 
         # The command interface is deliberately independent of the route
-        # modules: 1..3 select a table and 4 requests the kitchen.
+        # modules: 0..3 select a table and 4 requests the kitchen.
         import rclpy
         from std_msgs.msg import Int32
 
@@ -217,13 +217,13 @@ class ServingRoute(diagnostic.Route):
         self.status_pub.publish(Int32(data=2))
         print(
             "[serving-route] waiting for /navigation/trigger: "
-            "1=table1, 2=table2, 3=table3, 4=kitchen",
+            "0=table0, 1=table1, 2=table2, 3=table3, 4=kitchen",
             flush=True,
         )
 
     def _on_command(self, msg):
         target = int(msg.data)
-        if target not in (1, 2, 3, 4):
+        if target not in (0, 1, 2, 3, 4):
             print(f"[serving-route] ignored invalid target={target}", flush=True)
             return
         if self.mission is not None and target != 4:

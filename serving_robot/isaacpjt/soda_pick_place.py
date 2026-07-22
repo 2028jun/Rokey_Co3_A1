@@ -649,7 +649,12 @@ class SodaCanPickPlace:
             )
 
     def close(self):
-        pass
+        # RMPFlowController and Lula solvers retain articulation/tensor views.
+        # They must be released before the next trip replaces payload prims.
+        self._controller = None
+        self._lift_ik = None
+        self._gripper = None
+        self._can_prim = None
 
 
 class Soda1PickPlace(SodaCanPickPlace):

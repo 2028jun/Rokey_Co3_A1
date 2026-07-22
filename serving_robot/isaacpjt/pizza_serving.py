@@ -1450,4 +1450,11 @@ class TrayPizzaPickPlace:
             )
 
     def close(self):
-        pass
+        # Release tensor-backed wrappers before a later trip removes and
+        # recreates /World/ServingDish.  Keeping DynamicCylinder/RMPFlow alive
+        # while deleting the prim invalidates the global PhysX simulation view.
+        self._controller = None
+        self._gripper = None
+        self._dish = None
+        self._bail = None
+        self._bail_crossbar = None
