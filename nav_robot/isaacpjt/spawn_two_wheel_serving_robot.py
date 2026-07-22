@@ -33,6 +33,9 @@ D455_USD = (
     WORKSPACE
     / "assets/isaac/Assets/Isaac/5.1/Isaac/Sensors/Intel/RealSense/rsd455.usd"
 )
+SENSORIZED_ROBOT_USD = (
+    WORKSPACE / "assets/diagnostics/two_wheel_serving_robot_v3_sensorized.usd"
+)
 _lidar_render_product = None
 _lidar_writer = None
 
@@ -339,7 +342,7 @@ def create_d455_ros_graph(stage, color_camera_path, depth_camera_path):
     keys = og.Controller.Keys
     og.Controller.edit(
         {
-            "graph_path": "/World/TwoWheelServingRobot/D455ROS2",
+            "graph_path": f"{diagnostic.ROBOT_ROOT}/Robot/D455ROS2",
             "evaluator_name": "execution",
         },
         {
@@ -487,6 +490,29 @@ def attach_all_sensors(stage):
         f"[serving-sensors] D455 stand={d455_mount_path} "
         "RGB=/camera/color/image_raw depth=/camera/depth/image_raw; "
         f"RPLIDAR={lidar_mount_path} ({lidar_status})",
+        flush=True,
+    )
+    if os.environ.get("NAV_ROBOT_EXPORT_SENSOR_USD", "0") == "1":
+        export_sensorized_robot_usd(stage)
+
+
+def export_sensorized_robot_usd(stage):
+    """Export the composed robot, camera stand, D455, lidar and ROS graph."""
+    source_path = Sdf.Path(f"{diagnostic.ROBOT_ROOT}/Robot")
+    target_path = Sdf.Path("/two_wheel_serving_robot_sensorized")
+    flattened = stage.Flatten()
+    if SENSORIZED_ROBOT_USD.exists():
+        output = Sdf.Layer.FindOrOpen(str(SENSORIZED_ROBOT_USD))
+        output.Clear()
+    else:
+        output = Sdf.Layer.CreateNew(str(SENSORIZED_ROBOT_USD))
+    if not Sdf.CopySpec(flattened, source_path, output, target_path):
+        raise RuntimeError(f"failed to export sensorized robot from {source_path}")
+    output.defaultPrim = target_path.name
+    output.Save()
+    print(
+        f"[serving-sensors] exported self-contained USD={SENSORIZED_ROBOT_USD} "
+        f"defaultPrim={target_path}",
         flush=True,
     )
 
