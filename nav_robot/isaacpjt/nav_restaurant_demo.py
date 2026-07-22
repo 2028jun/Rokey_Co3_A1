@@ -101,7 +101,13 @@ try:
     from drink_serving import spawn_soda_cans
     from cutlery_serving import spawn_cutlery_box
     from pizza_serving import TrayPizzaPickPlace
-    print("[food_spawn] loaded drink_serving, cutlery_serving, pizza_serving modules", flush=True)
+    from soda1_delivery import Soda1PickPlace
+    from soda2_delivery import Soda2PickPlace
+    from cutlery_pick_place import CutleryBoxPickPlace
+    print(
+        "[food_spawn] loaded pizza, soda1, soda2 and cutlery delivery modules",
+        flush=True,
+    )
 except Exception as _food_import_exc:
     print(f"[warn] food spawn module import: {_food_import_exc}", flush=True)
 
@@ -191,9 +197,11 @@ def import_robot_usd():
             flush=True,
         )
 
-# Default kitchen dock (routes.yaml kitchen). Mission also teleports here on start.
+# Spawn exactly on the restaurant centreline.  With yaw=-90 deg this makes the
+# table-row approach an actual straight line to x=0 instead of a diagonal from
+# the former x=0.21 offset.
 SPAWN_POSITION = Gf.Vec3d(
-    float(os.environ.get("NAV_SPAWN_X", "0.21")),
+    float(os.environ.get("NAV_SPAWN_X", "0.00")),
     float(os.environ.get("NAV_SPAWN_Y", "5.25")),
     float(os.environ.get("NAV_SPAWN_Z", "0.002")),
 )
@@ -213,21 +221,26 @@ SLIDING_TRAY_JOINTS = [
 STOW_CONFIGURATION = list(np.deg2rad([90.0, 0.0, -90.0, 0.0, -60.0, 90.0]))
 
 WHEEL_RADIUS = 0.0759
-# The imported USD uses physical cylindrical wheel contacts and the bridge
-# intentionally ignores lateral cmd_vel.  Treat it as four-wheel skid steer:
-# yaw wheel speed depends on half track only.  The previous mecanum L+W term
-# (0.5945 m) over-commanded pure turns by 2.16x and made the chassis translate
-# almost a metre while rotating at table branches.
-DIFFERENTIAL_HALF_TRACK = 0.2755
+# A physical four-wheel skid steer needs extra differential wheel speed to
+# overcome tire scrub.  Geometric half-track (0.2755 m) under-steered badly in
+# rolling Nav2 curves, while the old mecanum L+W term (0.5945 m) over-commanded
+# pivots.  Use a conservative empirical effective turn radius between them.
+DIFFERENTIAL_HALF_TRACK = float(
+    os.environ.get("NAV_SKID_STEER_EFFECTIVE_HALF_TRACK", "0.40")
+)
 MAX_WHEEL_SPEED = 16.0
+DIRECT_CONTROL_HALF_TRACK = 0.5945
 LINEAR_ACCEL_LIMIT = 0.80
 LINEAR_DECEL_LIMIT = 1.00
-ANGULAR_ACCEL_LIMIT = 2.0
-ANGULAR_DECEL_LIMIT = 2.5
+ANGULAR_ACCEL_LIMIT = 3.0
+ANGULAR_DECEL_LIMIT = 3.5
 WHEEL_DRIVE_DAMPING = 1500.0
 WHEEL_DRIVE_MAX_FORCE = 2000.0
-TIRE_STATIC_FRICTION = float(os.environ.get("NAV_TIRE_STATIC_FRICTION", "0.9"))
-TIRE_DYNAMIC_FRICTION = float(os.environ.get("NAV_TIRE_DYNAMIC_FRICTION", "0.7"))
+TIRE_STATIC_FRICTION = float(os.environ.get("NAV_TIRE_STATIC_FRICTION", "0.55"))
+TIRE_DYNAMIC_FRICTION = float(os.environ.get("NAV_TIRE_DYNAMIC_FRICTION", "0.40"))
+BASE_ANGULAR_DAMPING = float(
+    os.environ.get("NAV_BASE_ANGULAR_DAMPING", "3.0")
+)
 ARM_DRIVE_STIFFNESS = 200000.0
 ARM_DRIVE_DAMPING = 20000.0
 ARM_DRIVE_MAX_FORCE = 10000.0
@@ -391,6 +404,31 @@ def attach_front_rplidar_ros2(stage):
         print(f"[warn] RPLIDAR S2E setup: {exc}", flush=True)
 
 
+def add_parking_brake(stage, articulation_path):
+    brake_prim = stage.GetPrimAtPath("/World/NavRobot/ParkingBrake")
+    if not brake_prim.IsValid():
+        joint = UsdPhysics.FixedJoint.Define(stage, "/World/NavRobot/ParkingBrake")
+        joint.CreateBody1Rel().SetTargets([Sdf.Path(articulation_path)])
+        base_prim = stage.GetPrimAtPath(articulation_path)
+        if base_prim.IsValid():
+            transform = UsdGeom.XformCache().GetLocalToWorldTransform(base_prim)
+            base_position = transform.ExtractTranslation()
+            base_rotation = transform.ExtractRotationQuat()
+            imag = base_rotation.GetImaginary()
+            joint.CreateLocalPos0Attr().Set(Gf.Vec3f(*map(float, base_position)))
+            joint.CreateLocalRot0Attr().Set(Gf.Quatf(float(base_rotation.GetReal()), Gf.Vec3f(*map(float, imag))))
+            joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+            joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+            print("[mobile robot] parking brake=on (fixed base via UsdPhysics.FixedJoint)", flush=True)
+
+
+def remove_parking_brake(stage):
+    brake_prim = stage.GetPrimAtPath("/World/NavRobot/ParkingBrake")
+    if brake_prim.IsValid():
+        stage.RemovePrim("/World/NavRobot/ParkingBrake")
+        print("[mobile robot] parking brake=off (unlocked base)", flush=True)
+
+
 def open_restaurant_and_robot():
     if not RESTAURANT_USD.is_file():
         raise FileNotFoundError(RESTAURANT_USD)
@@ -494,10 +532,13 @@ def configure_physics_stability(stage, articulation_path: str):
     base_prim = stage.GetPrimAtPath(articulation_path)
     rigid_body_api = PhysxSchema.PhysxRigidBodyAPI.Apply(base_prim)
     rigid_body_api.CreateLinearDampingAttr(5.0)
-    rigid_body_api.CreateAngularDampingAttr(10.0)
+    # Four cylindrical wheel contacts otherwise resist skid-steer pivots too
+    # strongly.  Keep enough damping for stable stops without suppressing yaw.
+    rigid_body_api.CreateAngularDampingAttr(BASE_ANGULAR_DAMPING)
     rigid_body_api.CreateMaxDepenetrationVelocityAttr(0.2)
     print(
-        "[nav_robot] physics=CPU/120Hz stabilization=on solver=64/16",
+        "[nav_robot] physics=CPU/120Hz stabilization=on solver=64/16 "
+        f"base_angular_damping={BASE_ANGULAR_DAMPING:.2f}",
         flush=True,
     )
 
@@ -757,6 +798,46 @@ def create_sensor_static_tf(stage, lidar_path: str, camera_path: str, node: Node
     pass
 
 
+class CommandServingSequence:
+    """Frame-driven composition of the already tested serving tasks."""
+
+    def __init__(self, named_tasks):
+        self._named_tasks = list(named_tasks)
+        self._index = 0
+        self.done = False
+        self.failed = False
+
+    def initialize(self, articulation, dof_names):
+        for _, task in self._named_tasks:
+            task.initialize(articulation, dof_names)
+        names = " -> ".join(name for name, _ in self._named_tasks)
+        print(f"[integrated-serving] order={names}", flush=True)
+
+    def step(self, articulation):
+        if self.done or self.failed:
+            return
+        name, task = self._named_tasks[self._index]
+        task.step(articulation)
+        if task.failed:
+            self.failed = True
+            print(f"[integrated-serving] STOPPED: {name} failed", flush=True)
+            return
+        if not task.done:
+            return
+        self._index += 1
+        if self._index >= len(self._named_tasks):
+            self.done = True
+            print("[integrated-serving] all requested deliveries complete", flush=True)
+            return
+        next_name, next_task = self._named_tasks[self._index]
+        print(f"[integrated-serving] starting {next_name}", flush=True)
+        next_task.start_with_deployed_trays()
+
+    def close(self):
+        for _, task in self._named_tasks:
+            task.close()
+
+
 class NavBridge(Node):
     """cmd_vel subscriber + odom/TF publisher + food spawn & arm serving server."""
 
@@ -779,7 +860,12 @@ class NavBridge(Node):
         self._odom_initialized = False
         self._pending_teleport = None  # (x, y, z, yaw) applied on sim thread
         self._pending_food_spawn = False
-        self._pending_arm_motion = False
+        self._pending_arm_command = None
+        self._active_serving_task = None
+        self._serving_paused = False
+        self._spawned_serving_tasks = {}
+        self._direct_nav = None
+        self._direct_nav_request = None
 
         qos = QoSProfile(
             depth=10,
@@ -798,10 +884,20 @@ class NavBridge(Node):
         # Subsystems Services & Publishers for Manager Node
         self.spawn_status_pub = self.create_publisher(Int32, "/food_spawn/status", qos)
         self.arm_status_pub = self.create_publisher(Int32, "/arm/status", qos)
+        self.navigation_status_pub = self.create_publisher(
+            Int32, "/navigation/status", qos
+        )
+        self.navigation_location_pub = self.create_publisher(
+            Int32, "/navigation/current_location", qos
+        )
         self.hand_safety_pub = self.create_publisher(Bool, "/hand_safety/intrusion", qos)
 
-        # Standard Int32 topic subscriber for Isaac Sim food spawning (bypasses custom srv ABI mismatch)
+        # Standard Int32 topic subscribers for Isaac Sim food spawning & arm serving
         self.create_subscription(Int32, "/food_spawn/trigger", self._on_food_spawn_trigger, qos)
+        self.create_subscription(Int32, "/arm/trigger", self._on_arm_trigger, qos)
+        self.create_subscription(
+            Int32, "/navigation/trigger", self._on_navigation_trigger, qos
+        )
 
         if TaskCommand is not None:
             self.create_service(
@@ -818,7 +914,10 @@ class NavBridge(Node):
         # Publish hand safety heartbeat (False = safe, no hand intrusion)
         self.create_timer(0.2, self._publish_hand_safety)
 
-        # Must match Isaac OG /clock + LaserScan stamps (not timeline.get_current_time()).
+        # RTX sensor timestamps are based on the ROS /clock graph.  The Python
+        # subscriber receives that clock a few render frames later, so the
+        # dynamic TF is future-dated slightly below to cover the transport
+        # latency seen by RViz/Nav2.
         self._sim_stamp = None
         clock_qos = QoSProfile(
             depth=10,
@@ -839,6 +938,8 @@ class NavBridge(Node):
             "nav_depth_optical_frame": (0.25, 0.0, 0.55, 0.0),
         }
         self._publish_static_sensor_tf()
+        self.navigation_location_pub.publish(Int32(data=4))
+        self.navigation_status_pub.publish(Int32(data=2))
         subsystem_services = (
             ", /food_spawn/command, /arm/command"
             if TaskCommand is not None
@@ -853,6 +954,9 @@ class NavBridge(Node):
 
     def _publish_hand_safety(self):
         self.hand_safety_pub.publish(Bool(data=False))
+
+    def _on_clock(self, msg: Clock):
+        self._sim_stamp = msg.clock
 
     def _on_food_spawn_trigger(self, msg: Int32):
         self.get_logger().info(f"📥 [FoodSpawn Trigger] Received spawn trigger topic: {msg.data}")
@@ -874,21 +978,67 @@ class NavBridge(Node):
         threading.Thread(target=run_spawn, daemon=True).start()
         return response
 
+    def _on_arm_trigger(self, msg: Int32):
+        self.get_logger().info(f"📥 [Arm Trigger] Received arm trigger topic: {msg.data}")
+        self._queue_arm_command(int(msg.data))
+
     def _on_arm_command(self, request, response):
         cmd = request.command
         self.get_logger().info(f"📥 [ArmServer] Received /arm/command: {cmd}")
-        response.success = True
-
-        def run_arm():
-            self.arm_status_pub.publish(Int32(data=1))  # 1 = WORKING
-            time.sleep(1.5)  # Arm serving movement simulation
-            self.arm_status_pub.publish(Int32(data=2))  # 2 = COMPLETED
-
-        threading.Thread(target=run_arm, daemon=True).start()
+        response.success = self._queue_arm_command(int(cmd))
         return response
 
-    def _on_clock(self, msg: Clock):
-        self._sim_stamp = msg.clock
+    def _queue_arm_command(self, command):
+        with self._lock:
+            if command == 99:
+                if self._active_serving_task is None:
+                    return False
+                self._serving_paused = True
+                self.get_logger().warning("integrated serving paused")
+                return True
+            if command == 98:
+                if self._active_serving_task is None:
+                    return False
+                self._serving_paused = False
+                self.get_logger().info("integrated serving resumed")
+                return True
+            if command <= 0 or self._active_serving_task is not None:
+                return False
+            self._pending_arm_command = command
+        self.arm_status_pub.publish(Int32(data=1))
+        return True
+
+    def _on_navigation_trigger(self, msg: Int32):
+        self._queue_navigation(int(msg.data))
+
+    def _queue_navigation(self, target):
+        if target not in (1, 2, 3, 4):
+            self.get_logger().warning(f"unknown navigation command: {target}")
+            return False
+        with self._lock:
+            if self._direct_nav is not None or self._direct_nav_request is not None:
+                if target != 4:
+                    self.get_logger().warning("direct navigation is already active")
+                    return False
+                # Kitchen return is also the escape path from a stalled or
+                # imperfect table dock.  Let the simulation thread atomically
+                # replace the current controller on its next update.
+                self._direct_nav_request = 4
+                self._target_vx = 0.0
+                self._target_wz = 0.0
+                self.get_logger().warning(
+                    "preempting active navigation for kitchen return"
+                )
+                self.navigation_status_pub.publish(Int32(data=1))
+                return True
+            self._direct_nav_request = target
+            self._target_vx = 0.0
+            self._target_wz = 0.0
+        self.navigation_status_pub.publish(Int32(data=1))
+        self.get_logger().info(
+            f"direct wheel navigation queued: target_id={target} (Nav2 bypassed)"
+        )
+        return True
 
     def _publish_static_sensor_tf(self):
         static_tfs = []
@@ -913,6 +1063,8 @@ class NavBridge(Node):
             )
             self._warned_vy = True
         with self._lock:
+            if self._direct_nav is not None or self._direct_nav_request is not None:
+                return
             self._target_vx = float(msg.linear.x)
             self._target_wz = float(msg.angular.z)
 
@@ -990,8 +1142,429 @@ class NavBridge(Node):
         )
         return np.clip(wheels, -MAX_WHEEL_SPEED, MAX_WHEEL_SPEED)
 
+    @staticmethod
+    def _angle_error(target, actual):
+        return math.atan2(math.sin(target - actual), math.cos(target - actual))
+
+    def _direct_wheel_ik(self, vx, wz):
+        """Legacy controller calibration that already pivoted this robot reliably."""
+        turn = DIRECT_CONTROL_HALF_TRACK * wz
+        wheels = np.asarray(
+            [
+                (vx - turn) / WHEEL_RADIUS,
+                (vx + turn) / WHEEL_RADIUS,
+                (vx - turn) / WHEEL_RADIUS,
+                (vx + turn) / WHEEL_RADIUS,
+            ],
+            dtype=float,
+        )
+        # Match the proven controller's limit exactly.
+        return np.clip(wheels, -8.0, 8.0)
+
+    def _start_direct_navigation(self, target, x, y, yaw):
+        docks = {
+            1: (1.82, -2.20, 0.0),
+            2: (-1.82, 0.70, math.pi),
+            3: (1.82, 0.70, 0.0),
+        }
+        if target == 4:
+            # Leave a table backwards to the centre aisle, pivot north, then
+            # drive straight to the kitchen spawn point.
+            if abs(x) > 0.80:
+                escape_yaw = 0.0 if x > 0.0 else math.pi
+                stages = [
+                    {"kind": "pivot", "yaw": escape_yaw},
+                    {"kind": "axis_x", "value": 0.0, "speed": -0.16,
+                     "yaw": escape_yaw},
+                    {"kind": "pivot", "yaw": math.pi / 2.0},
+                    {"kind": "axis_y", "value": 5.25, "speed": 0.35,
+                     "yaw": math.pi / 2.0},
+                    {"kind": "pivot", "yaw": -math.pi / 2.0},
+                ]
+            elif abs(y - 5.25) > 0.05:
+                stages = [
+                    {"kind": "pivot", "yaw": math.pi / 2.0},
+                    {"kind": "axis_y", "value": 5.25, "speed": 0.35,
+                     "yaw": math.pi / 2.0},
+                    {"kind": "pivot", "yaw": -math.pi / 2.0},
+                ]
+            else:
+                stages = [{"kind": "pivot", "yaw": -math.pi / 2.0}]
+            self._direct_nav = {
+                "mode": "return_route",
+                "target": target,
+                "stages": stages,
+                "index": 0,
+                "stage_start": time.monotonic(),
+                "last_log": 0.0,
+            }
+        elif abs(x) > 0.80:
+            # A new table command received while docked must first back out of
+            # the table bay.  The original single-trip demo had no such state,
+            # so a second table request could not establish a safe approach.
+            goal_y = docks[target][1]
+            aisle_yaw = -math.pi / 2.0 if goal_y < y else math.pi / 2.0
+            stages = [
+                {"kind": "axis_x", "value": 0.0, "speed": -0.14,
+                 "yaw": (0.0 if x > 0.0 else math.pi)},
+                {"kind": "pivot", "yaw": aisle_yaw},
+                {"kind": "axis_y", "value": goal_y, "speed": 0.30,
+                 "yaw": aisle_yaw},
+            ]
+            self._direct_nav = {
+                "mode": "table_transfer",
+                "target": target,
+                "goal": docks[target],
+                "stages": stages,
+                "index": 0,
+                "stage_start": time.monotonic(),
+                "last_log": 0.0,
+            }
+        else:
+            self._direct_nav = {
+                "mode": "legacy_table",
+                "target": target,
+                "goal": docks[target],
+                "stage": "move_to_pre_dock",
+                "path_aligned": False,
+                "recovery_count": 0,
+                "stage_start": time.monotonic(),
+                "last_log": 0.0,
+            }
+        self._cmd_vx = 0.0
+        self._cmd_wz = 0.0
+        self.get_logger().info(
+            f"direct route started target={target} pose=({x:.2f},{y:.2f},"
+            f"{math.degrees(yaw):.1f}deg)"
+        )
+
+    def _finish_direct_navigation(self, success, reason=""):
+        mission = self._direct_nav
+        if mission is None:
+            return
+        target = mission["target"]
+        self._direct_nav = None
+        self._cmd_vx = self._cmd_wz = 0.0
+        self._target_vx = self._target_wz = 0.0
+        if success:
+            self.navigation_location_pub.publish(Int32(data=target))
+            self.navigation_status_pub.publish(Int32(data=2))
+            self.get_logger().info(f"direct navigation complete target={target}")
+        else:
+            self.navigation_status_pub.publish(Int32(data=3))
+            self.get_logger().error(
+                f"direct navigation failed target={target}: {reason}"
+            )
+
+    def _update_direct_navigation(self, x, y, yaw):
+        mission = self._direct_nav
+        if mission is None:
+            return None
+        if mission["mode"] == "legacy_table":
+            return self._update_legacy_table_navigation(mission, x, y, yaw)
+
+        stage = mission["stages"][mission["index"]]
+        elapsed = time.monotonic() - mission["stage_start"]
+        kind = stage["kind"]
+        vx = wz = 0.0
+        done = False
+
+        if kind == "pivot":
+            error = self._angle_error(stage["yaw"], yaw)
+            done = abs(error) < math.radians(2.5)
+            if not done:
+                wz = float(np.clip(1.8 * error, -0.65, 0.65))
+                if abs(wz) < 0.18:
+                    wz = math.copysign(0.18, error)
+            timeout = 25.0
+            detail = f"yaw_error={math.degrees(error):.1f}deg"
+        else:
+            axis = x if kind == "axis_x" else y
+            error = stage["value"] - axis
+            done = abs(error) <= 0.05
+            desired_yaw = stage["yaw"]
+            yaw_error = self._angle_error(desired_yaw, yaw)
+            if not done:
+                requested = min(abs(stage["speed"]), max(0.045, abs(error) * 0.8))
+                vx = math.copysign(requested, stage["speed"])
+                wz = float(np.clip(1.6 * yaw_error, -0.28, 0.28))
+            timeout = 90.0
+            detail = f"axis_error={error:.3f}m yaw_error={math.degrees(yaw_error):.1f}deg"
+
+        now = time.monotonic()
+        if now - mission["last_log"] >= 1.0:
+            mission["last_log"] = now
+            self.get_logger().info(
+                f"direct stage={mission['index']} {kind} pose=({x:.2f},{y:.2f},"
+                f"{math.degrees(yaw):.1f}deg) {detail}"
+            )
+        if elapsed > timeout:
+            self._finish_direct_navigation(False, f"{kind} timeout; {detail}")
+            return (0.0, 0.0)
+        if done:
+            mission["index"] += 1
+            if mission["index"] >= len(mission["stages"]):
+                if mission["mode"] == "table_transfer":
+                    target = mission["target"]
+                    goal = mission["goal"]
+                    mission.clear()
+                    mission.update(
+                        mode="legacy_table",
+                        target=target,
+                        goal=goal,
+                        stage="move_to_pre_dock",
+                        path_aligned=False,
+                        stage_start=now,
+                        last_log=0.0,
+                        settle_count=0,
+                        recovery_count=0,
+                    )
+                    self.get_logger().info(
+                        "table transfer reached centre aisle; starting "
+                        "original pre-dock controller"
+                    )
+                    return (0.0, 0.0)
+                self._finish_direct_navigation(True)
+                return (0.0, 0.0)
+            mission["stage_start"] = now
+            mission["last_log"] = 0.0
+            next_kind = mission["stages"][mission["index"]]["kind"]
+            self.get_logger().info(f"direct stage complete; next={next_kind}")
+            return (0.0, 0.0)
+        return (vx, wz)
+
+    def _update_legacy_table_navigation(self, mission, x, y, yaw):
+        """Original mobile_manipulator_demo TableNavigationServer controller."""
+        goal_x, goal_y, goal_yaw = mission["goal"]
+        pre_x = goal_x - 0.65 * math.cos(goal_yaw)
+        pre_y = goal_y - 0.65 * math.sin(goal_yaw)
+        stage = mission["stage"]
+        vx = wz = 0.0
+
+        if stage == "move_to_pre_dock":
+            dx, dy = pre_x - x, pre_y - y
+            distance = math.hypot(dx, dy)
+            heading_error = self._angle_error(math.atan2(dy, dx), yaw)
+            if mission["path_aligned"]:
+                if abs(heading_error) > math.radians(12.0):
+                    mission["path_aligned"] = False
+            elif abs(heading_error) < math.radians(3.0):
+                mission["path_aligned"] = True
+
+            if not mission["path_aligned"]:
+                phase = "rotate_to_path"
+                wz = float(np.clip(1.8 * heading_error, -0.65, 0.65))
+            else:
+                phase = "drive_to_pre_dock"
+                vx = min(0.35, max(0.08, 0.8 * distance))
+                wz = float(np.clip(1.2 * heading_error, -0.65, 0.65))
+            if distance <= 0.08:
+                mission["stage"] = "align_at_pre_dock"
+                mission["path_aligned"] = False
+                mission["stage_start"] = time.monotonic()
+                phase, vx, wz = "pre_dock_reached", 0.0, 0.0
+            detail = (
+                f"pre=({pre_x:.2f},{pre_y:.2f}) distance={distance:.3f}m "
+                f"heading_error={math.degrees(heading_error):.1f}deg"
+            )
+            timeout = 120.0
+
+        elif stage == "align_at_pre_dock":
+            distance = math.hypot(pre_x - x, pre_y - y)
+            yaw_error = self._angle_error(goal_yaw, yaw)
+            phase = "align_at_pre_dock"
+            if abs(yaw_error) > math.radians(2.0):
+                wz = float(np.clip(1.8 * yaw_error, -0.65, 0.65))
+                # Commands below this cannot overcome the skid-steer tire's
+                # static friction, which left the robot parked around 2 deg.
+                if abs(wz) < 0.18:
+                    wz = math.copysign(0.18, yaw_error)
+            else:
+                mission["stage"] = "final_approach"
+                mission["stage_start"] = time.monotonic()
+                phase, wz = "start_final_approach", 0.0
+            detail = f"distance={distance:.3f}m yaw_error={math.degrees(yaw_error):.1f}deg"
+            timeout = 30.0
+
+        elif stage == "recovery_backout":
+            dx, dy = goal_x - x, goal_y - y
+            forward_error = math.cos(goal_yaw) * dx + math.sin(goal_yaw) * dy
+            yaw_error = self._angle_error(goal_yaw, yaw)
+            if abs(yaw_error) > math.radians(2.0):
+                # Never reverse while the chassis is still pointing along the
+                # diagonal re-entry angle; doing so drove it away sideways.
+                phase = "recovery_align_before_backout"
+                wz = float(np.clip(1.8 * yaw_error, -0.45, 0.45))
+                if abs(wz) < 0.18:
+                    wz = math.copysign(0.18, yaw_error)
+            elif forward_error < 0.55:
+                phase = "recovery_backout"
+                vx = -0.08
+                wz = float(np.clip(1.8 * yaw_error, -0.20, 0.20))
+            else:
+                mission["stage"] = "recovery_align"
+                mission["stage_start"] = time.monotonic()
+                phase, vx, wz = "recovery_backout_complete", 0.0, 0.0
+            distance = math.hypot(dx, dy)
+            detail = (
+                f"backout_forward={forward_error:.3f}m "
+                f"yaw_error={math.degrees(yaw_error):.1f}deg"
+            )
+            timeout = 15.0
+
+        elif stage == "recovery_align":
+            dx, dy = goal_x - x, goal_y - y
+            distance = math.hypot(dx, dy)
+            approach_yaw = math.atan2(dy, dx)
+            heading_error = self._angle_error(approach_yaw, yaw)
+            phase = "recovery_align_to_goal"
+            if abs(heading_error) > math.radians(2.0):
+                wz = float(np.clip(1.8 * heading_error, -0.45, 0.45))
+                if abs(wz) < 0.18:
+                    wz = math.copysign(0.18, heading_error)
+            else:
+                mission["recovery_approach_yaw"] = approach_yaw
+                mission["stage"] = "recovery_reapproach"
+                mission["stage_start"] = time.monotonic()
+                phase, wz = "recovery_reapproach_start", 0.0
+            detail = (
+                f"distance={distance:.3f}m approach_yaw="
+                f"{math.degrees(approach_yaw):.1f}deg heading_error="
+                f"{math.degrees(heading_error):.1f}deg"
+            )
+            timeout = 15.0
+
+        elif stage == "recovery_reapproach":
+            dx, dy = goal_x - x, goal_y - y
+            distance = math.hypot(dx, dy)
+            # Keep the entry line fixed.  Recomputing atan2 close to the goal
+            # made the target heading singular and curled the robot around it.
+            approach_yaw = mission["recovery_approach_yaw"]
+            heading_error = self._angle_error(approach_yaw, yaw)
+            phase = "recovery_reapproach"
+            if distance > 0.08:
+                if abs(heading_error) < math.radians(12.0):
+                    vx = min(0.08, max(0.018, 0.45 * distance))
+                wz = float(np.clip(1.8 * heading_error, -0.25, 0.25))
+            else:
+                mission["stage"] = "recovery_final_align"
+                mission["stage_start"] = time.monotonic()
+                mission["settle_count"] = 0
+                phase, vx, wz = "recovery_position_reached", 0.0, 0.0
+            detail = (
+                f"distance={distance:.3f}m heading_error="
+                f"{math.degrees(heading_error):.1f}deg"
+            )
+            timeout = 25.0
+
+        elif stage == "recovery_final_align":
+            dx, dy = goal_x - x, goal_y - y
+            distance = math.hypot(dx, dy)
+            yaw_error = self._angle_error(goal_yaw, yaw)
+            phase = "recovery_final_align"
+            if abs(yaw_error) > math.radians(2.0):
+                wz = float(np.clip(1.8 * yaw_error, -0.35, 0.35))
+                if abs(wz) < 0.18:
+                    wz = math.copysign(0.18, yaw_error)
+            else:
+                mission["stage"] = "final_approach"
+                mission["stage_start"] = time.monotonic()
+                mission["settle_count"] = 0
+                phase, wz = "recovery_final_align_complete", 0.0
+            detail = (
+                f"distance={distance:.3f}m yaw_error="
+                f"{math.degrees(yaw_error):.1f}deg"
+            )
+            timeout = 15.0
+
+        else:
+            dx, dy = goal_x - x, goal_y - y
+            distance = math.hypot(dx, dy)
+            yaw_error = self._angle_error(goal_yaw, yaw)
+            forward_error = math.cos(goal_yaw) * dx + math.sin(goal_yaw) * dy
+            lateral_error = -math.sin(goal_yaw) * dx + math.cos(goal_yaw) * dy
+            position_ok = distance <= 0.040
+            yaw_ok = abs(yaw_error) <= math.radians(2.0)
+            if (
+                abs(lateral_error) > 0.05
+                and abs(forward_error) < 0.10
+            ):
+                mission["recovery_count"] = mission.get("recovery_count", 0) + 1
+                if mission["recovery_count"] > 3:
+                    self._finish_direct_navigation(
+                        False,
+                        f"dock recovery exhausted; lateral={lateral_error:.3f}m",
+                    )
+                    return (0.0, 0.0)
+                mission["stage"] = "recovery_backout"
+                mission["stage_start"] = time.monotonic()
+                mission["settle_count"] = 0
+                phase, vx, wz = "start_lateral_recovery", 0.0, 0.0
+                self.get_logger().warning(
+                    f"dock lateral error={lateral_error:.3f}m; starting "
+                    f"re-entry {mission['recovery_count']}/3"
+                )
+            elif not position_ok:
+                phase = "final_forward_approach"
+                if abs(yaw_error) <= math.radians(8.0):
+                    vx = float(np.clip(0.45 * forward_error, -0.04, 0.08))
+                    if abs(vx) < 0.015 and abs(forward_error) > 0.004:
+                        vx = math.copysign(0.015, forward_error)
+                wz = float(
+                    # Positive lateral error is to the goal-frame left and
+                    # therefore requires positive yaw.  The copied controller
+                    # used the opposite sign for its former frame convention.
+                    np.clip(1.8 * yaw_error + 1.4 * lateral_error, -0.20, 0.20)
+                )
+                mission["settle_count"] = 0
+            elif not yaw_ok:
+                phase = "fine_align_at_table"
+                wz = float(np.clip(1.2 * yaw_error, -0.15, 0.15))
+                if abs(wz) < 0.12:
+                    wz = math.copysign(0.12, yaw_error)
+                mission["settle_count"] = 0
+            else:
+                phase = "settle_at_table"
+                mission["settle_count"] = mission.get("settle_count", 0) + 1
+                if mission["settle_count"] >= 30:
+                    self.get_logger().info(
+                        f"arrived table={mission['target']} pose=({x:.3f},{y:.3f},"
+                        f"{math.degrees(yaw):.1f}deg)"
+                    )
+                    self._finish_direct_navigation(True)
+                    return (0.0, 0.0)
+            detail = (
+                f"goal=({goal_x:.2f},{goal_y:.2f}) distance={distance:.3f}m "
+                f"forward={forward_error:.3f}m lateral={lateral_error:.3f}m yaw_error="
+                f"{math.degrees(yaw_error):.1f}deg"
+            )
+            timeout = 60.0
+
+        now = time.monotonic()
+        if now - mission["last_log"] >= 1.0:
+            mission["last_log"] = now
+            self.get_logger().info(
+                f"direct phase={phase} pose=({x:.2f},{y:.2f},"
+                f"{math.degrees(yaw):.1f}deg) {detail}"
+            )
+        if now - mission["stage_start"] > timeout:
+            self._finish_direct_navigation(False, f"{stage} timeout; {detail}")
+            return (0.0, 0.0)
+        return (vx, wz)
+
     def tick(self, _sim_time_sec: float = 0.0):
         self._apply_pending_teleport()
+
+        position, orientation = self.articulation.get_world_pose()
+        x = float(position[0])
+        y = float(position[1])
+        yaw = quaternion_to_yaw(orientation)
+
+        with self._lock:
+            nav_request = self._direct_nav_request
+            self._direct_nav_request = None
+        if nav_request is not None:
+            self._start_direct_navigation(nav_request, x, y, yaw)
 
         with self._lock:
             pending_spawn = self._pending_food_spawn
@@ -1000,39 +1573,160 @@ class NavBridge(Node):
         if pending_spawn and self.stage is not None:
             self.get_logger().info("Spawning Pizza, 4 Soda Cans, and Cutlery Box on robot tray in Isaac Sim...")
             try:
+                # A completed trip leaves its payload on the destination
+                # table.  The authoring helpers use stable prim paths, so
+                # remove only those dedicated payload roots before loading
+                # the next trip at the kitchen.
+                for payload_path in (
+                    "/World/ServingDish",
+                    "/World/PizzaBoardBail",
+                    "/World/PizzaBoardBailHinge",
+                    "/World/PizzaBoardGripBearing",
+                    "/World/PizzaBoardGripBlock",
+                    "/World/ServingDrinks",
+                    "/World/ServingCutlery",
+                ):
+                    if self.stage.GetPrimAtPath(payload_path).IsValid():
+                        self.stage.RemovePrim(payload_path)
+                self._spawned_serving_tasks = {}
                 if 'spawn_soda_cans' in globals():
                     spawn_soda_cans(self.stage)
                 if 'spawn_cutlery_box' in globals():
                     spawn_cutlery_box(self.stage)
                 if 'TrayPizzaPickPlace' in globals():
+                    # Constructor authors the physical dish at the kitchen.
+                    # Keep this exact object for delivery: constructing it a
+                    # second time would re-author the same USD prim hierarchy.
                     pizza_task = TrayPizzaPickPlace(self.stage)
+                    self._spawned_serving_tasks = {
+                        "pizza": pizza_task,
+                    }
                     dish_prim = self.stage.GetPrimAtPath("/World/ServingDish")
                     if dish_prim.IsValid():
                         dish_body = UsdPhysics.RigidBodyAPI.Get(self.stage, dish_prim.GetPath())
                         if dish_body:
                             dish_body.GetKinematicEnabledAttr().Set(False)
-                            self.get_logger().info("[FoodSpawn] Enabled dynamic physics for pizza dish")
+                            self.get_logger().info(
+                                "[FoodSpawn] Enabled dynamic physics for pizza dish"
+                            )
             except Exception as exc:
                 self.get_logger().error(f"Food spawn execution error: {exc}")
-            self.spawn_status_pub.publish(Int32(data=2))  # 2 = COMPLETED
+                self.spawn_status_pub.publish(Int32(data=3))
+            else:
+                self.spawn_status_pub.publish(Int32(data=2))  # 2 = COMPLETED
+
+        with self._lock:
+            arm_command = self._pending_arm_command
+            self._pending_arm_command = None
+
+        if arm_command is not None:
+            try:
+                cutlery_requested = arm_command >= 20
+                remainder = arm_command - (20 if cutlery_requested else 0)
+                pizza_requested = remainder >= 10
+                drink_count = remainder - (10 if pizza_requested else 0)
+                if drink_count > 2:
+                    raise ValueError(
+                        "only the tested soda1/soda2 pair is supported; "
+                        f"requested drinks={drink_count}"
+                    )
+                named_tasks = []
+                if pizza_requested:
+                    pizza_task = self._spawned_serving_tasks.get("pizza")
+                    if pizza_task is None:
+                        raise RuntimeError("pizza task was not prepared by food spawn")
+                    named_tasks.append(("pizza", pizza_task))
+                if drink_count >= 1:
+                    named_tasks.append(
+                        ("soda1", Soda1PickPlace(
+                            self.stage, wait_for_start=bool(named_tasks)
+                        ))
+                    )
+                if drink_count >= 2:
+                    named_tasks.append(
+                        ("soda2", Soda2PickPlace(
+                            self.stage, wait_for_start=bool(named_tasks)
+                        ))
+                    )
+                if cutlery_requested:
+                    named_tasks.append(
+                        ("cutlery", CutleryBoxPickPlace(
+                            self.stage, wait_for_start=bool(named_tasks)
+                        ))
+                    )
+                if not named_tasks:
+                    raise ValueError(f"arm command contains no delivery: {arm_command}")
+                task = CommandServingSequence(named_tasks)
+                add_parking_brake(self.stage, self.articulation.prim_path)
+                task.initialize(self.articulation, self.dof_names)
+                self._active_serving_task = task
+                self._serving_paused = False
+                self.get_logger().info(
+                    f"[integrated-serving] started arm_command={arm_command}"
+                )
+            except Exception as exc:
+                self.get_logger().error(
+                    f"integrated serving initialization failed: {exc}"
+                )
+                remove_parking_brake(self.stage)
+                self.arm_status_pub.publish(Int32(data=3))
+
+        if self._active_serving_task is not None:
+            self._target_vx = self._target_wz = 0.0
+            self._cmd_vx = self._cmd_wz = 0.0
+            self.articulation.apply_action(
+                ArticulationAction(
+                    joint_velocities=np.zeros(4, dtype=float),
+                    joint_indices=self.wheel_indices,
+                )
+            )
+            if not self._serving_paused:
+                self._active_serving_task.step(self.articulation)
+            if self._active_serving_task.failed:
+                self._active_serving_task.close()
+                self._active_serving_task = None
+                remove_parking_brake(self.stage)
+                self.arm_status_pub.publish(Int32(data=3))
+                self.get_logger().error("[integrated-serving] delivery failed")
+            elif self._active_serving_task.done:
+                self._active_serving_task.close()
+                self._active_serving_task = None
+                self._spawned_serving_tasks = {}
+                remove_parking_brake(self.stage)
+                self.arm_status_pub.publish(Int32(data=2))
+                self.get_logger().info("[integrated-serving] delivery complete")
 
         now = time.monotonic()
         dt = min(max(now - self._last_cmd_time, 1.0 / 240.0), 0.05)
         self._last_cmd_time = now
 
+        direct_command = self._update_direct_navigation(x, y, yaw)
         with self._lock:
             target_vx = self._target_vx
             target_wz = self._target_wz
+        if direct_command is not None:
+            target_vx, target_wz = direct_command
 
-        self._cmd_vx = self._slew(
-            self._cmd_vx, target_vx, LINEAR_ACCEL_LIMIT, LINEAR_DECEL_LIMIT, dt
-        )
-        self._cmd_wz = self._slew(
-            self._cmd_wz, target_wz, ANGULAR_ACCEL_LIMIT, ANGULAR_DECEL_LIMIT, dt
-        )
+        if direct_command is not None:
+            # The original TableNavigationServer applied each closed-loop
+            # command directly; retain that behavior instead of adding the
+            # Nav2 bridge's velocity ramp on top of it.
+            self._cmd_vx = target_vx
+            self._cmd_wz = target_wz
+        else:
+            self._cmd_vx = self._slew(
+                self._cmd_vx, target_vx, LINEAR_ACCEL_LIMIT, LINEAR_DECEL_LIMIT, dt
+            )
+            self._cmd_wz = self._slew(
+                self._cmd_wz, target_wz, ANGULAR_ACCEL_LIMIT, ANGULAR_DECEL_LIMIT, dt
+            )
         vx, wz = self._cmd_vx, self._cmd_wz
 
-        wheel_velocities = self._differential_ik(vx, wz)
+        wheel_velocities = (
+            self._direct_wheel_ik(vx, wz)
+            if direct_command is not None
+            else self._differential_ik(vx, wz)
+        )
         self.articulation.apply_action(
             ArticulationAction(
                 joint_velocities=wheel_velocities,
@@ -1069,7 +1763,15 @@ class NavBridge(Node):
         self.odom_pub.publish(odom)
 
         tf = TransformStamped()
-        tf.header.stamp = stamp
+        # /clock reaches this Python node about 0.067 s after the RTX scan has
+        # already been stamped.  Publish TF 0.10 s ahead so message filters can
+        # interpolate the scan without extrapolation failures.
+        tf_nanosec = int(stamp.nanosec) + 100_000_000
+        tf_sec = int(stamp.sec) + tf_nanosec // 1_000_000_000
+        tf.header.stamp = TimeMsg(
+            sec=tf_sec,
+            nanosec=tf_nanosec % 1_000_000_000,
+        )
         tf.header.frame_id = "odom"
         tf.child_frame_id = BASE_LINK_NAME
         tf.transform.translation.x = x
@@ -1117,6 +1819,11 @@ def main():
         f"[nav_robot] domain={os.environ['ROS_DOMAIN_ID']} "
         f"spawn=({SPAWN_POSITION[0]:.2f},{SPAWN_POSITION[1]:.2f}) "
         f"yaw={SPAWN_YAW:.2f}",
+        flush=True,
+    )
+    print(
+        "[nav_robot] skid-steer effective half-track="
+        f"{DIFFERENTIAL_HALF_TRACK:.3f}m",
         flush=True,
     )
 

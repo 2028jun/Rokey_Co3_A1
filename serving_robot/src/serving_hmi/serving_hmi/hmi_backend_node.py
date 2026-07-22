@@ -10,7 +10,15 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile
 from rosgraph_msgs.msg import Clock
-from std_msgs.msg import String, Bool
+from std_msgs.msg import String, Bool, Int32
+from std_srvs.srv import Trigger
+
+try:
+    from serving_robot_interfaces.srv import OrderRequest
+    ORDER_REQUEST_SRV_AVAILABLE = True
+except ImportError:
+    OrderRequest = None
+    ORDER_REQUEST_SRV_AVAILABLE = False
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -92,6 +100,18 @@ class HMIBridgeNode(Node):
             self.table_camera_callback,
             qos_profile_sensor_data
         )
+
+        # Serving Robot Manager Integration Clients & Subscribers
+        self.system_status_sub = self.create_subscription(
+            Int32,
+            '/system/status',
+            self.system_status_callback,
+            10
+        )
+        self.manager_reset_client = self.create_client(Trigger, '/manager/reset_fault')
+        if ORDER_REQUEST_SRV_AVAILABLE:
+            self.manager_order_client = self.create_client(OrderRequest, '/manager/order')
+            self.get_logger().info("Manager /manager/order Service Client created.")
 
     def table_camera_callback(self, msg):
         try:
@@ -184,6 +204,80 @@ class HMIBridgeNode(Node):
                         self.parking_brake = True
         except Exception as e:
             self.get_logger().warn(f"Failed to parse robot status msg: {e}")
+
+    def system_status_callback(self, msg: Int32):
+        status_code = msg.data
+        status_map = {
+            0: "IDLE",
+            1: "RETURNING TO KITCHEN",
+            2: "PREPARING FOOD (SPAWNING)",
+            3: "NAVIGATING TO TABLE",
+            4: "ARM SERVING FOOD",
+            5: "PAUSED (SAFETY HAND INTRUSION)",
+            6: "COMPLETED",
+            7: "SYSTEM FAILED (RESET REQUIRED)"
+        }
+        self.robot_state = status_map.get(status_code, f"STATE_{status_code}")
+        self.robot_connected = True
+        self.last_robot_status_recv_time = time.time()
+
+        if self.drive_mode != "LIVE":
+            self.drive_mode = "LIVE"
+            print(f"📡 [HMI Backend] Manager Status Received ({self.robot_state}) -> DRIVE MODE AUTO SWITCHED TO LIVE!", flush=True)
+
+        active_id = order_manager.active_order_id
+        if active_id:
+            if status_code in (1, 2):
+                order_manager.update_status(active_id, OrderStatus.PICKING_UP)
+                self.parking_brake = False
+            elif status_code == 3:
+                order_manager.update_status(active_id, OrderStatus.NAVIGATING)
+                self.parking_brake = False
+            elif status_code in (4, 5):
+                order_manager.update_status(active_id, OrderStatus.SERVING)
+                self.parking_brake = True
+            elif status_code == 6:
+                order_manager.update_status(active_id, OrderStatus.COMPLETED)
+                self.parking_brake = True
+
+    def send_order_to_manager(self, table_num: int, items: list):
+        if not ORDER_REQUEST_SRV_AVAILABLE or not hasattr(self, 'manager_order_client'):
+            return False, "OrderRequest srv not loaded"
+        if not self.manager_order_client.service_is_ready():
+            return False, "Manager /manager/order service not ready"
+
+        pizza1, pizza2, pizza3, drink, cutlery = 0, 0, 0, 0, 0
+        for item in items:
+            name = item.get("name", "").lower()
+            qty = int(item.get("quantity", 1))
+            if "pizza 1" in name or "supreme" in name or name == "pizza1":
+                pizza1 += qty
+            elif "pizza 2" in name or "pepperoni" in name or name == "pizza2":
+                pizza2 += qty
+            elif "pizza 3" in name or "cheese" in name or name == "pizza3" or "pizza" in name:
+                pizza3 += qty
+            elif "soda" in name or "drink" in name or "beverage" in name:
+                drink += qty
+            elif "cutlery" in name or "fork" in name or "spoon" in name:
+                cutlery += qty
+
+        req = OrderRequest.Request()
+        req.table_id = int(table_num)
+        req.pizza1_count = pizza1
+        req.pizza2_count = pizza2
+        req.pizza3_count = pizza3
+        req.drink_count = drink
+        req.cutlery_count = cutlery
+
+        print(f"🚀 [HMI Backend] Sending OrderRequest to Manager: Table={table_num}, P1={pizza1}, P2={pizza2}, P3={pizza3}, Drink={drink}, Cutlery={cutlery}", flush=True)
+        self.manager_order_client.call_async(req)
+        return True, "Order dispatched to Manager via /manager/order"
+
+    def reset_manager_fault(self):
+        if hasattr(self, 'manager_reset_client') and self.manager_reset_client.service_is_ready():
+            req = Trigger.Request()
+            self.manager_reset_client.call_async(req)
+            print("🚀 [HMI Backend] Triggered /manager/reset_fault service call", flush=True)
 
     def check_liveness_timer(self):
         now = time.time()
@@ -380,7 +474,9 @@ async def websocket_endpoint(websocket: WebSocket):
                         "status": new_order.status
                     }
                     if ros_node:
-                        ros_node.publish_order(order_payload)
+                        sent, msg = ros_node.send_order_to_manager(table_num, items)
+                        if not sent:
+                            ros_node.publish_order(order_payload)
                         if ros_node.drive_mode == "MOCK":
                             ros_node.update_mock_navigation()
 
@@ -414,6 +510,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     stop_flag = bool(data.get("stop", True))
                     if ros_node:
                         ros_node.publish_estop(stop_flag)
+
+                elif msg_type == "RESET_FAULT":
+                    if ros_node:
+                        ros_node.reset_manager_fault()
                         
             except Exception as ex:
                 print(f"Error handling WS message: {ex}")

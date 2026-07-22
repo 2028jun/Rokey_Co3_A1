@@ -86,10 +86,10 @@ TABLE_DISH_LOCAL = np.array([0.55, 0.0, -0.14568])
 BOARD_RADIUS = 0.195
 BOARD_THICKNESS = 0.018
 BOARD_BAIL_X = 0.0
-# The loose board is authored in world axes at the initial dock. With the
-# chassis yawed 180 degrees, its visible folded bail still matches the proven
-# world +X geometry while it lies toward arm-local -X.
-BOARD_BAIL_FOLD_X_SIGN = 1.0
+# Author the folded bail toward robot-local -X (the rear of the chassis).
+# The complete board assembly inherits the robot yaw, so this remains correct
+# when the restaurant scene changes the initial chassis heading.
+BOARD_BAIL_FOLD_X_SIGN = -1.0
 BOARD_BAIL_FOLD_ARM_X_SIGN = -1.0
 BOARD_BAIL_HALF_SPAN = 0.165
 BOARD_BAIL_HEIGHT = 0.165
@@ -195,9 +195,7 @@ def author_magnetic_steel_plate(stage):
         flush=True,
     )
 
-def author_wooden_pizza_board(
-    stage, mesh_path, physics_material, board_world_position
-):
+def author_wooden_pizza_board(stage, mesh_path, physics_material):
     """Create one watertight round board with a two-sided lifting bail."""
     circle_angles = np.linspace(0.0, 2.0 * np.pi, 64, endpoint=False)
     outline = [
@@ -297,16 +295,28 @@ def author_wooden_pizza_board(
         stop_physx.CreateContactOffsetAttr(0.001)
         stop_physx.CreateRestOffsetAttr(0.0)
 
-    # One Y-axis revolute joint represents the two coaxial physical pivots.
-    # At this dock the separate rigid bail starts toward world +X, equivalent
-    # to arm-local -X after the chassis' 180-degree yaw, and rotates upward as
-    # RG2 follows the crossbar's circular path.
+    # One local-Y revolute joint represents the two coaxial physical pivots.
+    # The board root carries the robot yaw, so the separate rigid components
+    # below receive that same orientation and all geometry stays robot-local.
+    dish_prim = stage.GetPrimAtPath("/World/ServingDish")
+    _, board_world_orientation, board_to_world = prim_world_pose(dish_prim)
     bail_path = "/World/PizzaBoardBail"
     bail_root = UsdGeom.Xform.Define(stage, bail_path)
-    bail_pivot_world = np.asarray(board_world_position, dtype=float) + np.array(
-        [BOARD_BAIL_X, 0.0, 0.5 * BOARD_THICKNESS + BOARD_BAIL_ROD_RADIUS]
+    bail_pivot_local = np.array(
+        [BOARD_BAIL_X, 0.0, 0.5 * BOARD_THICKNESS + BOARD_BAIL_ROD_RADIUS],
+        dtype=float,
+    )
+    bail_pivot_world = np.asarray(
+        board_to_world.Transform(Gf.Vec3d(*map(float, bail_pivot_local))),
+        dtype=float,
     )
     bail_root.AddTranslateOp().Set(Gf.Vec3d(*map(float, bail_pivot_world)))
+    bail_root.AddOrientOp().Set(
+        Gf.Quatf(
+            float(board_world_orientation[0]),
+            Gf.Vec3f(*map(float, board_world_orientation[1:])),
+        )
+    )
     UsdPhysics.RigidBodyAPI.Apply(bail_root.GetPrim())
     UsdPhysics.MassAPI.Apply(bail_root.GetPrim()).CreateMassAttr(BOARD_BAIL_MASS)
     bail_physx_body = PhysxSchema.PhysxRigidBodyAPI.Apply(bail_root.GetPrim())
@@ -380,7 +390,7 @@ def author_wooden_pizza_board(
         sphere.CreateDisplayColorAttr([Gf.Vec3f(0.12, 0.14, 0.16)])
         configure_bail_collider(sphere.GetPrim())
 
-    # Folded pose is explicitly 10 degrees above world +X (arm-local -X).
+    # Folded pose is explicitly 10 degrees above robot-local -X.
     # Overlapping spheres form each slender arm without an orientation transform.
     folded_angle = np.deg2rad(BOARD_BAIL_MIN_ANGLE_DEG)
     folded_direction = np.array(
@@ -421,10 +431,20 @@ def author_wooden_pizza_board(
         )
 
     grip_block_path = "/World/PizzaBoardGripBlock"
-    grip_block_world = bail_pivot_world + folded_bar_center
+    grip_block_local = bail_pivot_local + folded_bar_center
+    grip_block_world = np.asarray(
+        board_to_world.Transform(Gf.Vec3d(*map(float, grip_block_local))),
+        dtype=float,
+    )
     grip_block_root = UsdGeom.Xform.Define(stage, grip_block_path)
     grip_block_root.AddTranslateOp().Set(
         Gf.Vec3d(*map(float, grip_block_world))
+    )
+    grip_block_root.AddOrientOp().Set(
+        Gf.Quatf(
+            float(board_world_orientation[0]),
+            Gf.Vec3f(*map(float, board_world_orientation[1:])),
+        )
     )
     UsdPhysics.RigidBodyAPI.Apply(grip_block_root.GetPrim())
     UsdPhysics.MassAPI.Apply(grip_block_root.GetPrim()).CreateMassAttr(0.08)
@@ -596,7 +616,9 @@ class TrayPizzaPickPlace:
         self._stage = stage
         self._arm_base = find_serving_robot_prim(stage, "base_link")
         self._end_effector = find_serving_robot_prim(stage, "link_6")
-        _, _, self._arm_to_world = prim_world_pose(self._arm_base)
+        _, self._arm_orientation_world, self._arm_to_world = prim_world_pose(
+            self._arm_base
+        )
         # Retained for scene-coordinate helpers; grasp motion itself is now
         # top-down and the RG2 physical forward axis points toward world -Z.
         self._approach_world = np.array([-1.0, 0.0, 0.0])
@@ -645,6 +667,7 @@ class TrayPizzaPickPlace:
             prim_path="/World/ServingDish",
             name="serving_dish",
             position=self.local_to_world(TOP_DECK_DISH_LOCAL),
+            orientation=self._arm_orientation_world,
             radius=DISH_RADIUS,
             height=DISH_HEIGHT,
             visible=True,
@@ -706,7 +729,6 @@ class TrayPizzaPickPlace:
             stage,
             "/World/ServingDish/WoodenPizzaBoard",
             dish_material,
-            self.local_to_world(TOP_DECK_DISH_LOCAL),
         )
         author_magnetic_steel_plate(stage)
         self._bail = stage.GetPrimAtPath("/World/PizzaBoardBail")
@@ -750,6 +772,18 @@ class TrayPizzaPickPlace:
         value = self._arm_to_world.TransformDir(Gf.Vec3d(*map(float, vector)))
         result = np.array(value, dtype=float)
         return result / np.linalg.norm(result)
+
+    def refresh_robot_frame(self):
+        """Refresh cached robot-local axes after the mobile base has moved."""
+        _, self._arm_orientation_world, self._arm_to_world = prim_world_pose(
+            self._arm_base
+        )
+        self._base_forward_world = self.local_vector_to_world(
+            np.array([1.0, 0.0, 0.0])
+        )
+        self._bail_fold_world = self.local_vector_to_world(
+            np.array([BOARD_BAIL_FOLD_ARM_X_SIGN, 0.0, 0.0])
+        )
 
     def _tcp_to_wrist(self, tcp_position):
         # With the downward orientation, the finger TCP is below link_6.
@@ -931,6 +965,11 @@ class TrayPizzaPickPlace:
             )
 
     def initialize(self, articulation, dof_names):
+        # The dish is authored while the robot is in the kitchen, whereas the
+        # manipulation task starts after navigation.  Re-read the base frame
+        # so every tray, grasp, and destination coordinate follows the docked
+        # robot pose instead of the original spawn pose.
+        self.refresh_robot_frame()
         required = (*GRIPPER_JOINTS[:1], *SLIDING_TRAY_JOINTS)
         missing = [name for name in required if name not in dof_names]
         if missing:

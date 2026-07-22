@@ -3,7 +3,7 @@
 # Return spines stay on x=0 through the kitchen doorway (y≈5.0) then kitchen.
 frame_id: map
 
-kitchen: {x: 0.21, y: 5.25, yaw: -1.5708}
+kitchen: {x: 0.00, y: 5.25, yaw: -1.5708}
 
 routes:
   # ---- outbound: spine -> dock (all forward) ----

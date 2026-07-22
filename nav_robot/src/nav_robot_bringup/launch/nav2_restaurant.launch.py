@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Full Nav2 (planner/controller) for Isaac restaurant — NOT for daily rail.
+"""Nav2 goal navigation for the Isaac restaurant (ground-truth odom mode).
 
-Do NOT run this alongside go_to_table: both publish /nav_robot/cmd_vel.
-Daily table missions use odom-GT rail only; see docs/NAV2_QUICKSTART.md.
+Do NOT run this alongside nav_server_node: both command the same robot base.
+Isaac already publishes world-aligned odometry, so AMCL is intentionally not
+launched; map->odom is the identity transform supplied by map_view.launch.py.
 """
 
 import os
@@ -44,9 +45,10 @@ def _prepare(context, *args, **kwargs):
 def generate_launch_description():
     bringup_dir = get_package_share_directory("nav_robot_bringup")
     nav2_bringup_dir = get_package_share_directory("nav2_bringup")
+    local_launch_dir = Path(__file__).resolve().parent
 
     ws_root_guess = Path(bringup_dir).parents[3]
-    default_map = ws_root_guess / "maps" / "restaurant" / "map.yaml"
+    default_map = ws_root_guess / "nav_robot" / "maps" / "restaurant" / "map.yaml"
     if not default_map.is_file():
         alt = Path.cwd() / "maps" / "restaurant" / "map.yaml"
         if alt.is_file():
@@ -61,19 +63,28 @@ def generate_launch_description():
             "NAV_ROBOT_GENERATED_PARAMS",
             os.path.join(bringup_dir, "config", "nav2_params.yaml"),
         )
-        # Isaac bridge already subscribes to both /cmd_vel and /nav_robot/cmd_vel.
+        # Map + identity map->odom first, then planner/controller only.  The
+        # full bringup_launch.py would also start AMCL and corrupt Isaac's
+        # already world-aligned odometry.
         return [
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(
-                    os.path.join(nav2_bringup_dir, "launch", "bringup_launch.py")
+                    str(local_launch_dir / "map_view.launch.py")
                 ),
                 launch_arguments={
                     "map": map_file,
                     "use_sim_time": use_sim_time,
+                }.items(),
+            ),
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(nav2_bringup_dir, "launch", "navigation_launch.py")
+                ),
+                launch_arguments={
+                    "use_sim_time": use_sim_time,
                     "params_file": params_path,
                     "autostart": autostart,
                     "use_composition": "False",
-                    "slam": "False",
                 }.items(),
             ),
         ]
@@ -81,7 +92,7 @@ def generate_launch_description():
     return LaunchDescription(
         [
             SetEnvironmentVariable(
-                "ROS_DOMAIN_ID", os.environ.get("ROS_DOMAIN_ID", "103")
+                "ROS_DOMAIN_ID", os.environ.get("ROS_DOMAIN_ID", "102")
             ),
             DeclareLaunchArgument("use_sim_time", default_value="true"),
             DeclareLaunchArgument("map", default_value=str(default_map)),

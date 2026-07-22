@@ -28,7 +28,7 @@ if _ros_required:
     os.environ.setdefault("ROS_DISTRO", "humble")
     os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
     os.environ["ROS_DOMAIN_ID"] = os.environ.get(
-        "MOBILE_DEMO_ROS_DOMAIN_ID", "101"
+        "MOBILE_DEMO_ROS_DOMAIN_ID", "102"
     )
     _ld_paths = [path for path in os.environ.get("LD_LIBRARY_PATH", "").split(":") if path]
     _python_paths = [
@@ -80,6 +80,7 @@ from rclpy.executors import SingleThreadedExecutor
 WORKSPACE = Path(
     os.environ.get("COBOT3_WS", Path(__file__).resolve().parents[1])
 ).resolve()
+CANONICAL_SERVING_WORKSPACE = Path("/home/rokey/cobot3_ws/serving_robot")
 # Isaac's URDF importer resolves package:// URLs through ROS_PACKAGE_PATH,
 # while a sourced ROS 2/ament workspace does not populate that ROS 1 variable.
 _package_roots = [
@@ -94,12 +95,19 @@ URDF_PATH = (
     WORKSPACE
     / "src/ridgeback_m0609_description/urdf/ridgeback_m0609.urdf"
 )
-ROBOT_USD = WORKSPACE / "assets/mobile_manipulator/ridgeback_m0609_v2.usd"
+# Always test navigation with the actively maintained robot model.  The
+# nested Rokey_Co3_A1 copy has an older set of configuration layers even
+# though its top-level USD has the same filename.
+ROBOT_USD = (
+    CANONICAL_SERVING_WORKSPACE
+    / "assets/mobile_manipulator/ridgeback_m0609_v2.usd"
+)
 M0609_VISUAL_USD = (
-    WORKSPACE / "isaacpjt/M0609/Collected_m0609_camera2/m0609_gripper.usd"
+    CANONICAL_SERVING_WORKSPACE
+    / "isaacpjt/M0609/Collected_m0609_camera2/m0609_gripper.usd"
 )
 D455_ASSET_USD = (
-    WORKSPACE
+    CANONICAL_SERVING_WORKSPACE
     / "isaacpjt/M0609/Collected_m0609_camera2/"
     "omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/"
     "Isaac/5.1/Isaac/Sensors/Intel/RealSense/rsd455.usd"
@@ -111,6 +119,7 @@ RESTAURANT_USD = (
 
 # Dock the robot's -X face 8 cm from TableSet_00's clear right short edge.
 SPAWN_POSITION = Gf.Vec3d(-1.82, -2.20, 0.002)
+SPAWN_YAW_DEG = 180.0
 TABLE_CAMERA_PATH = (
     "/World/ServingRobot/Robot/ridgeback_base_link/ridgeback_base_link/"
     "fixed_table_depth_camera/realsense_d455/RSD455/Camera_Pseudo_Depth"
@@ -133,18 +142,19 @@ TABLE_SERVICE_ENABLED = os.environ.get("MOBILE_DEMO_TABLE_SERVICE", "1") == "1"
 # tests can still explicitly engage the fixed parking joint.
 PARKED_HOLD = os.environ.get("MOBILE_DEMO_PARKED_HOLD", "0") == "1"
 
-# Each pose applies the same table-relative docking transform:
-# robot = table_dock_frame * (x=1.38 m, y=0, yaw=0).
-# Left-table dock frames point +X into the aisle; right-table frames point -X.
+# Current robot convention: local +X, the arm, and the fixed camera all face
+# the served table.  Left tables therefore require yaw=pi and right tables
+# yaw=0 at the final dock pose.
 TABLE_DOCK_POSES = {
-    0: (-1.82, -2.20, 0.0),
-    1: (1.82, -2.20, math.pi),
-    2: (-1.82, 0.70, 0.0),
-    3: (1.82, 0.70, math.pi),
+    0: (-1.82, -2.20, math.pi),
+    1: (1.82, -2.20, 0.0),
+    2: (-1.82, 0.70, math.pi),
+    3: (1.82, 0.70, 0.0),
 }
 WHEEL_RADIUS = 0.0759
 WHEEL_BASE_SUM = 0.319 + 0.2755
 PRE_DOCK_CLEARANCE = 0.65
+PRE_DOCK_POSITION_TOLERANCE = 0.15
 TABLE_CAMERA_WIDTH = 1280
 TABLE_CAMERA_HEIGHT = 960
 
@@ -155,40 +165,10 @@ def enable_urdf_importer():
 
 
 def import_robot_usd():
-    if not URDF_PATH.is_file():
-        raise FileNotFoundError(
-            f"generated URDF missing: {URDF_PATH}\n"
-            "Run xacro after sourcing the workspace."
-        )
-
-    ROBOT_USD.parent.mkdir(parents=True, exist_ok=True)
-    if ROBOT_USD.is_file() and os.environ.get("MOBILE_DEMO_REIMPORT", "0") != "1":
-        print(f"[mobile robot] reuse USD={ROBOT_USD}", flush=True)
-        return
-    status, config = omni.kit.commands.execute("URDFCreateImportConfig")
-    if not status:
-        raise RuntimeError("URDFCreateImportConfig failed")
-    config.merge_fixed_joints = False
-    config.convex_decomp = False
-    config.import_inertia_tensor = True
-    config.fix_base = False
-    config.collision_from_visuals = False
-    config.distance_scale = 1.0
-
-    status, articulation_path = omni.kit.commands.execute(
-        "URDFParseAndImportFile",
-        urdf_path=str(URDF_PATH),
-        import_config=config,
-        dest_path=str(ROBOT_USD),
-        get_articulation_root=True,
-    )
-    if not status or not ROBOT_USD.is_file():
-        raise RuntimeError("Ridgeback/M0609 URDF import failed")
-    print(
-        f"[mobile robot] generated USD={ROBOT_USD} "
-        f"articulation={articulation_path}",
-        flush=True,
-    )
+    """Validate, but never regenerate or overwrite, the canonical v2 USD."""
+    if not ROBOT_USD.is_file():
+        raise FileNotFoundError(f"canonical robot USD missing: {ROBOT_USD}")
+    print(f"[mobile robot] canonical USD={ROBOT_USD}", flush=True)
 
 
 def open_restaurant_and_reference_robot():
@@ -203,12 +183,36 @@ def open_restaurant_and_reference_robot():
     stage = context.get_stage()
     spawn = UsdGeom.Xform.Define(stage, "/World/ServingRobot")
     spawn.AddTranslateOp().Set(SPAWN_POSITION)
+    spawn.AddRotateZOp().Set(SPAWN_YAW_DEG)
+    print(
+        f"[mobile robot] spawn=({SPAWN_POSITION[0]:.2f}, "
+        f"{SPAWN_POSITION[1]:.2f}) yaw={SPAWN_YAW_DEG:.1f}deg",
+        flush=True,
+    )
     robot = UsdGeom.Xform.Define(stage, "/World/ServingRobot/Robot")
     # Isaac's URDF importer does not author a defaultPrim on this layered USD,
     # so reference its known robot root explicitly.
     robot.GetPrim().GetReferences().AddReference(
         str(ROBOT_USD), Sdf.Path("/ridgeback_m0609")
     )
+    for _ in range(5):
+        simulation_app.update()
+    composed_names = {
+        prim.GetName()
+        for prim in stage.Traverse()
+        if str(prim.GetPath()).startswith("/World/ServingRobot/Robot/")
+    }
+    required_sliding_trays = {
+        "upper_tray_left_slide_joint",
+        "upper_tray_right_slide_joint",
+    }
+    missing = required_sliding_trays - composed_names
+    if missing:
+        raise RuntimeError(
+            "obsolete fixed/notched robot USD loaded; missing sliding tray "
+            f"joints={sorted(missing)} usd={ROBOT_USD}"
+        )
+    print("[mobile robot] verified latest sliding-tray USD", flush=True)
     return stage
 
 
@@ -319,13 +323,13 @@ def attach_fixed_table_depth_camera(stage):
     assembly_path = base_path.AppendChild("fixed_table_depth_camera")
     UsdGeom.Xform.Define(stage, assembly_path)
 
-    # Tall mast on the +X/right side, opposite the -X table docking face.  This
-    # lets the camera look over the arm instead of through it.
+    # Match the current robot convention: local +X is forward and the camera
+    # mast sits on robot-left (+Y), clear of the arm's forward workspace.
     mast = UsdGeom.Cylinder.Define(stage, assembly_path.AppendChild("mast"))
     mast.CreateRadiusAttr(0.018)
     mast.CreateHeightAttr(0.935)
     mast.CreateAxisAttr(UsdGeom.Tokens.z)
-    mast.AddTranslateOp().Set(Gf.Vec3f(0.25, -0.285, 1.3225))
+    mast.AddTranslateOp().Set(Gf.Vec3f(-0.25, 0.285, 1.3225))
     mast.CreateDisplayColorAttr([Gf.Vec3f(0.12, 0.15, 0.18)])
     UsdPhysics.CollisionAPI.Apply(mast.GetPrim())
 
@@ -334,15 +338,15 @@ def attach_fixed_table_depth_camera(stage):
     boom.CreateRadiusAttr(0.018)
     boom.CreateHeightAttr(0.215)
     boom.CreateAxisAttr(UsdGeom.Tokens.z)
-    boom.AddTranslateOp().Set(Gf.Vec3f(0.25, -0.3925, 1.79))
+    boom.AddTranslateOp().Set(Gf.Vec3f(-0.25, 0.3925, 1.79))
     boom.AddRotateXOp().Set(90.0)
     boom.CreateDisplayColorAttr([Gf.Vec3f(0.12, 0.15, 0.18)])
     UsdPhysics.CollisionAPI.Apply(boom.GetPrim())
 
-    # The table docks on the arm side (-X).  Aim over the arm at the center of
-    # a 0.74 m-high table while retaining a useful top-down view of hands.
-    camera_position = Gf.Vec3d(0.25, -0.50, 1.85)
-    table_target = Gf.Vec3d(-1.00, -0.15, 0.74)
+    # Aim along the current robot front (+X) at table height while retaining a
+    # useful top-down view of the arm and delivery surface.
+    camera_position = Gf.Vec3d(-0.25, 0.50, 1.85)
+    table_target = Gf.Vec3d(1.00, 0.15, 0.74)
     desired_camera_to_base = Gf.Matrix4d().SetLookAt(
         camera_position, table_target, Gf.Vec3d(0.0, 0.0, 1.0)
     ).GetInverse()
@@ -856,11 +860,11 @@ class TableNavigationServer:
         x, y = float(position[0]), float(position[1])
         yaw = quaternion_to_yaw(orientation)
         goal_x, goal_y, goal_yaw = TABLE_DOCK_POSES[self.target_table]
-        # The pre-dock pose is farther into the aisle along the robot's +X
-        # direction.  The robot can turn here without sweeping into a table,
-        # then reverse straight in so its arm-mounted -X face stays docked.
-        pre_x = goal_x + PRE_DOCK_CLEARANCE * math.cos(goal_yaw)
-        pre_y = goal_y + PRE_DOCK_CLEARANCE * math.sin(goal_yaw)
+        # Pre-dock lies behind the final pose along local -X.  The robot turns
+        # in the clear aisle, then drives straight forward with its +X camera
+        # and arm side facing the table.
+        pre_x = goal_x - PRE_DOCK_CLEARANCE * math.cos(goal_yaw)
+        pre_y = goal_y - PRE_DOCK_CLEARANCE * math.sin(goal_yaw)
 
         if self.navigation_stage == "move_to_pre_dock":
             dx, dy = pre_x - x, pre_y - y
@@ -887,7 +891,11 @@ class TableNavigationServer:
                     np.clip(1.2 * heading_error, -self.MAX_ANGULAR_SPEED,
                             self.MAX_ANGULAR_SPEED)
                 )
-            if distance <= self.POSITION_TOLERANCE:
+            # The old 2.5 cm threshold was smaller than the stopping distance
+            # at the controller's 0.08 m/s minimum speed.  It overshot the
+            # point, then circled back repeatedly.  Pre-dock only needs to be
+            # inside the clear turning area; final docking remains precise.
+            if distance <= PRE_DOCK_POSITION_TOLERANCE:
                 self.navigation_stage = "align_at_pre_dock"
                 self._path_aligned = False
                 phase = "pre_dock_reached"
@@ -921,11 +929,11 @@ class TableNavigationServer:
                 -math.sin(goal_yaw) * dx + math.cos(goal_yaw) * dy
             )
             if distance > self.POSITION_TOLERANCE:
-                phase = "final_reverse_approach"
+                phase = "final_forward_approach"
                 if abs(yaw_error) > self.HEADING_LEAVE_DRIVE:
                     linear_x = 0.0
                 else:
-                    linear_x = -min(
+                    linear_x = min(
                         self.MAX_DOCK_SPEED, max(0.035, 0.5 * distance)
                     )
                 angular_z = float(

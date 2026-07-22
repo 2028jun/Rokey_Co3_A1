@@ -1,0 +1,8 @@
+int32 table_id
+int32 pizza1_count
+int32 pizza2_count
+int32 pizza3_count
+int32 drink_count
+int32 cutlery_count
+---
+bool success

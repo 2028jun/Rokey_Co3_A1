@@ -10,7 +10,7 @@ def find_serving_robot_prim(stage, name):
         prim
         for prim in stage.Traverse()
         if prim.GetName() == name
-        and str(prim.GetPath()).startswith("/World/ServingRobot")
+        and (str(prim.GetPath()).startswith("/World/ServingRobot") or str(prim.GetPath()).startswith("/World/NavRobot"))
     ]
     if len(matches) != 1:
         raise RuntimeError(f"expected one serving-robot {name}, got {matches}")

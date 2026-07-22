@@ -74,7 +74,7 @@ Nav2 + Isaac이 떠 있는 상태에서:
 ```bash
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-export ROS_DOMAIN_ID=103
+export ROS_DOMAIN_ID=102
 rviz2
 ```
 
@@ -92,7 +92,7 @@ rviz2
 - `/amcl_pose`가 kitchen 근처 `(≈0.21, 5.25)`에서 안정
 - `config/waypoints.yaml`의 table dock이 free 공간(테이블 **옆**)에 있음
 
-어긋나면 Generator `origin`/bounds를 다시 맞추거나 RViz **2D Pose Estimate**로 AMCL을 보정합니다.
+어긋나면 Generator `origin`/bounds와 `map→odom` identity TF를 확인합니다.
 
 waypoint 좌표 (serving dock과 동일):
 
@@ -119,7 +119,7 @@ python3 tools/generate_placeholder_map.py
 ## Nav2에서 로드
 
 ```bash
-export ROS_DOMAIN_ID=103
+export ROS_DOMAIN_ID=102
 ros2 launch nav_robot_bringup nav2_restaurant.launch.py \
   map:=$PWD/maps/restaurant/map.yaml
 ```

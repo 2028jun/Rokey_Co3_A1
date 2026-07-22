@@ -6,7 +6,7 @@ import os
 import sys
 
 os.environ["ROS_DOMAIN_ID"] = os.environ.get(
-    "SERVING_ROBOT_ROS_DOMAIN_ID", "101"
+    "SERVING_ROBOT_ROS_DOMAIN_ID", "102"
 )
 
 import rclpy

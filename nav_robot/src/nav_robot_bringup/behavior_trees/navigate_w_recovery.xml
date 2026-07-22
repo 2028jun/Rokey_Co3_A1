@@ -1,10 +1,11 @@
 <!--
-  NavigateToPose with replanning and recovery:
-  failure -> Wait 3s -> Spin (sensor rescan) -> clear costmaps -> retry.
+  NavigateToPose with replanning and conservative recovery.  BackUp is
+  intentionally omitted: near restaurant chairs it moved the robot into the
+  obstacle after the controller had correctly stopped for a collision.
 -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+    <RecoveryNode number_of_retries="2" name="NavigateRecovery">
       <PipelineSequence name="NavigateWithReplanning">
         <RateController hz="1.0">
           <RecoveryNode number_of_retries="1" name="ComputePathToPose">
@@ -21,10 +22,8 @@
         <GoalUpdated/>
         <RoundRobin name="RecoveryActions">
           <Wait wait_duration="3.0"/>
-          <Spin spin_dist="1.57"/>
           <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
           <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
-          <BackUp backup_dist="0.30" backup_speed="0.10"/>
         </RoundRobin>
       </ReactiveFallback>
     </RecoveryNode>

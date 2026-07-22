@@ -3,14 +3,15 @@
 set -e
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-source /opt/ros/humble/setup.bash
+source /opt/ros/humble/setup.bash || true
 if [ -f "$SCRIPT_DIR/install/setup.bash" ]; then
     source "$SCRIPT_DIR/install/setup.bash"
 elif [ -f "/home/rokey/cobot3_ws/install/setup.bash" ]; then
     source "/home/rokey/cobot3_ws/install/setup.bash"
 fi
 
-export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-101}
+export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-102}
+export HMI_PORT=${HMI_PORT:-8000}
 
 echo "=========================================================="
 echo " Starting Pizza Serving Robot HMI Dashboard"
@@ -18,4 +19,6 @@ echo " ROS_DOMAIN_ID : $ROS_DOMAIN_ID"
 echo " HMI Web Access: http://localhost:$HMI_PORT"
 echo "=========================================================="
 
+WORKSPACE_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
+export PYTHONPATH=$SCRIPT_DIR/src/serving_hmi:$WORKSPACE_DIR/src/serving_robot_manager:$WORKSPACE_DIR/src/serving_robot_interfaces:$PYTHONPATH
 python3 -m serving_hmi.hmi_backend_node
