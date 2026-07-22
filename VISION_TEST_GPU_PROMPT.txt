@@ -7,6 +7,60 @@ nothing in the scaffold below has been run or visually checked. Your job is to
 verify it, fix whatever is wrong, and confirm the hand_safety pipeline
 actually fires on the simulated reach.
 
+## Pass 2 changes (read this first if you already ran pass 1)
+
+Pass 1's commit (`Fix hand-safety GPU test scaffold and default it to run
+out of the box`) confirmed the pipeline wiring works but flagged that the
+whole-body-slide reach never gets a hand into frame, and separately a human
+reviewer noticed the published camera feed looked very low-resolution. Both
+addressed here, neither verified on hardware yet:
+
+1. **Camera resolution raised 640x480 → 1280x960**
+   (`isaacpjt/mobile_manipulator_demo.py`'s `connect_table_camera_ros2()`
+   `RenderProduct.inputs:width/height`, plus the matching preview viewport
+   size). At 640x480, `hand_safety`'s ROI-crop-then-upscale-to-1280
+   pipeline was cropping only ~289x262px out of the frame and blowing it up
+   ~4.4x before YOLO ever saw it. At 1280x960 the same crop is ~579x524px,
+   ~2.2x upscale. Sanity-check with `ros2 topic echo
+   /serving_robot/table_camera/camera_info --once` and by eye in
+   `rqt_image_view`. Raise further if render cost allows and detail is
+   still the bottleneck.
+
+2. **Real per-joint arm reach via UsdSkel**, replacing the whole-body
+   slide as the primary mechanism (`isaacpjt/hand_intrusion_test_actor.py`,
+   see its module docstring for the full design rationale). In short:
+   `_setup_skeleton_reach()` finds `F_Business_02`'s `UsdSkel.Skeleton`,
+   seeds a brand-new `UsdSkelAnimation` from its rest pose (so the
+   character's baked idle animation stops overriding whatever we set —
+   this was the actual cause of pass 1's hands-never-move-forward
+   problem), binds it as the animation source, then each frame rotates
+   whichever joint fuzzy-matches "forearm" by up to
+   `HAND_TEST_REACH_JOINT_ANGLE_DEG` (default -70°) around local
+   `HAND_TEST_REACH_JOINT_AXIS` (default X). None of `UsdSkel.Cache`,
+   `Skeleton.GetRestTransformsAttr()`, `UsdSkel.DecomposeTransform()`, or
+   `UsdSkel.BindingAPI.Apply().CreateAnimationSourceRel()` have been
+   exercised against real skeleton data — if any of those calls don't
+   match this Isaac Sim build's UsdSkel Python API, `ReachAnimator` catches
+   the exception, prints why, and falls back to lean-only (pass 1's
+   behavior) rather than crashing. Check the console output for
+   `[hand_test] skeleton reach setup raised ...` / `disabling joint drive`
+   to know if that happened.
+
+   To debug: after `spawn_seated_person()` runs, call
+   `hand_test.list_skeleton_joints(stage)` from the Isaac Sim script
+   console to print every joint path, confirm the auto-picked forearm
+   joint (logged as `[hand_test] driving joint [N] <path> ...` at startup)
+   is actually the right one, and if not, override with:
+   ```bash
+   export HAND_TEST_REACH_JOINT_NAME="<substring from the printed path>"
+   export HAND_TEST_REACH_JOINT_AXIS=X   # try X, Y, Z
+   export HAND_TEST_REACH_JOINT_ANGLE_DEG=-70  # sign/magnitude, tune by eye
+   ```
+   The whole-body lean distance also shrank from ~1m to 15cm
+   (`HAND_TEST_LEAN_DISTANCE`) since the arm is now expected to cover most
+   of the reach; increase it back if the joint drive turns out not to work
+   at all on this asset.
+
 ## Goal
 
 At `TableSet_00` (the only table the fixed table camera ever frames — see

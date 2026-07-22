@@ -408,8 +408,15 @@ def connect_table_camera_ros2(stage):
                     "RenderProduct.inputs:cameraPrim",
                     [usdrt.Sdf.Path(TABLE_CAMERA_PATH)],
                 ),
-                ("RenderProduct.inputs:width", 640),
-                ("RenderProduct.inputs:height", 480),
+                # hand_safety crops just the tabletop ROI out of this frame
+                # (~35% width x ~45% height) and upscales that crop to its
+                # image_size:=1280 YOLO input. At 640x480 the crop was only
+                # ~289x262px, a ~4.4x upscale that threw away real hand
+                # detail. 1280x960 keeps the same 4:3 aspect and roughly
+                # doubles crop resolution (~579x524px, ~2.2x upscale).
+                # Raise further if render cost allows.
+                ("RenderProduct.inputs:width", 1280),
+                ("RenderProduct.inputs:height", 960),
                 ("RGBPublish.inputs:nodeNamespace", "serving_robot/table_camera"),
                 ("RGBPublish.inputs:topicName", "color/image_raw"),
                 ("RGBPublish.inputs:frameId", "table_camera_optical_frame"),
@@ -456,7 +463,7 @@ def connect_table_camera_ros2(stage):
     )
     print(
         "[table camera ROS2] /serving_robot/table_camera/{color/image_raw,"
-        "depth/image_raw,camera_info} 640x480",
+        "depth/image_raw,camera_info} 1280x960",
         flush=True,
     )
 
@@ -467,8 +474,8 @@ def open_table_camera_preview():
     create_viewport_for_camera(
         "Table Camera",
         TABLE_CAMERA_PATH,
-        width=640,
-        height=480,
+        width=1280,
+        height=960,
         position_x=760,
         position_y=80,
     )
@@ -722,7 +729,7 @@ def main():
     reach_animator = None
     if os.environ.get("MOBILE_DEMO_HAND_TEST", "1") == "1":
         person_prim = hand_test.spawn_seated_person(stage)
-        reach_animator = hand_test.ReachAnimator(person_prim)
+        reach_animator = hand_test.ReachAnimator(person_prim, stage)
     if os.environ.get("MOBILE_DEMO_PRINT_BOUNDS", "0") == "1":
         print_arm_visual_bounds(stage)
     run_optional_diagnostic(articulation, dof_names)
