@@ -11,7 +11,14 @@ import yaml
 from ament_index_python.packages import get_package_share_directory
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 
-from nova_rails.nav_bootstrap import AmclPoseTracker, make_pose, resolve_map_xy, reverse_open_loop
+from nova_rails.nav_bootstrap import (
+    AmclPoseTracker,
+    make_pose,
+    normalize_angle,
+    resolve_map_xy,
+    resolve_map_yaw,
+    reverse_open_loop,
+)
 from nova_rails.rail_geometry import Pose3, RailPolyline, prune_poses, route_poses
 
 _SPINE_X_TOL = 0.15
@@ -67,6 +74,10 @@ class RailNavigator:
         self._parking_dwell = float(self._cfg.get("parking_dwell_sec", 1.0))
         self._park_open_loop = bool(self._cfg.get("park_out_open_loop", True))
         self._aisle_x_max = float(self._cfg.get("aisle_x_max_m", 0.42))
+        self._align_heading_enable = bool(self._cfg.get("align_heading_at_dock", True))
+        self._align_yaw_tol = float(self._cfg.get("align_heading_yaw_tol_rad", 0.08))
+        self._spin_time = int(self._cfg.get("spin_time_allowance_sec", 30))
+        self._spin_attempts = int(self._cfg.get("max_spin_attempts", 3))
 
     def reverse_parking_exit(self, routes_data: dict, table_id: int) -> bool:
         """전방 주차 후 /cmd_vel 직선 후진으로 복도(x≈0) 진입 (Nav2 유턴 금지)."""
@@ -182,7 +193,9 @@ class RailNavigator:
                 end_i = idx + len(seg) - 1
                 sub = f"{label}_spine" if end_i < n - 1 else label
                 max_lat = self._leg_max_lat(leg, at_dock=(end_i == n - 1))
-                if not self._go_through_poses(seg, leg, sub, max_lat=max_lat):
+                if not self._go_through_poses(
+                    seg, leg, sub, max_lat=max_lat, at_dock=(end_i == n - 1)
+                ):
                     return False
                 prev_xy = (seg[-1][0], seg[-1][1])
                 idx += len(seg)
@@ -208,6 +221,7 @@ class RailNavigator:
         label: str,
         *,
         max_lat: float,
+        at_dock: bool = False,
     ) -> bool:
         self._nav.cancelTask()
         self._nav.result_future = None
@@ -218,7 +232,10 @@ class RailNavigator:
         if not self._nav.goThroughPoses(goals):
             print(f"[{label}] goals 거부", flush=True)
             return False
-        return self._wait_nav_cte(leg, label, max_lat, dest=dests[-1])
+        ok = self._wait_nav_cte(leg, label, max_lat, dest=dests[-1])
+        if ok and at_dock:
+            ok = self._align_yaw_at_dock(dests[-1][2], label)
+        return ok
 
     def _go_pose(
         self,
@@ -240,7 +257,51 @@ class RailNavigator:
         if self._nav.result_future is None:
             print(f"[{label}] result_future 없음", flush=True)
             return False
-        return self._wait_nav_cte(leg, label, max_lat, dest=dest)
+        ok = self._wait_nav_cte(leg, label, max_lat, dest=dest)
+        if ok and at_dock:
+            ok = self._align_yaw_at_dock(dest[2], label)
+        return ok
+
+    def _align_yaw_at_dock(self, target_yaw: float, label: str) -> bool:
+        """도킹/주방 등 최종 pose: 위치 도달 후 제자리 회전으로 yaw 정렬."""
+        if not self._align_heading_enable:
+            return True
+        tag = f"{label}_align"
+        for attempt in range(1, self._spin_attempts + 1):
+            rclpy.spin_once(self._nav, timeout_sec=0.05)
+            yaw = resolve_map_yaw(self._nav, self._tf, self._tracker)
+            if yaw is None:
+                print(f"[{tag}] yaw 없음 — 방향 정렬 생략", flush=True)
+                return True
+            err = normalize_angle(float(target_yaw) - yaw)
+            if abs(err) <= self._align_yaw_tol:
+                print(
+                    f"[{tag}] OK yaw={math.degrees(yaw):.1f}° "
+                    f"(목표 {math.degrees(target_yaw):.1f}°, err {math.degrees(err):.1f}°)",
+                    flush=True,
+                )
+                return True
+            print(
+                f"[{tag}] 회전 {attempt}/{self._spin_attempts}: "
+                f"Δyaw={math.degrees(err):.1f}° (tol {math.degrees(self._align_yaw_tol):.1f}°)",
+                flush=True,
+            )
+            self._nav.cancelTask()
+            self._nav.result_future = None
+            time.sleep(0.2)
+            if not self._nav.spin(spin_dist=err, time_allowance=self._spin_time):
+                print(f"[{tag}] Spin 거부", flush=True)
+                return False
+            if not self._wait_simple_action(tag):
+                return False
+        yaw = resolve_map_yaw(self._nav, self._tf, self._tracker)
+        if yaw is not None:
+            err = normalize_angle(float(target_yaw) - yaw)
+            if abs(err) <= self._align_yaw_tol * 1.5:
+                print(f"[{tag}] OK (완화) err={math.degrees(err):.1f}°", flush=True)
+                return True
+        print(f"[{tag}] 방향 정렬 실패", flush=True)
+        return False
 
     def _wait_nav_cte(
         self,
@@ -288,9 +349,13 @@ class RailNavigator:
         xy = resolve_map_xy(self._nav, self._tf, self._tracker)
         if xy:
             err = math.hypot(xy[0] - dest[0], xy[1] - dest[1])
+            yaw_now = resolve_map_yaw(self._nav, self._tf, self._tracker)
+            yaw_err_s = ""
+            if yaw_now is not None:
+                yaw_err_s = f" yaw_err={math.degrees(normalize_angle(dest[2] - yaw_now)):.1f}°"
             print(
                 f"[{label}] {'OK' if ok else 'FAIL'} "
-                f"pose=({xy[0]:.2f},{xy[1]:.2f}) err={err:.2f} m rail_max_cte={max_cte:.2f}",
+                f"pose=({xy[0]:.2f},{xy[1]:.2f}) err={err:.2f} m rail_max_cte={max_cte:.2f}{yaw_err_s}",
                 flush=True,
             )
         return ok

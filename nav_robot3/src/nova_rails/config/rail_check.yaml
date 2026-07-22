@@ -11,6 +11,11 @@ park_out_open_loop: true
 aisle_x_max_m: 0.42
 park_reverse_min_travel_frac: 0.72
 aisle_margin_m: 0.22
-backup_speed_mps: 0.10
+backup_speed_mps: 0.15
 backup_time_allowance_sec: 45
 parking_dwell_sec: 1.0
+# 최종 dock(테이블·주방): 위치 도달 후 Nav2 Spin으로 routes.yaml yaw 정렬
+align_heading_at_dock: true
+align_heading_yaw_tol_rad: 0.08
+spin_time_allowance_sec: 30
+max_spin_attempts: 3

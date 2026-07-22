@@ -1,16 +1,24 @@
 # Rokey_Co3_A1
 
-팀 협업 저장소 (`younggi` 등 브랜치).
+## Nova Carter 식당 주행 (기본: nav_robot3)
 
-## Nova Carter 식당 주행
+터미널마다 한 번:
 
-Isaac Sim Nova Carter + Nav2 주행 스택과 **실행 방법**은 다음 문서를 보세요.
+```bash
+source ~/git/Rokey_Co3_A1/tools/aliases.sh
+```
 
-- **[docs/NOVA_CARTER.md](docs/NOVA_CARTER.md)** — `nav_robot2` / `nav_robot3` / `nav_robot` 요약 및 `t1`·`t2`·`t3` 순서
-- [`nav_robot2/README.md`](nav_robot2/README.md) — 권장 standalone (ROS domain **103**)
-- [`nav_robot3/README.md`](nav_robot3/README.md) — 레일 미션 (ROS domain **104**)
+| 터미널 | 명령 |
+|--------|------|
+| 1 | `t1` → Isaac **Play** |
+| 2 | `t2` |
+| 3 | `t3 --table-id 2` |
+
+`ROS_DOMAIN_ID=103` (aliases가 설정). 상세: [`nav_robot3/README.md`](nav_robot3/README.md), [`docs/NOVA_CARTER.md`](docs/NOVA_CARTER.md).
 
 ```bash
 git checkout younggi
-ls nav_robot2 nav_robot3   # 두 디렉터리가 있어야 함
+cd nav_robot3 && colcon build --packages-select nova_rails && source install/setup.bash
 ```
+
+`nav_robot2/`는 레거시(deprecated)입니다.

@@ -22,7 +22,7 @@ _ros_bridge_lib = Path(
 os.environ.setdefault("ROS_DISTRO", "humble")
 os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
 os.environ["ROS_DOMAIN_ID"] = os.environ.get(
-    "NAV_ROBOT3_ROS_DOMAIN_ID", os.environ.get("ROS_DOMAIN_ID", "104")
+    "NAV_ROBOT3_ROS_DOMAIN_ID", os.environ.get("ROS_DOMAIN_ID", "103")
 )
 _ld_paths = [path for path in os.environ.get("LD_LIBRARY_PATH", "").split(":") if path]
 _python_paths = [

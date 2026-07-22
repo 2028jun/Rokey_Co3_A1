@@ -52,6 +52,7 @@ def make_pose(nav: BasicNavigator, x: float, y: float, yaw: float) -> PoseStampe
 class AmclPoseTracker:
     def __init__(self, nav: BasicNavigator) -> None:
         self._xy: tuple[float, float] | None = None
+        self._yaw: float | None = None
         self._sub = nav.create_subscription(
             PoseWithCovarianceStamped, "/amcl_pose", self._on_amcl, AMCL_POSE_QOS
         )
@@ -59,13 +60,62 @@ class AmclPoseTracker:
     def _on_amcl(self, msg: PoseWithCovarianceStamped) -> None:
         p = msg.pose.pose.position
         self._xy = (float(p.x), float(p.y))
+        o = msg.pose.pose.orientation
+        self._yaw = _quat_yaw(float(o.x), float(o.y), float(o.z), float(o.w))
 
     @property
     def xy(self) -> tuple[float, float] | None:
         return self._xy
 
+    @property
+    def yaw(self) -> float | None:
+        return self._yaw
 
-def lookup_map_xy(
+
+def _quat_yaw(x: float, y: float, z: float, w: float) -> float:
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def normalize_angle(rad: float) -> float:
+    while rad > math.pi:
+        rad -= 2.0 * math.pi
+    while rad < -math.pi:
+        rad += 2.0 * math.pi
+    return rad
+
+
+def lookup_map_yaw(
+    tf_buffer: Buffer, nav: BasicNavigator | None = None
+) -> float | None:
+    stamps = []
+    if nav is not None:
+        now = nav.get_clock().now()
+        stamps.extend([now, now - Duration(nanoseconds=200_000_000)])
+    stamps.append(Time())
+    for stamp in stamps:
+        try:
+            tf = tf_buffer.lookup_transform(
+                "map", "base_link", stamp, timeout=Duration(seconds=0.5)
+            )
+            q = tf.transform.rotation
+            return _quat_yaw(q.x, q.y, q.z, q.w)
+        except Exception:
+            continue
+    return None
+
+
+def resolve_map_yaw(
+    nav: BasicNavigator,
+    tf_buffer: Buffer,
+    tracker: AmclPoseTracker | None,
+) -> float | None:
+    yaw = lookup_map_yaw(tf_buffer, nav)
+    if yaw is not None:
+        return yaw
+    return tracker.yaw if tracker else None
+
+
+def resolve_map_xy(
     tf_buffer: Buffer, nav: BasicNavigator | None = None
 ) -> tuple[float, float] | None:
     stamps = []

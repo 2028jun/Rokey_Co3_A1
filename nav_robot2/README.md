@@ -1,6 +1,12 @@
-# nav_robot2 — Nova Carter + Occupancy Map + Nav2
+# nav_robot2 — Nova Carter + Nav2 (deprecated)
 
-저장소 공통 안내: [`docs/NOVA_CARTER.md`](../docs/NOVA_CARTER.md) (`younggi` 브랜치)
+**이 워크스페이스는 더 이상 쓰지 않습니다.** 레일 주행은 **`nav_robot3`** + 저장소 루트 `tools/aliases.sh` (`t1`/`t2`/`t3`)를 사용하세요.
+
+저장소 공통 안내: [`docs/NOVA_CARTER.md`](../docs/NOVA_CARTER.md)
+
+---
+
+아래는 레거시 문서입니다.
 
 `nav_robot`와 분리된 워크스페이스입니다. **식당 USD/주방 자산만** 복사해 두었고, Nav2·미션·Isaac 실행은 이 디렉터리 기준으로만 사용합니다. **SLAM 없음** — AMCL + Occupancy Map.
 
