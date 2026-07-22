@@ -33,8 +33,9 @@ D455_USD = (
     WORKSPACE
     / "assets/isaac/Assets/Isaac/5.1/Isaac/Sensors/Intel/RealSense/rsd455.usd"
 )
-SENSORIZED_ROBOT_USD = (
-    WORKSPACE / "assets/diagnostics/two_wheel_serving_robot_v3_sensorized.usd"
+ROBOT_SENSOR_LAYER = (
+    WORKSPACE
+    / "assets/diagnostics/configuration/two_wheel_serving_robot_v2_sensor.usd"
 )
 _lidar_render_product = None
 _lidar_writer = None
@@ -497,24 +498,76 @@ def attach_all_sensors(stage):
 
 
 def export_sensorized_robot_usd(stage):
-    """Export the composed robot, camera stand, D455, lidar and ROS graph."""
-    source_path = Sdf.Path(f"{diagnostic.ROBOT_ROOT}/Robot")
-    target_path = Sdf.Path("/two_wheel_serving_robot_sensorized")
-    flattened = stage.Flatten()
-    if SENSORIZED_ROBOT_USD.exists():
-        output = Sdf.Layer.FindOrOpen(str(SENSORIZED_ROBOT_USD))
-        output.Clear()
-    else:
-        output = Sdf.Layer.CreateNew(str(SENSORIZED_ROBOT_USD))
-    if not Sdf.CopySpec(flattened, source_path, output, target_path):
-        raise RuntimeError(f"failed to export sensorized robot from {source_path}")
-    output.defaultPrim = target_path.name
-    output.Save()
+    """Persist camera, lidar and ROS graph in the importer's sensor layer."""
+    target_path = Sdf.Path("/two_wheel_ridgeback_serving_robot")
+    output_layer = Sdf.Layer.FindOrOpen(str(ROBOT_SENSOR_LAYER))
+    if output_layer is None:
+        raise RuntimeError(f"robot sensor layer is missing: {ROBOT_SENSOR_LAYER}")
+    output_layer.Clear()
+    root_spec = Sdf.CreatePrimInLayer(output_layer, target_path)
+    root_spec.specifier = Sdf.SpecifierDef
+    root_spec.typeName = "Xform"
+    output_layer.defaultPrim = target_path.name
+    source_layer = stage.GetRootLayer()
+    source_base = Sdf.Path(
+        f"{diagnostic.ROBOT_ROOT}/Robot/ridgeback_base_link/ridgeback_base_link"
+    )
+    # The main asset references this layer at its outer ridgeback_base_link;
+    # one relative link level here becomes the inner physical base link.
+    target_base = target_path.AppendChild("ridgeback_base_link")
+    Sdf.CreatePrimInLayer(output_layer, target_base)
+    for child in ("fixed_table_depth_camera", "base_scan"):
+        Sdf.CopySpec(
+            source_layer,
+            source_base.AppendChild(child),
+            output_layer,
+            target_base.AppendChild(child),
+        )
+    output_layer.Save()
     print(
-        f"[serving-sensors] exported self-contained USD={SENSORIZED_ROBOT_USD} "
-        f"defaultPrim={target_path}",
+        f"[serving-sensors] embedded sensors in USD layer={ROBOT_SENSOR_LAYER}",
         flush=True,
     )
+
+
+def connect_embedded_sensors(stage):
+    """Connect ROS render/writer nodes to sensors already stored in the USD."""
+    global _lidar_render_product, _lidar_writer
+    manager = omni.kit.app.get_app().get_extension_manager()
+    manager.set_extension_enabled_immediate("isaacsim.ros2.bridge", True)
+    for _ in range(3):
+        diagnostic.simulation_app.update()
+    base_path = find_base_path(stage)
+    sensor_mount_path = f"{base_path}/fixed_table_depth_camera/realsense_d455"
+    color_camera_path = (
+        f"{sensor_mount_path}/RSD455/Camera_OmniVision_OV9782_Color"
+    )
+    depth_camera_path = f"{sensor_mount_path}/RSD455/Camera_Pseudo_Depth"
+    lidar_path = f"{base_path}/base_scan/RPLIDAR_S2E"
+    for required in (color_camera_path, depth_camera_path, lidar_path):
+        if not stage.GetPrimAtPath(required).IsValid():
+            raise RuntimeError(f"embedded sensor prim is missing: {required}")
+    create_d455_ros_graph(stage, color_camera_path, depth_camera_path)
+    import omni.replicator.core as rep
+
+    _lidar_render_product = rep.create.render_product(
+        lidar_path, [1, 1], name="TwoWheelServingRPLidar"
+    )
+    _lidar_writer = rep.writers.get("RtxLidarROS2PublishLaserScan")
+    _lidar_writer.initialize(topicName="/scan", frameId="base_scan")
+    _lidar_writer.attach([_lidar_render_product])
+    print(
+        f"[serving-sensors] connected embedded D455={sensor_mount_path}; "
+        f"RPLIDAR={lidar_path} (ROS2 /scan connected)",
+        flush=True,
+    )
+
+
+def initialize_sensors(stage):
+    if os.environ.get("NAV_ROBOT_EXPORT_SENSOR_USD", "0") == "1":
+        attach_all_sensors(stage)
+    else:
+        connect_embedded_sensors(stage)
 
 
 def configure_all_drives(stage):
@@ -578,7 +631,7 @@ def configure_serving_physics(stage):
 diagnostic.Route = ServingRoute
 diagnostic.configure_wheel_drives = configure_all_drives
 diagnostic.configure_physics = configure_serving_physics
-diagnostic.POST_INITIALIZE_HOOK = attach_all_sensors
+diagnostic.POST_INITIALIZE_HOOK = initialize_sensors
 
 
 if __name__ == "__main__":
