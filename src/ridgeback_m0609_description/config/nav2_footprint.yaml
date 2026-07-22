@@ -1,0 +1,13 @@
+# Conservative footprint (slightly tighter than shelf extremes).
+# Approx Ridgeback body ~0.84 x 0.70 m.
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      footprint: "[[0.42, 0.35], [0.42, -0.35], [-0.42, -0.35], [-0.42, 0.35]]"
+      robot_radius: 0.0
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      footprint: "[[0.42, 0.35], [0.42, -0.35], [-0.42, -0.35], [-0.42, 0.35]]"
+      robot_radius: 0.0

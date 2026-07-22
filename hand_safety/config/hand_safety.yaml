@@ -1,0 +1,28 @@
+hand_detector_node:
+  ros__parameters:
+    input_topic: /serving_robot/table_camera/color/image_raw
+    output_image_topic: /hand_detection/image
+    detections_topic: /hand_detection/detections
+    roi_intrusion_topic: /hand_safety/roi_intrusion
+    table_arrived_topic: /serving_robot/table_arrived
+    model_path: src/hand_safety/models/YOLOv10n_hands.pt
+    # The rendered table-2 hand measures about 0.44-0.77 across live frames.
+    # ROI cropping/filtering rejects the stronger robot-arm candidate.
+    confidence: 0.40
+    iou: 0.7
+    # Preserve small, distant hand details during YOLO preprocessing.
+    image_size: 1280
+    # Use one inference crop instead of competing with Isaac Sim for the
+    # memory/compute of four 1280 px tiles.
+    tiled_inference: false
+    tile_overlap: 0.15
+    # Crop one padded tabletop ROI before inference. This enlarges the hand
+    # while excluding most of the robot arm, without adding another GPU pass.
+    roi_inference: true
+    roi_inference_padding: 0.05
+    device: "0"
+    process_rate: 30.0
+    confirmation_frames: 3
+    # Large debug images and OpenCV HighGUI can make the process appear hung.
+    publish_annotated_image: false
+    show_window: false
