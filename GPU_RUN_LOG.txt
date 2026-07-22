@@ -105,7 +105,7 @@ tasks" section for the full writeup):
   tightened to exclude the gripper's resting position and/or a raised
   YOLO confidence threshold against the gripper hardware.
 
-## Pass 3 -- 2026-07-22 (commit 931d412)
+## Pass 3 -- 2026-07-22 (commit bb6ea4b)
 
 Tested:
 - Reach speed: HAND_TEST_TRAVEL_SECONDS 0.4 -> 0.8 (already applied blind
