@@ -9,6 +9,19 @@ Pass 1-3 history; Git history preserves the old implementation plans. This
 prompt contains only the current work. Do not copy old pass narratives back
 into it.
 
+## Repository bootstrap
+
+Before working, run `git status` and preserve any existing uncommitted GPU-side
+work; never discard it with reset, checkout, or deletion. Fetch `origin`, switch
+to `vision-test`, and update it with `git pull --ff-only origin vision-test`.
+If local work prevents a fast-forward, integrate it safely instead of
+overwriting it. Then read this prompt and `GPU_RUN_LOG.txt` completely and
+execute the work end to end. Do not stop after planning or after one test case.
+
+When finished, update `GPU_RUN_LOG.txt`, commit the tested code and log, push
+`vision-test`, and report the commit hash, changed files, measured results,
+remaining limitations, and the identified 5 FPS bottleneck.
+
 ## Objective
 
 1. Replace the seated test person's whole-body slide/sink with a natural,
@@ -261,5 +274,4 @@ Append one dated Pass 4 entry to `GPU_RUN_LOG.txt` containing:
 - the complete performance table and final bottleneck conclusion.
 
 Keep implementation changes focused and retain useful environment/config
-overrides. After testing, commit the code and log together and push the tested
-result to `vision-test`. Report the commit hash and remaining limitations.
+overrides.
