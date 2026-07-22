@@ -15,6 +15,9 @@ from isaacsim.core.api.materials.physics_material import PhysicsMaterial
 from isaacsim.core.api.objects import DynamicCylinder
 from isaacsim.core.utils.types import ArticulationAction
 from isaacsim.robot.manipulators.grippers import ParallelGripper
+from isaacsim.robot_motion.motion_generation.lula.kinematics import (
+    LulaKinematicsSolver,
+)
 from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdPhysics, UsdShade
 
 from isaac_scene_utils import find_serving_robot_prim, prim_world_pose
@@ -870,6 +873,7 @@ class TrayPizzaPickPlace:
             "lower pizza board onto table",
             "open gripper",
             "retreat vertically from table",
+            "return arm to initial home pose",
             "pizza delivery complete",
         ]
         print(f"[serving-bail] phase={phase} {names[phase]}", flush=True)
@@ -958,9 +962,18 @@ class TrayPizzaPickPlace:
         elif phase == 10:
             self._command_gripper(articulation, GRIPPER_OPEN[0])
         elif phase == 12:
+            current = articulation.get_joint_positions()
+            self._stow_start_joints = np.asarray(
+                current[self._arm_joint_indices], dtype=float
+            ).copy()
+            print(
+                "[serving-bail] pizza placed on table; folding arm joints back to compact ready pose [90, 0, -90, 0, -60, 90]deg",
+                flush=True,
+            )
+        elif phase == 13:
             self.done = True
             print(
-                "[serving-bail] pizza placed on destination table; holding pose",
+                "[serving-bail] pizza delivery complete; arm stowed in home pose",
                 flush=True,
             )
 
@@ -1027,6 +1040,13 @@ class TrayPizzaPickPlace:
             end_effector_frame_name="link_6",
         )
         self._controller.rmp_flow.set_robot_base_pose(
+            robot_position=arm_position,
+            robot_orientation=arm_orientation,
+        )
+        self._lift_ik = LulaKinematicsSolver(
+            str(M0609_DESCRIPTION), str(M0609_RMPFLOW_URDF)
+        )
+        self._lift_ik.set_robot_base_pose(
             robot_position=arm_position,
             robot_orientation=arm_orientation,
         )
@@ -1239,7 +1259,14 @@ class TrayPizzaPickPlace:
                 )
             return
 
-        tcp_target = self._targets[self._phase]
+        if self.done or self.failed or self._phase >= 13:
+            return
+
+        tcp_target = (
+            self._targets[self._phase]
+            if self._phase < len(self._targets)
+            else self._initial_wrist
+        )
         transition_complete = True
         if self._phase in (4, 5):
             start_angle, end_angle = (
@@ -1278,13 +1305,49 @@ class TrayPizzaPickPlace:
                 * (self._lift_tcp_target[2] - self._lift_tcp_start[2])
             )
             transition_complete = raw_amount >= 1.0
+            wrist_target = self._tcp_to_wrist(tcp_target)
+            target_orientation = (
+                self._lift_orientation
+                if self._lift_orientation is not None
+                else VERTICAL_EE_ORIENTATION
+            )
+            current_arm = np.asarray(
+                articulation.get_joint_positions()[self._arm_joint_indices],
+                dtype=float,
+            )
+            lift_joints, ik_ok = self._lift_ik.compute_inverse_kinematics(
+                "link_6",
+                wrist_target,
+                target_orientation,
+                current_arm,
+                0.003,
+                0.03,
+            )
+            if ik_ok:
+                lift_joints = current_arm + (
+                    np.asarray(lift_joints, dtype=float)
+                    - current_arm
+                    + np.pi
+                ) % (2.0 * np.pi) - np.pi
+                if self._lift_j1_hold is not None:
+                    lift_joints[0] = self._lift_j1_hold
+                articulation.apply_action(
+                    ArticulationAction(
+                        joint_positions=np.asarray(lift_joints, dtype=float),
+                        joint_indices=self._arm_joint_indices,
+                    )
+                )
             if self._phase_steps % 60 == 0:
                 print(
-                    "[serving-lift] vertical-only "
+                    "[serving-lift-direct-ik] vertical-only "
                     f"z={tcp_target[2]:.4f}m "
-                    f"target_z={self._lift_tcp_target[2]:.4f}m",
+                    f"target_z={self._lift_tcp_target[2]:.4f}m "
+                    f"ik_ok={ik_ok}",
                     flush=True,
                 )
+            if transition_complete:
+                self._enter_phase(7, articulation)
+            return
         elif self._phase == 9:
             raw_amount = min(
                 1.0, self._phase_steps / PLACEMENT_DESCENT_STEPS
@@ -1311,11 +1374,32 @@ class TrayPizzaPickPlace:
             if self._phase == 6 and self._lift_orientation is not None
             else (
                 self._delivery_orientation
-                if self._phase >= 8
+                if 8 <= self._phase <= 11
                 and self._delivery_orientation is not None
                 else VERTICAL_EE_ORIENTATION
             )
         )
+        if self._phase == 12:
+            raw_amount = min(1.0, self._phase_steps / INITIAL_TRANSITION_STEPS)
+            amount = raw_amount * raw_amount * (3.0 - 2.0 * raw_amount)
+            stow_target_joints = np.deg2rad([90.0, 0.0, -90.0, 0.0, -60.0, 90.0])
+            target_joints = self._stow_start_joints + amount * (
+                stow_target_joints - self._stow_start_joints
+            )
+            articulation.apply_action(
+                ArticulationAction(
+                    joint_positions=target_joints,
+                    joint_indices=self._arm_joint_indices,
+                )
+            )
+            transition_complete = raw_amount >= 1.0
+            if transition_complete:
+                self._settled_steps += 1
+                if self._settled_steps >= 15:
+                    self._enter_phase(13, articulation)
+            else:
+                self._settled_steps = 0
+            return
         if self._phase == 0:
             raw_amount = min(1.0, self._phase_steps / INITIAL_TRANSITION_STEPS)
             # Smoothstep has zero slope at both ends, preventing the initial
@@ -1335,21 +1419,12 @@ class TrayPizzaPickPlace:
             target_end_effector_position=wrist_target,
             target_end_effector_orientation=target_orientation,
         )
-        articulation.apply_action(action)
         if self._phase == 6 and self._lift_j1_hold is not None:
             # RMPFlow's default posture has J1=0 while this pickup branch is
-            # near +pi.  At the top of the vertical lift it can otherwise
-            # jump to the equivalent zero-J1 IK branch before phase 7 begins.
-            articulation.apply_action(
-                ArticulationAction(
-                    joint_positions=np.asarray(
-                        [self._lift_j1_hold], dtype=float
-                    ),
-                    joint_indices=np.asarray(
-                        [self._arm_joint_indices[0]], dtype=np.int32
-                    ),
-                )
-            )
+            # near +pi. Directly override J1 target in the action array before
+            # sending a single unified action command to the articulation.
+            if action.joint_positions is not None:
+                action.joint_positions[0] = self._lift_j1_hold
             if self._phase_steps % 60 == 0:
                 actual_j1 = float(
                     articulation.get_joint_positions()[
@@ -1362,6 +1437,7 @@ class TrayPizzaPickPlace:
                     f"actual={np.degrees(actual_j1):.1f}deg",
                     flush=True,
                 )
+        articulation.apply_action(action)
 
         ee_position, _, _ = prim_world_pose(self._end_effector)
         error = float(np.linalg.norm(wrist_target - ee_position))

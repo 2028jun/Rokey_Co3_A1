@@ -1012,10 +1012,10 @@ class CommandServingSequence:
         self.failed = False
 
     def initialize(self, articulation, dof_names):
-        for _, task in self._named_tasks:
+        for name, task in self._named_tasks:
             task.initialize(articulation, dof_names)
         names = " -> ".join(name for name, _ in self._named_tasks)
-        print(f"[integrated-serving] order={names}", flush=True)
+        print(f"[integrated-serving] order={names} (all tasks initialized)", flush=True)
 
     def step(self, articulation):
         if self.done or self.failed:
@@ -1035,11 +1035,15 @@ class CommandServingSequence:
             return
         next_name, next_task = self._named_tasks[self._index]
         print(f"[integrated-serving] starting {next_name}", flush=True)
-        next_task.start_with_deployed_trays()
+        if hasattr(next_task, "start_with_deployed_trays"):
+            next_task.start_with_deployed_trays()
 
     def close(self):
         for _, task in self._named_tasks:
-            task.close()
+            try:
+                task.close()
+            except Exception:
+                pass
 
 
 class NavBridge(Node):

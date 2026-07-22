@@ -58,6 +58,7 @@ OUTSIDE_BAIL_LOCAL_Y = 0.28
 TABLE_APPROACH_HEIGHT = 0.12
 VERTICAL_STEPS = 300
 INITIAL_STEPS = 240
+DETOUR_STEPS = 240
 
 # This is the table position formerly derived from the pizza-board centre,
 # but it is fully defined here so this task does not instantiate pizza assets.
@@ -256,6 +257,27 @@ class SodaCanPickPlace:
                 flush=True,
             )
 
+    def refresh_robot_frame(self):
+        """Re-read the robot base world transform after navigation."""
+        (
+            arm_position,
+            arm_orientation,
+            self._arm_to_world,
+        ) = prim_world_pose(self._arm_base)
+        up_vec = self._arm_to_world.TransformDir(Gf.Vec3d(0.0, 0.0, 1.0))
+        self._up = np.array(up_vec, dtype=float)
+        self._up = self._up / np.linalg.norm(self._up)
+        if hasattr(self, "_controller") and self._controller is not None:
+            self._controller.rmp_flow.set_robot_base_pose(
+                robot_position=arm_position,
+                robot_orientation=arm_orientation,
+            )
+        if hasattr(self, "_lift_ik") and self._lift_ik is not None:
+            self._lift_ik.set_robot_base_pose(
+                robot_position=arm_position,
+                robot_orientation=arm_orientation,
+            )
+
     def start_with_deployed_trays(self):
         """Activate after pizza delivery without retracting/redeploying trays."""
         if not self._initialized:
@@ -264,9 +286,11 @@ class SodaCanPickPlace:
             return
         self._active = True
         self._trays_deployed = True
-        # Pizza needs the original 40 N form-lock grip.  Lower the force only
+        # Pizza needs the original 40 N form-lock grip. Lower the force only
         # now, after the pizza task has released its handle.
         self._enable_soda_grip_force()
+        # Refresh robot base world pose and axes after mobile navigation
+        self.refresh_robot_frame()
         # Phase 0 interpolates from the pose left by pizza delivery, not from
         # the shared ready pose captured before the pizza task began.
         self._initial_wrist, self._initial_orientation, _ = prim_world_pose(
@@ -514,6 +538,13 @@ class SodaCanPickPlace:
             start = self._vertical_starts[self._phase]
             tcp_target[:2] = start[:2]
             tcp_target[2] = start[2] + amount * (tcp_target[2] - start[2])
+            transition_complete = raw >= 1.0
+        elif self._phase in (4, 5) and self._use_bail_detour:
+            raw = min(1.0, self._phase_steps / float(DETOUR_STEPS))
+            amount = raw * raw * (3.0 - 2.0 * raw)
+            start = self._targets[3] if self._phase == 4 else self._targets[4]
+            end = self._targets[self._phase]
+            tcp_target = start + amount * (end - start)
             transition_complete = raw >= 1.0
         wrist_target = self._tcp_to_wrist(tcp_target)
         orientation = self._vertical_orientation

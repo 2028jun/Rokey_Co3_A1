@@ -120,7 +120,11 @@ URDF_PATH = (
     WORKSPACE
     / "src/ridgeback_m0609_description/urdf/ridgeback_m0609.urdf"
 )
-ROBOT_USD = WORKSPACE / "assets/mobile_manipulator/ridgeback_m0609_v2.usd"
+_two_wheel_usd = WORKSPACE.parent / "nav_robot/assets/diagnostics/two_wheel_serving_robot_v2.usd"
+if not _two_wheel_usd.is_file():
+    _two_wheel_usd = WORKSPACE / "assets/diagnostics/two_wheel_serving_robot_v2.usd"
+ROBOT_USD = _two_wheel_usd
+ROBOT_ASSET_ROOT = "/two_wheel_ridgeback_serving_robot"
 M0609_VISUAL_USD = (
     WORKSPACE / "isaacpjt/M0609/Collected_m0609_camera2/m0609_gripper.usd"
 )
@@ -154,10 +158,8 @@ _front_lidar_render_product = None
 _front_lidar_writer = None
 ARM_JOINTS = [f"joint_{index}" for index in range(1, 7)]
 WHEEL_JOINTS = [
-    "front_left_wheel_joint",
-    "front_right_wheel_joint",
-    "rear_left_wheel_joint",
-    "rear_right_wheel_joint",
+    "left_wheel_joint",
+    "right_wheel_joint",
 ]
 SLIDING_TRAY_JOINTS = [
     "upper_tray_left_slide_joint",
@@ -354,7 +356,7 @@ def open_restaurant_and_reference_robot():
     # Isaac's URDF importer does not author a defaultPrim on this layered USD,
     # so reference its known robot root explicitly.
     robot.GetPrim().GetReferences().AddReference(
-        str(ROBOT_USD), Sdf.Path("/ridgeback_m0609")
+        str(ROBOT_USD), Sdf.Path(ROBOT_ASSET_ROOT)
     )
     return stage
 
@@ -473,7 +475,10 @@ def attach_fixed_table_depth_camera(stage):
     mast.CreateRadiusAttr(0.018)
     mast.CreateHeightAttr(0.935)
     mast.CreateAxisAttr(UsdGeom.Tokens.z)
-    mast.AddTranslateOp().Set(Gf.Vec3f(-0.25, 0.285, 1.3225))
+    mast_trans = mast.GetTranslateOp()
+    if not mast_trans:
+        mast_trans = mast.AddTranslateOp()
+    mast_trans.Set(Gf.Vec3f(-0.25, 0.285, 1.3225))
     mast.CreateDisplayColorAttr([Gf.Vec3f(0.12, 0.15, 0.18)])
     UsdPhysics.CollisionAPI.Apply(mast.GetPrim())
 
@@ -482,8 +487,14 @@ def attach_fixed_table_depth_camera(stage):
     boom.CreateRadiusAttr(0.018)
     boom.CreateHeightAttr(0.215)
     boom.CreateAxisAttr(UsdGeom.Tokens.z)
-    boom.AddTranslateOp().Set(Gf.Vec3f(-0.25, 0.3925, 1.79))
-    boom.AddRotateXOp().Set(90.0)
+    boom_trans = boom.GetTranslateOp()
+    if not boom_trans:
+        boom_trans = boom.AddTranslateOp()
+    boom_trans.Set(Gf.Vec3f(-0.25, 0.3925, 1.79))
+    boom_rot = boom.GetRotateXOp()
+    if not boom_rot:
+        boom_rot = boom.AddRotateXOp()
+    boom_rot.Set(90.0)
     boom.CreateDisplayColorAttr([Gf.Vec3f(0.12, 0.15, 0.18)])
     UsdPhysics.CollisionAPI.Apply(boom.GetPrim())
 
@@ -669,7 +680,10 @@ def attach_front_rplidar_ros2(stage):
         raise RuntimeError(f"mobile-base rigid body is missing: {base_path}")
     mount_path = base_prim.GetPath().AppendChild(FRONT_LIDAR_FRAME)
     mount = UsdGeom.Xform.Define(stage, mount_path)
-    mount.AddTranslateOp().Set(FRONT_LIDAR_TRANSLATION)
+    mount_trans = mount.GetTranslateOp()
+    if not mount_trans:
+        mount_trans = mount.AddTranslateOp()
+    mount_trans.Set(FRONT_LIDAR_TRANSLATION)
 
     status, lidar_prim = omni.kit.commands.execute(
         "IsaacSensorCreateRtxLidar",
@@ -857,16 +871,6 @@ def configure_joint_drives(stage):
             drive.CreateDampingAttr(WHEEL_DRIVE_DAMPING)
             drive.CreateMaxForceAttr(WHEEL_DRIVE_MAX_FORCE)
             drive.CreateTargetVelocityAttr(0.0)
-            angle = 45.0 if name in {
-                "front_left_wheel_joint",
-                "rear_right_wheel_joint",
-            } else -45.0
-            prim.CreateAttribute(
-                "isaacmecanumwheel:radius", Sdf.ValueTypeNames.Float
-            ).Set(0.0759)
-            prim.CreateAttribute(
-                "isaacmecanumwheel:angle", Sdf.ValueTypeNames.Float
-            ).Set(angle)
             configured_wheels.append(name)
         elif name in SLIDING_TRAY_JOINTS:
             drive = UsdPhysics.DriveAPI.Apply(prim, "linear")
@@ -1018,7 +1022,7 @@ def run_optional_diagnostic(articulation, dof_names):
     for frame in range(360):
         velocity = np.zeros(len(dof_names), dtype=float)
         if 120 <= frame < 240:
-            velocity[wheel_indices] = [1.2, 1.2, 1.2, 1.2]
+            velocity[wheel_indices] = 1.2
         articulation.apply_action(
             ArticulationAction(
                 joint_velocities=velocity,
@@ -1026,10 +1030,11 @@ def run_optional_diagnostic(articulation, dof_names):
             )
         )
         if frame == 300:
-            target = articulation.get_joint_positions()
-            target[arm_indices] = np.asarray(STOW_CONFIGURATION)
-            articulation.set_joint_position_targets(
-                target[arm_indices], joint_indices=np.asarray(arm_indices)
+            articulation.apply_action(
+                ArticulationAction(
+                    joint_positions=np.asarray(STOW_CONFIGURATION, dtype=float),
+                    joint_indices=np.asarray(arm_indices, dtype=np.int32),
+                )
             )
         simulation_app.update()
 
@@ -1070,11 +1075,7 @@ def main():
     prepare_antigravity_food_assets()
     import_robot_usd()
     stage = open_restaurant_and_reference_robot()
-    if SERVING_TASK in {
-        "soda", "soda1", "soda2", "pizza_soda", "pizza_soda1_soda2",
-        "pizza_soda1_soda2_cutlery",
-    }:
-        spawn_soda_cans(stage)
+    spawn_soda_cans(stage)
     spawn_cutlery_box(stage)
     attach_m0609_visuals(stage)
     attach_fixed_table_depth_camera(stage)
