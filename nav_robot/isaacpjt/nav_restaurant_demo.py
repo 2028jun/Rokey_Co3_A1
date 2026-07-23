@@ -1124,8 +1124,6 @@ class NavBridge(Node):
         self.create_subscription(
             PoseStamped, "/nav_robot/teleport", self._on_teleport, qos
         )
-        self.create_subscription(LaserScan, "/scan", self._on_scan, sensor_qos)
-        self.create_subscription(LaserScan, "/nav_robot/scan", self._on_scan, sensor_qos)
         self.odom_pub = self.create_publisher(Odometry, "/nav_robot/odom", qos)
         self.tf_broadcaster = TransformBroadcaster(self)
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
@@ -1560,14 +1558,11 @@ class NavBridge(Node):
             LIDAR_MAX_RANGE,
         )
 
-    def _on_scan(self, msg: LaserScan):
-        self._process_obstacle_ranges(
-            msg.ranges,
-            msg.angle_min,
-            msg.angle_increment,
-            msg.range_min,
-            msg.range_max,
-        )
+    def _clear_obstacle_state(self):
+        self._obstacle_stop = False
+        self._obstacle_stop_started = None
+        self._clearance_start = None
+        self._obstacle_scale = 1.0
 
     def _process_obstacle_ranges(
         self,
@@ -1580,23 +1575,23 @@ class NavBridge(Node):
         with self._lock:
             mission = self._direct_nav
             if mission is None:
-                self._obstacle_scale = 1.0
+                self._clear_obstacle_state()
                 return
 
             if mission["mode"] == "legacy_table":
                 stage = mission.get("stage")
                 if stage not in ("move_to_pre_dock", "final_approach"):
-                    self._obstacle_scale = 1.0
+                    self._clear_obstacle_state()
                     return
             else:
                 stages = mission.get("stages", [])
                 index = mission.get("index", 0)
                 if index >= len(stages):
-                    self._obstacle_scale = 1.0
+                    self._clear_obstacle_state()
                     return
                 kind = stages[index].get("kind")
                 if kind not in ("axis_x", "axis_y"):
-                    self._obstacle_scale = 1.0
+                    self._clear_obstacle_state()
                     return
 
             slow_distance = 1.4
