@@ -1,0 +1,23 @@
+Isaac Sim 5.1 GPU 세션에서 확인. `isaacsim.replicator.agent`(Actor SDG) 확장은
+Isaac Sim 켜면 자동으로 로드되도록 이미 설정되어 있음.
+
+목표(이번엔 이것만): 빈 스테이지에 캐릭터 하나 놓고, push_button / typing 행동
+애니메이션이 스크립트/코드로 트리거 가능한지, 트리거했을 때 크래시 없이
+관절이 자연스럽게 움직이는지만 확인. 테이블/ROI/hand_safety 파이프라인
+통합은 하지 마.
+
+애니메이션 USD 파일: GPU 컴퓨터의 `~/Downloads` 폴더에 있음.
+
+할 일:
+1. 빈 스테이지 + 캐릭터 하나 스폰.
+2. Downloads의 행동 애니메이션 USD를 Actor SDG 커맨드로 등록해서 재생 --
+   필요하면 `isaacsim.replicator.agent.core` 확장 소스
+   (`~/.local/share/ov/data/exts/v2/` 하위)를 직접 읽어서 UI가 내부적으로
+   뭘 호출하는지 확인하고, 그 호출을 스크립트로 재현.
+3. Headless에서도 시도해보고, 크래시 나면 GUI로도 시도.
+4. 결과만 짧게 보고: 어떤 API로 트리거했는지, headless/GUI 각각 됐는지
+   안 됐는지, 렌더 결과가 자연스러웠는지.
+
+이 브랜치의 vision-test 프롬프트/Pass 시스템(`VISION_TEST_GPU_PROMPT.txt`)과는
+무관한 사전 확인용 스파이크임. 여기 결과로 뭘 커밋/수정할지는 결정하지 말고,
+이 파일 자체도 건드리지 마 -- 결과만 보고.
