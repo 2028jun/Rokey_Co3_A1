@@ -1,4 +1,4 @@
-"""Nav2 free-path planning replaced with Orthogonal L-Path, Orthogonal A*, Integrated Project Axis Controller & Forward/Lateral Docking Controller with Predicted Braking, Orthogonal Yaw Pinning, and Lateral Recovery."""
+"""Nav2 free-path planning replaced with Orthogonal L-Path, Orthogonal A*, Integrated Project Axis Controller with Precise Stop & Pulse Recovery, and Lateral Recovery Micro-Docking."""
 
 from __future__ import annotations
 
@@ -39,6 +39,7 @@ class AxisStage:
     yaw: float          # Heading for this stage (Control Frame)
     speed: float
     is_last: bool
+    axis_sign: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,18 @@ class MotionConfig:
     final_yaw_tolerance_rad: float = math.radians(2.0)
     axis_tolerance_m: float = 0.03
     final_approach_axis_tolerance_m: float = 0.03
+    axis_decel_mps2: float = 0.30
+    axis_position_gain: float = 0.8
+    axis_fine_control_distance_m: float = 0.05
+    axis_fine_position_gain: float = 1.0
+    axis_fine_max_speed_mps: float = 0.03
+    axis_min_effective_speed_mps: float = 0.04
+    axis_position_tolerance_m: float = 0.02
+    axis_speed_tolerance_mps: float = 0.01
+    axis_settle_samples: int = 5
+    axis_fine_pulse_speed_mps: float = 0.04
+    axis_fine_pulse_duration_sec: float = 0.10
+    axis_fine_pulse_attempts: int = 3
     axis_braking_decel_mps2: float = 0.30
     axis_speed_gain: float = 0.8
     axis_min_linear_speed_mps: float = 0.015
@@ -691,7 +704,8 @@ class SimplifiedPathNavigator:
 
         started = time.monotonic()
         last_log = started
-        previous_axis_error: float | None = None
+        settle_count = 0
+        pulse_count = 0
 
         while time.monotonic() - started < 90.0:
             rclpy.spin_once(self._nav, timeout_sec=0.03)
@@ -704,64 +718,69 @@ class SimplifiedPathNavigator:
             axis = x if stage.kind == "axis_x" else y
             axis_error = stage.value - axis
             yaw_error = normalize_angle(stage.yaw - yaw)
+            actual_speed = self._control_twist[0] if self._control_twist is not None else 0.0
 
-            tolerance = (
-                self._cfg.final_approach_axis_tolerance_m
-                if stage.is_last
-                else self._cfg.axis_tolerance_m
-            )
-
-            current_vx = abs(self._control_twist[0]) if self._control_twist is not None else 0.0
-            stopping_distance = (current_vx * current_vx) / (2.0 * self._cfg.axis_braking_decel_mps2)
-
-            # 1) Reached axis tolerance with predicted braking distance
-            if abs(axis_error) <= (stopping_distance + tolerance):
-                self._stop()
-                self._spin_sleep(0.10)
-                if not self._wait_until_stopped(timeout_sec=2.0, label=f"{label}:predicted_stop"):
-                    return False
-                print(
-                    f"[{label}] predicted stop: axis_error={axis_error:.3f}m "
-                    f"vx={current_vx:.3f}m/s stopping_distance={stopping_distance:.3f}m tol={tolerance:.3f}m",
-                    flush=True,
-                )
-                return True
-
-            # 2) Axis target crossed (sign inversion check)
-            crossed = (
-                previous_axis_error is not None
-                and (axis_error * previous_axis_error <= 0.0)
-            )
-            if crossed:
-                self._stop()
-                self._spin_sleep(0.10)
-                if not self._wait_until_stopped(timeout_sec=2.0, label=f"{label}:axis_cross_stop"):
-                    return False
-                print(
-                    f"[{label}] axis target crossed: prev={previous_axis_error:.3f}m current={axis_error:.3f}m",
-                    flush=True,
-                )
-                return True
-
-            previous_axis_error = axis_error
-
-            # 3-Tier Corner Slowdown logic based on axis error
+            forward_error = axis_error * stage.axis_sign
             abs_error = abs(axis_error)
-            if abs_error <= self._cfg.axis_crawl_distance_m:
-                requested = max(
-                    self._cfg.axis_min_linear_speed_mps,
-                    min(self._cfg.axis_crawl_max_speed_mps, 0.4 * abs_error),
-                )
-            elif abs_error <= self._cfg.axis_slowdown_distance_m:
-                requested = max(
-                    self._cfg.axis_crawl_max_speed_mps,
-                    min(self._cfg.axis_slow_max_speed_mps, 0.6 * abs_error),
-                )
+
+            # Stopping condition: position & speed convergence
+            position_ok = (abs_error <= self._cfg.axis_position_tolerance_m)
+            speed_ok = (abs(actual_speed) <= self._cfg.axis_speed_tolerance_mps)
+
+            if position_ok and speed_ok:
+                self._publish_cmd(Twist())
+                settle_count += 1
+                if settle_count >= self._cfg.axis_settle_samples:
+                    self._stop()
+                    if not self._wait_until_stopped(timeout_sec=2.0, label=f"{label}:precise_stop"):
+                        return False
+                    print(
+                        f"[{label}] precise axis stop: error={axis_error:.3f}m speed={actual_speed:.3f}m/s",
+                        flush=True,
+                    )
+                    return True
             else:
-                requested = min(abs(stage.speed), 0.8 * abs_error)
+                settle_count = 0
+
+            # Velocity calculation (Normal vs Fine Control)
+            if abs_error > self._cfg.axis_fine_control_distance_m:
+                braking_speed = math.sqrt(2.0 * self._cfg.axis_decel_mps2 * abs_error)
+                position_speed = self._cfg.axis_position_gain * abs_error
+                target_speed = min(abs(stage.speed), braking_speed, position_speed)
+                target_speed = max(self._cfg.axis_min_effective_speed_mps, target_speed)
+                linear_cmd = math.copysign(target_speed, forward_error)
+            else:
+                linear_cmd = _clamp(
+                    self._cfg.axis_fine_position_gain * forward_error,
+                    -self._cfg.axis_fine_max_speed_mps,
+                    self._cfg.axis_fine_max_speed_mps,
+                )
+
+            # Check Stalled Pulse Recovery
+            fine_stalled = (
+                abs_error > self._cfg.axis_position_tolerance_m
+                and abs(linear_cmd) < self._cfg.axis_min_effective_speed_mps
+                and abs(actual_speed) < 0.005
+            )
+
+            if fine_stalled:
+                if pulse_count < self._cfg.axis_fine_pulse_attempts:
+                    pulse_count += 1
+                    print(
+                        f"[{label}] fine control stalled (error={axis_error:.3f}m); "
+                        f"triggering pulse {pulse_count}/{self._cfg.axis_fine_pulse_attempts}",
+                        flush=True,
+                    )
+                    pulse_cmd = Twist()
+                    pulse_cmd.linear.x = math.copysign(self._cfg.axis_fine_pulse_speed_mps, forward_error)
+                    self._publish_cmd(pulse_cmd)
+                    self._spin_sleep(self._cfg.axis_fine_pulse_duration_sec)
+                    self._publish_cmd(Twist())
+                    self._spin_sleep(0.05)
+                    continue
 
             cmd = Twist()
-            cmd.linear.x = math.copysign(requested, stage.speed)
+            cmd.linear.x = linear_cmd
             cmd.angular.z = max(
                 -self._cfg.axis_max_yaw_correction_rps,
                 min(
@@ -775,9 +794,9 @@ class SimplifiedPathNavigator:
             now = time.monotonic()
             if now - last_log >= self._cfg.log_period_sec:
                 print(
-                    f"[{label}] axis drive kind={stage.kind} axis_error={axis_error:.3f}m "
-                    f"yaw_error={math.degrees(yaw_error):.1f}deg vx={cmd.linear.x:.3f} wz={cmd.angular.z:.3f} "
-                    f"stop_dist={stopping_distance:.3f}m",
+                    f"[{label}] axis drive kind={stage.kind} axis_error={axis_error:.3f}m fwd_err={forward_error:.3f}m "
+                    f"yaw_error={math.degrees(yaw_error):.1f}deg vx={cmd.linear.x:.3f} actual_vx={actual_speed:.3f} "
+                    f"settle={settle_count}/{self._cfg.axis_settle_samples}",
                     flush=True,
                 )
                 last_log = now
@@ -926,6 +945,13 @@ class SimplifiedPathNavigator:
                     )
                     continue
 
+                if abs(dx) >= abs(dy):
+                    kind = "axis_x"
+                    axis_sign = 1.0 if dx >= 0.0 else -1.0
+                else:
+                    kind = "axis_y"
+                    axis_sign = 1.0 if dy >= 0.0 else -1.0
+
                 map_dx = e[0] - s[0]
                 map_dy = e[1] - s[1]
 
@@ -936,22 +962,14 @@ class SimplifiedPathNavigator:
 
                 stage_yaw = normalize_angle(map_axis_yaw + yaw_offset)
 
-                if abs(dx) >= abs(dy):
-                    stage = AxisStage(
-                        kind="axis_x",
-                        value=control_end[0],
-                        yaw=stage_yaw,
-                        speed=self._cfg.max_linear_speed_mps,
-                        is_last=is_last,
-                    )
-                else:
-                    stage = AxisStage(
-                        kind="axis_y",
-                        value=control_end[1],
-                        yaw=stage_yaw,
-                        speed=self._cfg.max_linear_speed_mps,
-                        is_last=is_last,
-                    )
+                stage = AxisStage(
+                    kind=kind,
+                    value=control_end[0] if kind == "axis_x" else control_end[1],
+                    yaw=stage_yaw,
+                    speed=self._cfg.max_linear_speed_mps,
+                    is_last=is_last,
+                    axis_sign=axis_sign,
+                )
 
                 print(
                     f"[{label}:seg{index}] axis stage: "
