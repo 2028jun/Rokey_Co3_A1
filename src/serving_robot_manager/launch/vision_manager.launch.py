@@ -42,14 +42,14 @@ def generate_launch_description():
                         "input_topic": "/camera/color/image_raw",
                         "roi_intrusion_topic": "/hand_safety/intrusion",
                         "table_arrived_topic": "/serving_robot/table_arrived",
-                        "confidence": 0.60,
+                        "confidence": 0.70,
                         "image_size": 1280,
                         "half": False,
                         "confirmation_frames": 5,
                         "self_mask_enabled": True,
-                        "self_mask_value_max": 70,
-                        "self_mask_saturation_max": 100,
-                        "self_mask_min_box_overlap": 0.50,
+                        "self_mask_value_max": 90,
+                        "self_mask_saturation_max": 130,
+                        "self_mask_min_box_overlap": 0.20,
                         "publish_annotated_image": ParameterValue(
                             vision_debug, value_type=bool
                         ),

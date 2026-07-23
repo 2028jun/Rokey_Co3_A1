@@ -60,7 +60,7 @@ class HandDetectorNode(Node):
             "table_arrived_topic", "/serving_robot/table_arrived"
         )
         self.declare_parameter("model_path", str(DEFAULT_MODEL_PATH))
-        self.declare_parameter("confidence", 0.60)
+        self.declare_parameter("confidence", 0.70)
         self.declare_parameter("iou", 0.7)
         # Preserve enough pixels for the relatively small rendered hand.
         self.declare_parameter("image_size", 1280)
@@ -76,9 +76,9 @@ class HandDetectorNode(Node):
         self.declare_parameter("confirmation_frames", 5)
         # Simulator-first dynamic self-mask for the robot's dark material.
         self.declare_parameter("self_mask_enabled", True)
-        self.declare_parameter("self_mask_value_max", 70)
-        self.declare_parameter("self_mask_saturation_max", 100)
-        self.declare_parameter("self_mask_min_box_overlap", 0.50)
+        self.declare_parameter("self_mask_value_max", 90)
+        self.declare_parameter("self_mask_saturation_max", 130)
+        self.declare_parameter("self_mask_min_box_overlap", 0.20)
         # Defaulted on for the vision GPU test: `ros2 run hand_safety
         # hand_detector_node` alone now opens a live cv2 window and
         # publishes the annotated stream, no --ros-args needed.
