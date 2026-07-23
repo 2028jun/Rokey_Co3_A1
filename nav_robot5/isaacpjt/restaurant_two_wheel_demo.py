@@ -349,12 +349,28 @@ def build_stages_from_points(points: list[dict], current_x: float, current_y: fl
 
         if abs(dx) >= abs(dy):
             stage_yaw = 0.0 if dx >= 0.0 else math.pi
-            stages.append({"kind": "pivot", "yaw": stage_yaw})
-            stages.append({"kind": "axis_x", "value": target_x, "yaw": stage_yaw, "speed": 0.22 if dx >= 0.0 else -0.22})
+            stages.append({
+                "kind": "pivot",
+                "yaw": stage_yaw,
+            })
+            stages.append({
+                "kind": "axis_x",
+                "value": target_x,
+                "yaw": stage_yaw,
+                "speed": 0.22,  # Speed is always positive since pivot pre-aligns heading
+            })
         else:
             stage_yaw = math.pi / 2.0 if dy >= 0.0 else -math.pi / 2.0
-            stages.append({"kind": "pivot", "yaw": stage_yaw})
-            stages.append({"kind": "axis_y", "value": target_y, "yaw": stage_yaw, "speed": 0.22 if dy >= 0.0 else -0.22})
+            stages.append({
+                "kind": "pivot",
+                "yaw": stage_yaw,
+            })
+            stages.append({
+                "kind": "axis_y",
+                "value": target_y,
+                "yaw": stage_yaw,
+                "speed": 0.22,  # Speed is always positive since pivot pre-aligns heading
+            })
 
         curr_x, curr_y = target_x, target_y
 
@@ -512,7 +528,7 @@ class DiffNavBridge(Node):
         else:
             self.get_logger().error(f"direct navigation failed mission={mission_id}: {reason}")
 
-    # Exact Line-by-Line Original Method: _update_direct_navigation from nav_restaurant_demo.py
+    # Method: _update_direct_navigation with Always Positive vx & Heading Mismatch Check
     def _update_direct_navigation(self, x: float, y: float, yaw: float) -> tuple[float, float] | None:
         mission = self._direct_nav
         if mission is None:
@@ -562,12 +578,34 @@ class DiffNavBridge(Node):
         else:
             axis = x if kind == "axis_x" else y
             error = stage["value"] - axis
+
+            # Heading Mismatch Check upon stage start
+            expected_sign = 1.0 if stage["value"] >= axis else -1.0
+            heading_axis_sign = (
+                math.cos(stage["yaw"])
+                if kind == "axis_x"
+                else math.sin(stage["yaw"])
+            )
+            if expected_sign * heading_axis_sign <= 0.0:
+                self._finish_direct_navigation(
+                    False,
+                    (
+                        f"stage heading mismatch: "
+                        f"kind={kind} target={stage['value']:.3f} "
+                        f"axis={axis:.3f} yaw={math.degrees(stage['yaw']):.1f}"
+                    ),
+                    x,
+                    y,
+                    yaw,
+                )
+                return 0.0, 0.0
+
             done = abs(error) <= 0.05
             desired_yaw = stage["yaw"]
             yaw_error = self._angle_error(desired_yaw, yaw)
             if not done:
                 requested = min(abs(stage["speed"]), max(0.045, abs(error) * 0.8))
-                vx = math.copysign(requested, stage["speed"])
+                vx = requested  # Always forward linear velocity since pivot pre-aligned heading
                 wz = float(np.clip(1.6 * yaw_error, -0.28, 0.28))
             timeout = 90.0
             detail = f"axis_error={error:.3f}m yaw_error={math.degrees(yaw_error):.1f}deg"
