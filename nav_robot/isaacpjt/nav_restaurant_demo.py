@@ -1109,6 +1109,13 @@ class NavBridge(Node):
         self.create_subscription(
             PoseStamped, "/nav_robot/teleport", self._on_teleport, qos
         )
+        sensor_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self.create_subscription(LaserScan, "/scan", self._on_scan, sensor_qos)
+        self.create_subscription(LaserScan, "/nav_robot/scan", self._on_scan, sensor_qos)
         self.create_subscription(LaserScan, "/scan", self._on_scan, qos)
         self.create_subscription(LaserScan, "/nav_robot/scan", self._on_scan, qos)
         self.odom_pub = self.create_publisher(Odometry, "/nav_robot/odom", qos)
