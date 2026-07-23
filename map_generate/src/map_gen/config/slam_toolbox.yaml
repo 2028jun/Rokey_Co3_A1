@@ -11,14 +11,16 @@ slam_toolbox:
     mode: mapping  # online async mapping
 
     resolution: 0.05
-    map_update_interval: 2.0
+    map_update_interval: 1.0
 
-    max_laser_range: 20.0
-    min_laser_range: 0.2
+    # Match Isaac two_wheel lidar (~12 m)
+    max_laser_range: 12.0
+    min_laser_range: 0.15
     transform_timeout: 0.5
-    minimum_time_interval: 0.2
-    minimum_travel_distance: 0.2
-    minimum_travel_heading: 0.17
+    # Denser pose graph updates while driving slowly
+    minimum_time_interval: 0.1
+    minimum_travel_distance: 0.08
+    minimum_travel_heading: 0.08
 
     transform_publish_period: 0.05
     tf_buffer_duration: 30.0
@@ -29,8 +31,8 @@ slam_toolbox:
     use_response_expansion: true
 
     do_loop_closing: true
-    loop_match_minimum_chain_size: 10
-    loop_search_maximum_distance: 3.0
+    loop_match_minimum_chain_size: 8
+    loop_search_maximum_distance: 4.0
 
     throttle_scans: 1
     debug_logging: false
