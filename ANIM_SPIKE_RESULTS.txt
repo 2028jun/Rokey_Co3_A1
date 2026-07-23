@@ -1,0 +1,68 @@
+ANIM_SPIKE_PROMPT.txt 결과 (2026-07-23, GPU hardware, headless)
+
+## 결론
+push_button / typing 행동 애니메이션은 스크립트로 트리거 가능하며, 헤드리스
+환경에서 크래시 없이 자연스럽게 재생됨. GUI 폴백 불필요.
+
+## 사용한 API (Actor SDG UI가 내부적으로 호출하는 체인을 소스에서 추적해 재현)
+
+1. `omni.anim.people.python_ext.get_instance().get_custom_command_manager()`
+2. `~/Downloads`의 두 skelanim.usd는 `CustomCommandManager.add_custom_command()`가
+   요구하는 `CustomCommandName`/`CustomCommandTemplate` 커스텀 속성이 없는 순수
+   SkelAnimation 파일이었음 (직접 USD 열어서 확인: `/Root`가 그냥 SkelAnimation
+   하나뿐). `add_custom_command()`를 그대로 쓰면 `None.name` 접근으로 크래시남 --
+   대신 `CustomCommand(anim_path=..., name="push_button",
+   template=CustomCommandTemplate.TIMING)` 객체를 매니저의 커맨드 리스트에 직접
+   추가해서 우회함 (`isaacpjt/anim_spike_test.py` 참고).
+3. `isaacsim.replicator.agent.core.stage_util.CharacterUtil.load_default_biped_to_stage()`
+   호출 -> 내부에서 `omni.anim.people.populate_anim_graph()`가 실행되어 AnimationGraph에
+   `state_push_button`/`state_type_keyboard` 상태가 자동 생성됨.
+4. `CharacterUtil.load_character_usd_to_stage()`로 보이는 캐릭터 스폰 ->
+   `setup_animation_graph_to_character()` / `setup_python_scripts_to_character()`로
+   AnimGraph + `character_behavior.py` BehaviorScript 부착.
+5. 커맨드 파일(`"<캐릭터이름> push_button"`)을 작성해서
+   `/exts/omni.anim.people/command_settings/command_file_path` carb 설정에 등록 ->
+   타임라인 play.
+
+## 결과
+
+- 헤드리스: 크래시 없음. 각 실행 ~15~25초.
+- BehaviorScript가 커맨드 파일을 정상적으로 읽어 큐에 반영 확인
+  (`commands: ['push_button']`).
+- 렌더 캡처로 확인: push_button 애니메이션이 실제로 재생됨 -- 팔이 자연스럽게
+  올라가는 동작이 몇 초에 걸쳐 확인되고, 이후 idle로 정상 복귀함. 아래 스크린샷
+  참고 (`docs/anim_spike_frames/`).
+  - `push_button_idle.png`: 재생 시작 직후, 양팔이 옆으로 늘어진 기본 자세.
+  - `push_button_active.png`: 약 2초 후, 왼팔이 올라가 구부러진 상태 (push_button
+    실행 중).
+- type_keyboard도 동일 경로로 크래시 없이 트리거됨 (다만 테스트에 쓴 고정
+  카메라 앵글상 손 디테일까지는 뚜렷이 확인되지 않음 -- 손/키보드 오브젝트가
+  없는 빈 스테이지라 애니메이션이 원래 상호작용하도록 설계된 대상 없이 재생됨).
+- 참고: 이 GPU 머신에 이미 전날(7/22) 다른 세션이 이 작업을 시도한 흔적
+  (크래시 덤프, 이미 등록되어 있던 `TypeKeyboard` 커스텀 커맨드)이 남아있었음 --
+  완전히 처음 시도하는 작업은 아닌 것으로 보임.
+
+## 재현 방법
+
+```bash
+export SPIKE_ANIM_USD=~/Downloads/push_button.skelanim.usd
+export SPIKE_COMMAND_NAME=push_button
+/home/rokey/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/python.sh \
+  isaacpjt/anim_spike_test.py            # 헤드리스
+# 또는 GUI로 직접 보려면:
+export DISPLAY=:1
+/home/rokey/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/python.sh \
+  isaacpjt/anim_spike_test.py --gui
+```
+
+type_keyboard를 테스트하려면 `SPIKE_ANIM_USD`/`SPIKE_COMMAND_NAME`을
+`type_keyboard.skelanim.usd` / `type_keyboard`로 바꾸면 됨.
+
+## 이 스파이크의 범위 밖 (다음에 필요하면)
+
+- 실제 손/키보드 오브젝트와의 상호작용(InteractableObjectHelper 경로,
+  `TIMING_TO_OBJECT` 템플릿)은 테스트하지 않음 -- 이번 스파이크는 순수
+  TIMING 템플릿(그냥 재생)만 확인.
+- 두 skelanim.usd 파일 자체에 `CustomCommandName`/`CustomCommandTemplate`
+  속성을 authoring해서 Actor SDG UI에서 "정식으로" 등록되게 만드는 작업은
+  하지 않음 (스크립트에서 직접 CustomCommand 객체를 만들어 우회함).
