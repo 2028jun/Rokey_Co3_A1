@@ -17,7 +17,7 @@ from rclpy.qos import (
 from nav_msgs.msg import Odometry
 from rosgraph_msgs.msg import Clock
 from std_msgs.msg import String, Bool, Int32
-from std_srvs.srv import Trigger
+from std_srvs.srv import Trigger, SetBool
 
 try:
     from serving_robot_interfaces.srv import OrderRequest
@@ -138,6 +138,7 @@ class HMIBridgeNode(Node):
             10,
         )
         self.manager_reset_client = self.create_client(Trigger, '/manager/reset_fault')
+        self.hand_test_client = self.create_client(SetBool, '/hand_test/set_visible')
         if ORDER_REQUEST_SRV_AVAILABLE:
             self.manager_order_client = self.create_client(OrderRequest, '/manager/order')
             self.get_logger().info("Manager /manager/order Service Client created.")
@@ -148,6 +149,16 @@ class HMIBridgeNode(Node):
         # Periodic timer for checking liveness and driving mock navigation (20 Hz)
         self.create_timer(0.05, self.check_liveness_timer)
         self.get_logger().info("HMI ROS 2 Bridge Node initialized.")
+
+    def set_hand_test_visible(self, visible: bool):
+        if not hasattr(self, 'hand_test_client'):
+            return False, "hand_test_client not initialized"
+        if not self.hand_test_client.service_is_ready():
+            return False, "/hand_test/set_visible service is not ready"
+        req = SetBool.Request()
+        req.data = visible
+        self.hand_test_client.call_async(req)
+        return True, f"hand spawn visible={visible} request queued"
 
     def table_camera_callback(self, msg):
         try:
@@ -647,6 +658,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     stop_flag = bool(data.get("stop", True))
                     if ros_node:
                         ros_node.publish_estop(stop_flag)
+
+                elif msg_type == "SET_HAND_TEST_VISIBLE":
+                    visible = bool(data.get("visible", False))
+                    if ros_node:
+                        sent, msg = ros_node.set_hand_test_visible(visible)
+                        print(f"[HMI Backend] SET HAND TEST VISIBLE ({visible}): {msg}", flush=True)
 
                 elif msg_type == "RESET_FAULT":
                     if ros_node:

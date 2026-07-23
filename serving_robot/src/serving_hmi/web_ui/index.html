@@ -291,6 +291,20 @@
                             </tbody>
                         </table>
                     </div>
+                <!-- Test Controls Section (테스트 제어) -->
+                <div class="test-controls-wrapper">
+                    <h3><i class="fa-solid fa-vial-virus" style="color: var(--accent-neon);"></i> 시뮬레이션 테스트 제어</h3>
+                    <div class="test-btn-group">
+                        <button class="test-btn spawn" onclick="setHandTestVisible(true)">
+                            <i class="fa-solid fa-hand-back-fist"></i> 손 스폰 (Spawn)
+                        </button>
+                        <button class="test-btn remove" onclick="setHandTestVisible(false)">
+                            <i class="fa-solid fa-hand-slash"></i> 손 제거 (Remove)
+                        </button>
+                    </div>
+                    <div class="test-status-info">
+                        <span>손 서비스 상태: <strong id="hand-service-status">대기 중</strong></span>
+                    </div>
                 </div>
             </section>
         </main>

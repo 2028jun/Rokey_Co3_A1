@@ -658,3 +658,69 @@ body {
     gap: 8px;
     color: var(--text-muted);
 }
+
+/* Test Controls Panel */
+.test-controls-wrapper {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.test-controls-wrapper h3 {
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: var(--text-main);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.test-btn-group {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+
+.test-btn {
+    padding: 9px 12px;
+    border-radius: 8px;
+    border: none;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    transition: all 0.2s ease;
+    color: white;
+}
+
+.test-btn.spawn {
+    background: linear-gradient(135deg, #f59e0b, #d97706);
+    box-shadow: 0 0 10px rgba(245, 158, 11, 0.3);
+}
+
+.test-btn.spawn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 0 16px rgba(245, 158, 11, 0.6);
+}
+
+.test-btn.remove {
+    background: linear-gradient(135deg, #64748b, #475569);
+    box-shadow: 0 0 10px rgba(100, 116, 139, 0.3);
+}
+
+.test-btn.remove:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 0 16px rgba(100, 116, 139, 0.6);
+}
+
+.test-status-info {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    text-align: right;
+}
