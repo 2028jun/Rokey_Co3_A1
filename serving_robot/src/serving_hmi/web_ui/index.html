@@ -125,9 +125,28 @@
                     </div>
                 </div>
 
-                <!-- Step 2: Select Table -->
+                <!-- Step 2: Additional Options -->
                 <div class="form-section">
-                    <label class="section-label">2. 서빙 테이블 선택</label>
+                    <label class="section-label">2. 추가 주문</label>
+                    <div class="menu-grid">
+                        <div class="menu-card" id="menu-card-m5" style="grid-column: span 2;">
+                            <div class="menu-emoji">🍴</div>
+                            <div class="menu-info">
+                                <span class="menu-name">식기도구 (수저통)</span>
+                                <span class="menu-price">0원 (무료)</span>
+                            </div>
+                            <div class="qty-controls">
+                                <button class="qty-btn" onclick="updateCart('m5', '식기도구 (수저통)', 0, -1)">-</button>
+                                <span class="qty-count" id="qty-m5">0</span>
+                                <button class="qty-btn" onclick="updateCart('m5', '식기도구 (수저통)', 0, 1)">+</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Step 3: Select Table -->
+                <div class="form-section">
+                    <label class="section-label">3. 서빙 테이블 선택</label>
                     <div class="table-grid">
                         <button class="table-btn selected" onclick="selectTable(1)">Table 1</button>
                         <button class="table-btn" onclick="selectTable(2)">Table 2</button>
