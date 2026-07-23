@@ -1466,9 +1466,9 @@ class NavBridge(Node):
                     self._obstacle_scale = 1.0
                     return
 
-            slow_distance = 1.8
-            stop_distance = 0.5
-            resume_distance = 1.2
+            slow_distance = 2.5
+            stop_distance = 1.0
+            resume_distance = 1.4
             front_angle = math.radians(20.0)
 
             valid_ranges = []
@@ -1495,8 +1495,9 @@ class NavBridge(Node):
                 if len(close_points) >= 3 and nearest <= stop_distance:
                     self._start_obstacle_stop(nearest)
                 elif nearest < slow_distance:
-                    scale = (nearest - stop_distance) / (slow_distance - stop_distance)
-                    self._obstacle_scale = float(np.clip(scale, 0.15, 1.0))
+                    ratio = (nearest - stop_distance) / (slow_distance - stop_distance)
+                    ratio = float(np.clip(ratio, 0.0, 1.0))
+                    self._obstacle_scale = max(0.03, ratio * ratio)
                 else:
                     self._obstacle_scale = 1.0
             else:
@@ -1509,6 +1510,13 @@ class NavBridge(Node):
                 else:
                     self._clearance_start = None
 
+            if nearest < slow_distance or self._obstacle_stop:
+                if now - getattr(self, "_last_obstacle_log", 0.0) >= 0.5:
+                    self._last_obstacle_log = now
+                    self.get_logger().info(
+                        f"obstacle distance={nearest:.2f}m scale={self._obstacle_scale:.2f} stop={self._obstacle_stop}"
+                    )
+
     def _start_obstacle_stop(self, distance: float):
         if self._obstacle_stop:
             return
@@ -1518,10 +1526,8 @@ class NavBridge(Node):
         self._obstacle_scale = 0.0
         self._target_vx = 0.0
         self._target_wz = 0.0
-        self._cmd_vx = 0.0
-        self._cmd_wz = 0.0
         self.get_logger().warning(
-            f"전방 장애물(사람) 최근접 감지: {distance:.2f}m <= 0.5m, 주행 정지"
+            f"전방 장애물(사람) 최근접 감지: distance={distance:.2f}m <= {1.0}m, 주행 정지"
         )
 
     def _finish_obstacle_stop(self, distance: float):

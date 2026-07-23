@@ -33,7 +33,7 @@ class CorridorPersonSpawnController:
 
         prim = self.stage.GetPrimAtPath(CORRIDOR_PERSON_PRIM)
         if prim.IsValid():
-            UsdGeom.Imageable(prim).MakeInvisible()
+            self.stage.RemovePrim(CORRIDOR_PERSON_PRIM)
         print(
             f"[obstacle_test] corridor person controller ready at {tuple(CORRIDOR_PERSON_POSITION)}",
             flush=True,
@@ -59,7 +59,7 @@ class CorridorPersonSpawnController:
                 precision=UsdGeom.XformOp.PrecisionDouble
             ).Set(CORRIDOR_PERSON_YAW)
 
-            # Apply PhysX Collision API to all human meshes
+            # Apply PhysX Collision API to human meshes for LiDAR reflection
             for p in Usd.PrimRange(prim):
                 if p.IsA(UsdGeom.Mesh):
                     UsdPhysics.CollisionAPI.Apply(p)
@@ -68,29 +68,19 @@ class CorridorPersonSpawnController:
                     except Exception:
                         pass
 
-            # Create guide capsule collider (purpose="guide" makes it invisible in rendering but active in PhysX)
-            collider_path = f"{CORRIDOR_PERSON_PRIM}/CollisionBody"
-            capsule = UsdGeom.Capsule.Define(self.stage, collider_path)
-            capsule.CreateHeightAttr(1.7)
-            capsule.CreateRadiusAttr(0.35)
-            capsule.CreateAxisAttr("Z")
-            UsdGeom.Xformable(capsule).AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.85))
-            UsdPhysics.CollisionAPI.Apply(capsule.GetPrim())
-            capsule.CreatePurposeAttr("guide")
-
         UsdGeom.Imageable(prim).MakeVisible()
         self.active = True
         print(
-            f"[obstacle_test] corridor person spawned with active PhysX collider at {tuple(CORRIDOR_PERSON_POSITION)}",
+            f"[obstacle_test] corridor person spawned at {tuple(CORRIDOR_PERSON_POSITION)}",
             flush=True,
         )
 
     def _remove(self) -> None:
         prim = self.stage.GetPrimAtPath(CORRIDOR_PERSON_PRIM)
         if prim.IsValid():
-            UsdGeom.Imageable(prim).MakeInvisible()
+            self.stage.RemovePrim(CORRIDOR_PERSON_PRIM)
         self.active = False
-        print("[obstacle_test] corridor person made invisible", flush=True)
+        print("[obstacle_test] corridor person and collider completely removed", flush=True)
 
     def update(self) -> None:
         with self._request_lock:
