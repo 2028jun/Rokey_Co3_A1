@@ -684,7 +684,7 @@ Still broken / follow-up (i.e., Pass 6's actual job):
   design (connected later during full-system integration) -- not a gap to
   fix in this branch.
 
-## Pass 6 -- 2026-07-23 (commit <fill in after committing>)
+## Pass 6 -- 2026-07-23 (commit 68e1413)
 
 Tested:
 - Task 1: opened the real restaurant scene (`lightweight_pizza_restaurant.usda`,
