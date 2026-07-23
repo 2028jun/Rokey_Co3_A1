@@ -847,3 +847,120 @@ Still broken / follow-up:
 - Front/side/overhead close-ups and four-cycle root/body invariance still
   need final capture after the arm endpoint and opposite-arm pose are fixed.
 - This is a useful GPU-tested intermediate revision, not acceptance-complete.
+
+## Pass 8 -- 2026-07-23 (GPU hardware, commit pending)
+
+Tested:
+- Read AGENTS.md, all of GPU_RUN_LOG.txt (passes 1-7), and
+  VISION_TEST_GPU_PROMPT.txt before changing anything, per the prompt's own
+  bootstrap instructions. Found uncommitted, never-rendered work already
+  sitting in the tree from a prior session: a mirrored `LeftArmRig`/
+  `ElbowPivotL` extraction in `assets/rigid_arm_asset.usda`, addressing pass
+  7's "opposite arm still spread" defect via the same static-rig-extraction
+  technique as the reaching arm, with per-arm rest orientation baked
+  directly into the asset (no Python driving needed since it never moves).
+- Built a new, reusable multi-angle visual-QA capture path
+  (`MOBILE_DEMO_CAPTURE_POSES=1` in `mobile_manipulator_demo.py`) that runs
+  the real robot+person+camera setup headlessly, forces `ReachAnimator`
+  through progress 0/0.25/0.5/0.75/1.0, and saves PNGs from the real fixed
+  table camera plus three new free-standing QA cameras (front/side/overhead,
+  aimed from the seat position along/across/above the reach direction) via
+  `omni.kit.viewport.utility`. This is the first pass to actually produce
+  inspectable frames against the prompt's visual-acceptance-criteria list at
+  every stage, rather than judging by angle numbers or only the two
+  endpoints.
+- Ran the real four-terminal `hand_safety` pipeline headlessly (Isaac Sim
+  GUI-less demo + `hand_detector_node`, manual `table_arrived` publish, and
+  direct topic echo/subscription in place of `rqt_image_view` -- no display
+  needed to read topics or save frames) across 16+ real reach cycles, both
+  before and after the ROI fix below.
+
+Changed:
+- `assets/rigid_arm_asset.usda`: kept the new `LeftArmRig`/`ElbowPivotL`
+  static relaxed-arm extraction, fixing criterion 1 (both arms must rest
+  normally) for the previously-untouched left arm.
+- `assets/rigid_arm_asset.usda`: replaced all four `Cone` shoulder/elbow
+  transition prims (`ShoulderSleeveTransition[L]`, `ElbowTransition[L]`)
+  with `Sphere` prims, reverting to pass 5's proven, rotation-invariant
+  design. Root cause found by rendering once with the cones hidden: a cone
+  has a directional pointed apex, so as `RightArmRig`/`ElbowPivot` swing the
+  whole cap assembly with the arm, that point sticks out past the arm/torso
+  silhouette from most viewing angles -- this was the floating spike/disc
+  artifact criterion 2 asked to fix, present at both rest and full reach
+  (i.e. not introduced by this pass's left-arm work; it dates to pass 7's
+  undocumented, never-rendered cone swap, which had no log entry explaining
+  why spheres were replaced and was never visually verified). Sized the new
+  spheres empirically against rendered frames (shoulder 0.065 -> 0.085,
+  elbow held at pass 5's 0.06) since this pass's relaxed hang-at-side rest
+  pose swings the arm much further from the character's bind pose than pass
+  5's context ever exercised, opening a bigger seam than pass 5's 0.065
+  alone covers.
+- `hand_safety/hand_safety/roi_intrusion.py`: replaced
+  `TABLE_ROI_NORMALIZED`. Root cause, found by projecting the reach arm's
+  true (non-orphaned-point) glove mesh world bounding box through the real
+  table camera's own intrinsics/extrinsics: the polygon was still
+  calibrated for pass 1-5's seat/target position (hand at x~535-684,
+  y~236-489 px), but pass 6/7 moved `TABLE_HAND_TARGET`/the seat to the
+  customer-side edge without ever re-measuring the ROI against the new hand
+  position (normalized x=[0.164,0.262], y=[0.332,0.433] -- nowhere near the
+  old x=[0.379,0.586] range). This is why every pass since 6 measured zero
+  ROI-confirmed detections despite the reach itself being geometrically
+  correct all along.
+- `isaacpjt/mobile_manipulator_demo.py`: added `capture_pose_frames()` /
+  `_define_lookat_camera()` / `MOBILE_DEMO_CAPTURE_POSES` (kept -- a
+  reusable diagnostic, instrumented the same env-var-gated way
+  `MOBILE_DEMO_PRINT_BOUNDS` already was) and a `MOBILE_DEMO_HIDE_CONES`
+  debug hook (also kept, cheap and harmless, useful if this cap geometry
+  ever needs re-litigating).
+
+Observed:
+- Visual (all four camera angles, progress 0/0.25/0.5/0.75/1.0 via the new
+  capture path): both arms rest naturally at rest -- no T-pose, no spread
+  arm, symmetric left/right; only the reaching arm moves during a cycle; no
+  visible hole or floating spike at either shoulder or elbow after the
+  sphere fix (small residual: the caps still read as a slightly bulbous
+  ball rather than a seamless joint, see Still broken); the person's whole
+  body stays clearly outside the table and both south-side chairs at every
+  progress value and from the overhead view; no visible hyperextension or
+  backward/sideways elbow bend at rest, mid-reach (0.25/0.5/0.75), or full
+  reach.
+- Numeric (true, non-orphaned-point glove bbox at full reach vs
+  `TABLE_HAND_TARGET`): glove bbox min=(-3.328,-3.356,0.893)
+  max=(-3.191,-3.130,1.074) contains the target (-3.25,-3.33,0.98) -- the
+  reach lands correctly. The "glove is on the chair" impression from a
+  first look at the table-camera render was a parallax illusion specific to
+  that camera's oblique angle: `Chair_00_Visual`'s true world bbox max-x is
+  -3.52, a full 0.19 m away from the glove's min-x of -3.328 -- no actual
+  overlap in world space.
+- Real hardware ROS run, post-ROI-fix: `/hand_safety/roi_intrusion` over a
+  45 s window (multiple full reach cycles): 252 `false` / 46 `true`,
+  cleanly clustered in bursts matching reach cycles (pre-fix, an equivalent
+  window measured 295/295 `false`, zero `true`, confirming the regression
+  was real and reproducible). Captured one confirmed detection directly:
+  confidence 0.884, `confirmed: true` after 3 consecutive frames,
+  `roi_intrusion: true`, bbox [241,339,318,393] px -- matching the
+  projected estimate closely.
+- `MOBILE_DEMO_CAPTURE_POSES` runs took ~19 s end to end (reusing the
+  cached URDF-imported robot USD), cheap enough that it should be the
+  default way to check this actor's pose in future passes instead of a
+  full GUI/ROS round trip.
+
+Still broken / follow-up:
+- The shoulder/elbow sphere caps still read as a visible bulbous ball
+  rather than a seamless joint, especially at the elbow (fabric-material
+  sphere against bare-skin-textured forearm/upper-arm). Same limitation
+  pass 5 already flagged: "a primitive sphere has diminishing returns... a
+  proper fix would replace it with non-primitive, UV-shaped cap geometry."
+  Not attempted this pass -- the hole/spike is fixed, the cosmetic bulge is
+  not.
+- The new QA cameras (front/side/overhead) are ad hoc free-standing cameras
+  aimed heuristically along/across the seat-to-target direction, not
+  officially specified/calibrated views -- good enough to judge pose/joint
+  criteria this pass, but a reviewer wanting an exact "canonical"
+  front/side/overhead framing should treat these as approximate.
+- Did not re-run a live four-cycle root/body-invariance check on hardware
+  this pass (unchanged from pass 6/7's own verification, and the
+  `rigid_arm` mode's translateOp is untouched code this pass); flagging
+  rather than silently assuming it still holds.
+- `HAND_TEST_RIG_MODE=legacy` and `/serving_robot/table_arrived`'s missing
+  real publisher are both unchanged, as in every prior pass.

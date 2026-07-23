@@ -482,6 +482,192 @@ def open_table_camera_preview():
     print("[table camera] preview viewport opened", flush=True)
 
 
+def _define_lookat_camera(stage, path, eye, target, up):
+    """Define a plain UsdGeom.Camera at `path` looking from `eye` at `target`.
+
+    Mirrors the eye/target/up -> SetLookAt(...).GetInverse() recipe already
+    used by attach_fixed_table_depth_camera above (that one composes it
+    through several mount-frame transforms; this one applies it directly in
+    world space since these are free-standing QA cameras, not robot-mounted).
+    """
+    camera = UsdGeom.Camera.Define(stage, path)
+    camera.CreateFocalLengthAttr(24.0)
+    camera.CreateClippingRangeAttr(Gf.Vec2f(0.05, 20.0))
+    camera_to_world = Gf.Matrix4d().SetLookAt(eye, target, up).GetInverse()
+    UsdGeom.Xformable(camera.GetPrim()).MakeMatrixXform().Set(camera_to_world)
+    return camera
+
+
+def capture_pose_frames(stage, reach_animator):
+    """Render the person's rig from four angles at several reach-cycle
+    progress values and save PNGs, so the visual acceptance criteria in
+    VISION_TEST_GPU_PROMPT.txt (body pose / joint realism / cone
+    transitions / clipping) can actually be inspected frame by frame
+    instead of judged from angle numbers alone.
+
+    Gated behind MOBILE_DEMO_CAPTURE_POSES=1; writes into
+    MOBILE_DEMO_CAPTURE_DIR (default /tmp/vision_test_pose_frames) and exits
+    before the interactive loop, the same way MOBILE_DEMO_EXIT_AFTER_READY
+    does.
+    """
+    from omni.kit.viewport.utility import capture_viewport_to_file
+
+    out_dir = Path(
+        os.environ.get("MOBILE_DEMO_CAPTURE_DIR", "/tmp/vision_test_pose_frames")
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    seat = hand_test.SEAT_POSITION
+    target = hand_test.TABLE_HAND_TARGET
+    forward = Gf.Vec3d(target[0] - seat[0], target[1] - seat[1], 0.0)
+    forward = forward / forward.GetLength()
+    right = Gf.Vec3d(-forward[1], forward[0], 0.0)
+    aim = seat + Gf.Vec3d(0.0, 0.0, 1.2 * hand_test.PERSON_SCALE)
+
+    cameras = {
+        "front": (seat + forward * 2.2 + Gf.Vec3d(0, 0, 1.5), aim, Gf.Vec3d(0, 0, 1)),
+        "side": (seat + right * 2.2 + Gf.Vec3d(0, 0, 1.5), aim, Gf.Vec3d(0, 0, 1)),
+        "overhead": (seat + Gf.Vec3d(0, 0, 3.0), aim, forward),
+    }
+    viewports = {}
+    for name, (eye, look_target, up) in cameras.items():
+        cam_path = f"/World/QACamera_{name}"
+        _define_lookat_camera(stage, cam_path, eye, look_target, up)
+        window = create_viewport_for_camera(f"QA_{name}", cam_path, width=1280, height=960)
+        viewports[name] = window.viewport_api
+    table_window = create_viewport_for_camera(
+        "QA_table", TABLE_CAMERA_PATH, width=1280, height=960
+    )
+    viewports["table"] = table_window.viewport_api
+
+    if os.environ.get("MOBILE_DEMO_HIDE_CONES", "0") == "1":
+        for cone_name in (
+            "ShoulderSleeveTransition",
+            "ElbowTransition",
+            "ShoulderSleeveTransitionL",
+            "ElbowTransitionL",
+        ):
+            for prim in stage.Traverse():
+                if prim.GetName() == cone_name and str(prim.GetPath()).startswith(
+                    hand_test.PERSON_PRIM_PATH
+                ):
+                    UsdGeom.Imageable(prim).MakeInvisible()
+                    print(f"[debug] hid {prim.GetPath()}", flush=True)
+
+    def _render_settle(frames=15):
+        for _ in range(frames):
+            simulation_app.update()
+
+    def _capture(progress, views):
+        reach_animator._apply_progress(progress)
+        _render_settle()
+        for view_name in views:
+            path = out_dir / f"progress_{progress:.2f}_{view_name}.png"
+            capture_viewport_to_file(viewports[view_name], str(path))
+            _render_settle(5)
+            print(f"[capture] wrote {path}", flush=True)
+
+    bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
+
+    def _print_bboxes(label_prefix):
+        for label, path in [
+            ("ShoulderSphere", f"{hand_test.ARM_RIG_PATH}/ShoulderSleeveTransition"),
+            ("ElbowSphere", f"{hand_test.ELBOW_PATH}/ElbowTransition"),
+            ("UpperArm_Skin", f"{hand_test.ARM_RIG_PATH}/UpperArm_Skin"),
+            ("UpperArm_Tshirt", f"{hand_test.ARM_RIG_PATH}/UpperArm_Tshirt"),
+        ]:
+            prim = stage.GetPrimAtPath(path)
+            if not prim.IsValid():
+                print(f"[capture][bbox][{label_prefix}] {label}: prim not found at {path}", flush=True)
+                continue
+            world_bbox = bbox_cache.ComputeWorldBound(prim).ComputeAlignedRange()
+            print(
+                f"[capture][bbox][{label_prefix}] {label}: min={tuple(world_bbox.GetMin())} max={tuple(world_bbox.GetMax())}",
+                flush=True,
+            )
+
+    _capture(0.0, ["front", "side", "overhead", "table"])
+    _print_bboxes("rest")
+    _capture(0.25, ["table"])
+    _capture(0.5, ["table"])
+    _capture(0.75, ["table"])
+    _capture(1.0, ["front", "side", "overhead", "table"])
+    _print_bboxes("full_reach")
+
+    for label, path in [
+        ("TableSet_00", "/World/Dining/TableSet_00"),
+        ("Chair_00_Visual", "/World/Dining/TableSet_00/Chair_00_Visual"),
+        ("Chair_01_Visual", "/World/Dining/TableSet_00/Chair_01_Visual"),
+    ]:
+        prim = stage.GetPrimAtPath(path)
+        if not prim.IsValid():
+            print(f"[capture][bbox] {label}: prim not found at {path}", flush=True)
+            continue
+        world_bbox = bbox_cache.ComputeWorldBound(prim).ComputeAlignedRange()
+        print(f"[capture][bbox] {label}: min={tuple(world_bbox.GetMin())} max={tuple(world_bbox.GetMax())}", flush=True)
+    print(f"[capture][target] TABLE_HAND_TARGET={tuple(hand_test.TABLE_HAND_TARGET)}", flush=True)
+
+    # The glove Mesh keeps its full, un-trimmed points array (see the asset
+    # build notes at the bottom of hand_intrusion_test_actor.py), so a plain
+    # BBoxCache bound is polluted by orphaned points never referenced by any
+    # face (e.g. the other hand's vertices). Bound only the points actually
+    # referenced by faceVertexIndices to get the true rendered extent.
+    glove_prim = stage.GetPrimAtPath(f"{hand_test.ELBOW_PATH}/ForearmHand_Glove")
+    glove_mesh = UsdGeom.Mesh(glove_prim)
+    points = glove_mesh.GetPointsAttr().Get()
+    indices = glove_mesh.GetFaceVertexIndicesAttr().Get()
+    used = sorted(set(indices))
+    local_min = Gf.Vec3d(*[min(points[i][a] for i in used) for a in range(3)])
+    local_max = Gf.Vec3d(*[max(points[i][a] for i in used) for a in range(3)])
+    xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+    local_to_world = xform_cache.GetLocalToWorldTransform(glove_prim)
+    corners = [
+        local_to_world.Transform(Gf.Vec3d(x, y, z))
+        for x in (local_min[0], local_max[0])
+        for y in (local_min[1], local_max[1])
+        for z in (local_min[2], local_max[2])
+    ]
+    world_min = Gf.Vec3d(*[min(c[a] for c in corners) for a in range(3)])
+    world_max = Gf.Vec3d(*[max(c[a] for c in corners) for a in range(3)])
+    print(
+        f"[capture][glove_true_bbox] used_points={len(used)}/{len(points)} "
+        f"min={tuple(world_min)} max={tuple(world_max)}",
+        flush=True,
+    )
+
+    table_cam_prim = stage.GetPrimAtPath(TABLE_CAMERA_PATH)
+    table_cam = UsdGeom.Camera(table_cam_prim)
+    cam_to_world = xform_cache.GetLocalToWorldTransform(table_cam_prim)
+    world_to_cam = cam_to_world.GetInverse()
+    focal = table_cam.GetFocalLengthAttr().Get()
+    h_ap = table_cam.GetHorizontalApertureAttr().Get()
+    v_ap = table_cam.GetVerticalApertureAttr().Get()
+
+    def _project_to_normalized(world_point):
+        cam_space = world_to_cam.Transform(world_point)
+        ndc_x = (focal / (h_ap / 2.0)) * (cam_space[0] / -cam_space[2])
+        ndc_y = (focal / (v_ap / 2.0)) * (cam_space[1] / -cam_space[2])
+        return ((ndc_x + 1.0) / 2.0, (1.0 - ndc_y) / 2.0)
+
+    corners = [
+        Gf.Vec3d(x, y, z)
+        for x in (world_min[0], world_max[0])
+        for y in (world_min[1], world_max[1])
+        for z in (world_min[2], world_max[2])
+    ]
+    projected = [_project_to_normalized(c) for c in corners]
+    xs = [p[0] for p in projected]
+    ys = [p[1] for p in projected]
+    print(
+        f"[capture][table_cam] glove_true_bbox (at progress=1.0) projects to "
+        f"normalized x=[{min(xs):.3f},{max(xs):.3f}] y=[{min(ys):.3f},{max(ys):.3f}]",
+        flush=True,
+    )
+
+    reach_animator._apply_progress(0.0)
+    print(f"[capture] done, frames in {out_dir}", flush=True)
+
+
 def find_articulation_root(stage):
     roots = [
         str(prim.GetPath())
@@ -734,6 +920,13 @@ def main():
         print_arm_visual_bounds(stage)
     run_optional_diagnostic(articulation, dof_names)
     run_stability_check(articulation, dof_names)
+
+    if os.environ.get("MOBILE_DEMO_CAPTURE_POSES", "0") == "1":
+        if reach_animator is None:
+            raise RuntimeError("MOBILE_DEMO_CAPTURE_POSES needs MOBILE_DEMO_HAND_TEST=1")
+        capture_pose_frames(stage, reach_animator)
+        simulation_app.close()
+        return
 
     if os.environ.get("MOBILE_DEMO_EXIT_AFTER_READY", "0") == "1":
         simulation_app.close()

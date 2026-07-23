@@ -22,19 +22,29 @@ import numpy as np
 # on the correct instance root (same class of late-edit-not-reaching-Hydra
 # problem as the UsdSkel joint rotation documented in
 # hand_intrusion_test_actor.py) -- see GPU_RUN_LOG.txt pass 3 for the full
-# investigation. Tightening the ROI instead: at 1280x960, the old
-# near-right corner (936, 604) put the polygon's right edge at x=830 by
-# y=632, comfortably overlapping the gripper's box (left edge x=786); the
-# new corner (750, 604) keeps the right edge at x<=760 through that same
-# y-range, clearing the gripper with margin. Confirmed this still covers
-# the actual hand-test reach position (YOLO detected the test character's
-# hand moving through x~535-684, y~236-489 during a reach, all comfortably
-# inside the tightened polygon).
+# investigation. That version covered the reach position of pass 1-5's
+# seat/target (YOLO detected the hand moving through x~535-684, y~236-489).
+#
+# Pass 6/7 later moved the test actor to a standing position behind the
+# customer-side chairs with TABLE_HAND_TARGET on the table's south edge (see
+# hand_intrusion_test_actor.py), which moves the reaching hand to a
+# completely different part of the frame -- but nobody re-measured this
+# polygon against that new position, so roi_intrusion silently never fired
+# for two passes (confirmed this pass: 0 ROI-confirmed detections across
+# 16 real reach cycles on hardware, even though the wrist lands within
+# 1e-16 m of TABLE_HAND_TARGET -- the reach itself was never broken). Directly
+# measured the new hand position by projecting the reach-arm glove mesh's
+# true (non-orphaned-point) world bounding box through this camera's actual
+# intrinsics/extrinsics at full reach: normalized x=[0.164,0.262],
+# y=[0.332,0.433] -- nowhere near the old polygon's x=[0.379,0.586] range.
+# Replaced with a rectangle around that measurement plus margin for
+# detection-box slack; still clear of the gripper false-positive region
+# above (x=[0.614,0.649], y=[0.579,0.757]).
 TABLE_ROI_NORMALIZED = (
-    (0.379, 0.310),
-    (0.547, 0.286),
-    (0.586, 0.629),
-    (0.438, 0.732),
+    (0.10, 0.28),
+    (0.32, 0.28),
+    (0.32, 0.52),
+    (0.10, 0.52),
 )
 
 
