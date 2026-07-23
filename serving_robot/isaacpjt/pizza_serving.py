@@ -1498,14 +1498,32 @@ class TrayPizzaPickPlace:
                 f"gap={self._magnet_gap * 1000.0:.2f}mm",
                 flush=True,
             )
-        position_tolerance = 0.03 if self._phase == 0 else 0.025
-        self._settled_steps = (
-            self._settled_steps + 1
-            if (
+        if self._phase == 0:
+            position_tolerance = 0.03
+        elif self._phase == 9:
+            position_tolerance = 0.04
+        else:
+            position_tolerance = 0.025
+
+        if self._phase == 11:
+            position_delta = wrist_target - ee_position
+            xy_error = float(np.linalg.norm(position_delta[:2]))
+            z_error = abs(float(position_delta[2]))
+            reached = (
+                transition_complete
+                and z_error < 0.02
+                and xy_error < 0.07
+            )
+        else:
+            reached = (
                 transition_complete
                 and error < position_tolerance
                 and bail_angle_reached
             )
+
+        self._settled_steps = (
+            self._settled_steps + 1
+            if reached
             else 0
         )
         if self._settled_steps >= 15:
