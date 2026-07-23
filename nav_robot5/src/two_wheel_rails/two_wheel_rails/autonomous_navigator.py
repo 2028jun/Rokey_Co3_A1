@@ -1,4 +1,4 @@
-"""Nav2 free-path planning replaced with Orthogonal L-Path, Orthogonal A*, and Control-Frame 0.15m Step Docking."""
+"""Nav2 free-path planning replaced with Orthogonal L-Path, Orthogonal A*, and Control-Frame 0.40m Sub-Step Drive & Micro-Docking."""
 
 from __future__ import annotations
 
@@ -35,31 +35,32 @@ DIRECTIONS = [(1, 0), (0, 1), (-1, 0), (0, -1)]
 @dataclass(frozen=True)
 class MotionConfig:
     sample_spacing_m: float = 0.05
-    maximum_cost: int = 50
+    maximum_cost: int = 70
     turn_penalty: float = 8.0
     obstacle_cost_weight: float = 3.0
     corner_replan_attempts: int = 3
     rotation_clearance_radius_m: float = 0.45
 
     dock_approach_distance_m: float = 0.60
-    dock_step_distance_m: float = 0.15
+    dock_step_distance_m: float = 0.08
     dock_max_linear_speed_mps: float = 0.10
-    dock_min_linear_speed_mps: float = 0.04
-    dock_xy_tolerance_m: float = 0.07
-    dock_yaw_tolerance_rad: float = math.radians(3.0)
+    dock_min_linear_speed_mps: float = 0.02
+    dock_xy_tolerance_m: float = 0.03
+    dock_yaw_tolerance_rad: float = math.radians(1.0)
     dock_realign_threshold_rad: float = math.radians(6.0)
 
     rotate_done_rad: float = math.radians(4.0)
-    rotate_reenter_rad: float = math.radians(10.0)
+    rotate_reenter_rad: float = math.radians(5.0)
     final_yaw_tolerance_rad: float = math.radians(4.0)
-    waypoint_tolerance_m: float = 0.12
+    waypoint_tolerance_m: float = 0.16
+    endpoint_crossing_lateral_tolerance_m: float = 0.20
     max_linear_speed_mps: float = 0.22
     min_linear_speed_mps: float = 0.07
     max_angular_speed_rps: float = 0.50
     rotate_gain: float = 1.25
     drive_timeout_base_sec: float = 15.0
     drive_timeout_per_meter_sec: float = 12.0
-    replan_cte_m: float = 0.35
+    replan_cte_m: float = 0.15
     replan_attempts: int = 2
     log_period_sec: float = 1.0
 
@@ -85,6 +86,23 @@ def _point_line_distance(point: Point, start: Point, end: Point) -> float:
     nearest_x = ax + t * dx
     nearest_y = ay + t * dy
     return math.hypot(px - nearest_x, py - nearest_y)
+
+
+def _segment_progress(point: Point, start: Point, end: Point) -> tuple[float, float]:
+    px, py = point
+    ax, ay = start
+    bx, by = end
+    dx = bx - ax
+    dy = by - ay
+    denom = math.hypot(dx, dy)
+    if denom <= 1e-12:
+        return 0.0, math.hypot(px - ax, py - ay)
+    ux = dx / denom
+    uy = dy / denom
+
+    along = (px - ax) * ux + (py - ay) * uy
+    lateral = abs(-(px - ax) * uy + (py - ay) * ux)
+    return along, lateral
 
 
 def remove_near_duplicate_points(points: list[Point], min_dist_m: float = 0.02) -> list[Point]:
@@ -180,7 +198,7 @@ def corner_rotation_is_clear(
 
 
 class SimplifiedPathNavigator:
-    """Orthogonal L-path & A* navigator with strict costmap, control-frame transformation, and 0.15m step docking."""
+    """Orthogonal L-path & A* navigator with strict costmap, control-frame transformation, 0.4m sub-step drive & micro-docking."""
 
     def __init__(self, nav: BasicNavigator, tf_buffer, tracker: AmclPoseTracker) -> None:
         self._nav = nav
@@ -520,8 +538,6 @@ class SimplifiedPathNavigator:
         tolerance = self._cfg.rotate_done_rad if tolerance_rad is None else tolerance_rad
         started = time.monotonic()
         last_log = started
-        cached_map_pose = self._map_pose()
-        map_yaw_deg = math.degrees(cached_map_pose[2]) if cached_map_pose is not None else 0.0
 
         while time.monotonic() - started < 30.0:
             rclpy.spin_once(self._nav, timeout_sec=0.03)
@@ -543,7 +559,7 @@ class SimplifiedPathNavigator:
             if now - last_log >= self._cfg.log_period_sec:
                 print(
                     f"[{label}] rotate ctrl_err={math.degrees(error):.1f}deg (tol={math.degrees(tolerance):.1f}deg) "
-                    f"(ctrl_yaw={math.degrees(pose[2]):.1f}deg, map_yaw={map_yaw_deg:.1f}deg)",
+                    f"(ctrl_yaw={math.degrees(pose[2]):.1f}deg)",
                     flush=True,
                 )
                 last_log = now
@@ -562,9 +578,6 @@ class SimplifiedPathNavigator:
             return False
 
         yaw_offset = normalize_angle(raw_p[2] - map_p[2])
-        map_heading = math.atan2(map_end[1] - map_start[1], map_end[0] - map_start[0])
-        control_target_yaw = normalize_angle(map_heading + yaw_offset)
-
         dx_start = map_start[0] - map_p[0]
         dy_start = map_start[1] - map_p[1]
         dx_end = map_end[0] - map_p[0]
@@ -581,7 +594,7 @@ class SimplifiedPathNavigator:
             raw_p[0] + (c_rot * dx_end - s_rot * dy_end),
             raw_p[1] + (s_rot * dx_end + c_rot * dy_end),
         )
-        length = math.hypot(control_end[0] - control_start[0], control_end[1] - control_start[1])
+        total_length = math.hypot(control_end[0] - control_start[0], control_end[1] - control_start[1])
 
         print(
             f"[{label}] control transform: "
@@ -593,56 +606,83 @@ class SimplifiedPathNavigator:
             flush=True,
         )
 
-        if not self._rotate_to(control_target_yaw, f"{label}:align"):
-            return False
+        max_sub_step_m = 0.40
+        num_sub_steps = max(1, math.ceil(total_length / max_sub_step_m))
 
-        started = time.monotonic()
-        last_log = started
-        timeout = self._cfg.drive_timeout_base_sec + length * self._cfg.drive_timeout_per_meter_sec
-        while time.monotonic() - started < timeout:
-            rclpy.spin_once(self._nav, timeout_sec=0.03)
-            pose = self._motion_pose()
-            if pose is None:
-                continue
-            x, y, yaw = pose
+        for k in range(num_sub_steps):
+            sub_start_r = k / num_sub_steps
+            sub_end_r = (k + 1) / num_sub_steps
 
-            distance = math.hypot(control_end[0] - x, control_end[1] - y)
-            if distance <= self._cfg.waypoint_tolerance_m:
-                self._stop()
-                return True
+            sub_start = (
+                control_start[0] + sub_start_r * (control_end[0] - control_start[0]),
+                control_start[1] + sub_start_r * (control_end[1] - control_start[1]),
+            )
+            sub_end = (
+                control_start[0] + sub_end_r * (control_end[0] - control_start[0]),
+                control_start[1] + sub_end_r * (control_end[1] - control_start[1]),
+            )
+            sub_length = math.hypot(sub_end[0] - sub_start[0], sub_end[1] - sub_start[1])
 
-            heading_error = normalize_angle(control_target_yaw - yaw)
-            if abs(heading_error) >= self._cfg.rotate_reenter_rad:
-                self._stop()
-                if not self._rotate_to(control_target_yaw, f"{label}:realign"):
-                    return False
-                continue
+            cur_p = self._motion_pose()
+            if cur_p is None:
+                return False
+            sub_target_yaw = math.atan2(sub_end[1] - cur_p[1], sub_end[0] - cur_p[0])
 
-            cte = _point_line_distance((x, y), control_start, control_end)
-            if cte > self._cfg.replan_cte_m:
-                self._stop()
-                print(f"[{label}] CTE {cte:.2f}m > limit {self._cfg.replan_cte_m:.2f}m -> segment failed", flush=True)
+            if not self._rotate_to(sub_target_yaw, f"{label}:step{k+1}_align"):
                 return False
 
-            cmd = Twist()
-            cmd.angular.z = 0.0
-            cmd.linear.x = max(
-                self._cfg.min_linear_speed_mps,
-                min(self._cfg.max_linear_speed_mps, 0.55 * distance),
-            )
-            self._publish_cmd(cmd)
+            sub_started = time.monotonic()
+            last_log = sub_started
+            timeout = self._cfg.drive_timeout_base_sec + sub_length * self._cfg.drive_timeout_per_meter_sec
+            brake_margin = 0.02  # 0.02m braking margin
 
-            now = time.monotonic()
-            if now - last_log >= self._cfg.log_period_sec:
-                print(
-                    f"[{label}] drive dist={distance:.2f}m cte={cte:.2f}m "
-                    f"ctrl_err={math.degrees(heading_error):.1f}deg "
-                    f"(ctrl_yaw={math.degrees(yaw):.1f}deg, map_yaw={math.degrees(map_p[2]):.1f}deg)",
-                    flush=True,
+            while time.monotonic() - sub_started < timeout:
+                rclpy.spin_once(self._nav, timeout_sec=0.03)
+                pose = self._motion_pose()
+                if pose is None:
+                    continue
+                x, y, yaw = pose
+
+                distance_to_sub_end = math.hypot(sub_end[0] - x, sub_end[1] - y)
+                distance_to_seg_end = math.hypot(control_end[0] - x, control_end[1] - y)
+                along, lateral_cte = _segment_progress((x, y), control_start, control_end)
+
+                if lateral_cte > self._cfg.replan_cte_m:
+                    self._stop()
+                    print(f"[{label}:step{k+1}] lateral CTE {lateral_cte:.2f}m > limit {self._cfg.replan_cte_m:.2f}m -> segment failed", flush=True)
+                    return False
+
+                if distance_to_sub_end <= (self._cfg.waypoint_tolerance_m + brake_margin) or distance_to_seg_end <= self._cfg.waypoint_tolerance_m:
+                    self._stop()
+                    print(f"[{label}:step{k+1}] sub-step reached (dist={distance_to_sub_end:.3f}m, along={along:.2f}m/{total_length:.2f}m)", flush=True)
+                    break
+
+                if along >= total_length and lateral_cte <= self._cfg.endpoint_crossing_lateral_tolerance_m:
+                    self._stop()
+                    print(f"[{label}] endpoint plane crossed (along={along:.2f}m/{total_length:.2f}m, lateral_cte={lateral_cte:.3f}m)", flush=True)
+                    return True
+
+                cmd = Twist()
+                cmd.angular.z = 0.0
+                cmd.linear.x = max(
+                    self._cfg.min_linear_speed_mps,
+                    min(self._cfg.max_linear_speed_mps, 0.55 * distance_to_sub_end),
                 )
-                last_log = now
-        self._stop()
-        return False
+                self._publish_cmd(cmd)
+
+                now = time.monotonic()
+                if now - last_log >= self._cfg.log_period_sec:
+                    print(
+                        f"[{label}:step{k+1}] drive dist={distance_to_sub_end:.2f}m lateral_cte={lateral_cte:.2f}m "
+                        f"ctrl_err={math.degrees(normalize_angle(sub_target_yaw - yaw)):.1f}deg",
+                        flush=True,
+                    )
+                    last_log = now
+
+            self._stop()
+            self._spin_sleep(0.05)
+
+        return True
 
     def navigate_to(self, goal: PoseStamped, *, label: str = "goal") -> bool:
         if not self._wait_for_navigation_inputs(timeout_sec=8.0):
@@ -695,7 +735,7 @@ class SimplifiedPathNavigator:
 
             break
 
-        print(f"[{label}] approach point reached; starting 0.15m step docking stage", flush=True)
+        print(f"[{label}] approach point reached; starting micro-step docking stage", flush=True)
 
         raw_p = self._motion_pose()
         map_p = self._map_pose()
@@ -718,7 +758,6 @@ class SimplifiedPathNavigator:
             return False
 
         dock_start_time = time.monotonic()
-        step_dist = self._cfg.dock_step_distance_m
 
         while time.monotonic() - dock_start_time < 30.0:
             rclpy.spin_once(self._nav, timeout_sec=0.03)
@@ -733,9 +772,9 @@ class SimplifiedPathNavigator:
             if dist_to_dock <= self._cfg.dock_xy_tolerance_m:
                 self._stop()
                 if abs(yaw_err) <= self._cfg.dock_yaw_tolerance_rad:
-                    print(f"[{label}] docking complete (dist={dist_to_dock:.3f}m, yaw_err={math.degrees(yaw_err):.1f}deg)", flush=True)
+                    print(f"[{label}] docking complete (dist={dist_to_dock:.3f}m, yaw_err={math.degrees(yaw_err):.2f}deg)", flush=True)
                     return True
-                print(f"[{label}] xy reached; performing final strict yaw alignment...", flush=True)
+                print(f"[{label}] xy reached ({dist_to_dock:.3f}m <= 0.03m); performing final strict 1-deg yaw alignment...", flush=True)
                 return self._rotate_to(ctrl_goal_yaw, f"{label}:dock_final_yaw", self._cfg.dock_yaw_tolerance_rad)
 
             if abs(yaw_err) >= self._cfg.dock_realign_threshold_rad:
@@ -745,8 +784,11 @@ class SimplifiedPathNavigator:
                     return False
                 continue
 
+            # Determine step size: 0.08m when dist > 0.20m; 0.03m when dist <= 0.20m
+            step_dist = 0.03 if dist_to_dock <= 0.20 else 0.08
             step_start = (x, y)
             step_target_dist = min(step_dist, dist_to_dock)
+            brake_margin = 0.015  # 0.015m braking margin
             step_started = time.monotonic()
 
             while time.monotonic() - step_started < 10.0:
@@ -759,7 +801,7 @@ class SimplifiedPathNavigator:
                 rem_dist = math.hypot(ctrl_dock_x - p[0], ctrl_dock_y - p[1])
                 cur_yaw_err = normalize_angle(ctrl_goal_yaw - p[2])
 
-                if moved >= step_target_dist or rem_dist <= self._cfg.dock_xy_tolerance_m:
+                if moved >= (step_target_dist - brake_margin) or rem_dist <= self._cfg.dock_xy_tolerance_m:
                     self._stop()
                     break
 
@@ -777,6 +819,9 @@ class SimplifiedPathNavigator:
                     min(self._cfg.dock_max_linear_speed_mps, 0.4 * (step_target_dist - moved)),
                 )
                 self._publish_cmd(cmd)
+
+            self._stop()
+            self._spin_sleep(0.05)
 
         self._stop()
         print(f"[{label}] docking stage timed out", flush=True)
