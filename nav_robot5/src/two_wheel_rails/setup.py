@@ -26,6 +26,7 @@ setup(
     entry_points={
         "console_scripts": [
             "rail_mission = two_wheel_rails.rail_mission:main",
+            "autonomous_mission = two_wheel_rails.autonomous_mission:main",
             "topic_bridge = two_wheel_rails.topic_bridge:main",
         ],
     },
