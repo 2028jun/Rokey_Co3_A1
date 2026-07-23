@@ -21,15 +21,16 @@ dock_realign_threshold_rad: 0.1047197551   # 6 deg
 
 # Motion Control
 rotate_done_rad: 0.0698131701       # 4 deg
-rotate_reenter_rad: 0.1745329252    # 10 deg
+rotate_reenter_rad: 0.0872664626    # 5 deg
 final_yaw_tolerance_rad: 0.0698131701
-waypoint_tolerance_m: 0.12
+waypoint_tolerance_m: 0.16
+endpoint_crossing_lateral_tolerance_m: 0.20
 max_linear_speed_mps: 0.22
 min_linear_speed_mps: 0.07
 max_angular_speed_rps: 0.50
 rotate_gain: 1.25
 drive_timeout_base_sec: 15.0
 drive_timeout_per_meter_sec: 12.0
-replan_cte_m: 0.35
+replan_cte_m: 0.15
 replan_attempts: 2
 log_period_sec: 1.0

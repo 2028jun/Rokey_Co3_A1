@@ -292,9 +292,88 @@ Visualization Manager:
       Show Arrows: true
       Show Axes: true
       Show Names: false
-      Tree: {}
       Update Interval: 0
       Value: false
+    - Alpha: 1
+      Class: rviz_default_plugins/Path
+      Color: 0; 255; 0
+      Enabled: true
+      Line Style: Lines
+      Line Width: 0.05
+      Name: Orthogonal Selected Path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0.05
+      Pose Color: 255; 0; 0
+      Pose Style: None
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /orthogonal_path/selected
+      Value: true
+    - Alpha: 1
+      Class: rviz_default_plugins/Path
+      Color: 255; 165; 0
+      Enabled: true
+      Line Style: Lines
+      Line Width: 0.05
+      Name: Dock Approach
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0.05
+      Pose Color: 255; 0; 0
+      Pose Style: None
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /orthogonal_path/dock_approach
+      Value: true
+    - Alpha: 0.7
+      Class: rviz_default_plugins/Path
+      Color: 0; 255; 255
+      Enabled: true
+      Line Style: Lines
+      Line Width: 0.03
+      Name: L Candidate X First
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0.03
+      Pose Color: 255; 0; 0
+      Pose Style: None
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /orthogonal_path/l_candidate_x_first
+      Value: true
+    - Alpha: 0.7
+      Class: rviz_default_plugins/Path
+      Color: 255; 0; 255
+      Enabled: true
+      Line Style: Lines
+      Line Width: 0.03
+      Name: L Candidate Y First
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0.03
+      Pose Color: 255; 0; 0
+      Pose Style: None
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /orthogonal_path/l_candidate_y_first
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
