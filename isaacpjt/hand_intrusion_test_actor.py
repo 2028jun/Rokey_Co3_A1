@@ -17,44 +17,69 @@ headless). Neither failure applies to a plain, non-skinned Xform hierarchy,
 which is exactly how pass #1's whole-body translate itself worked -- a
 plain `Xformable` translate/orient op update always rendered correctly.
 
-Pass #5 (this one) exploits that: it extracts the character's own right
-upper-arm and forearm+hand geometry (skin + sleeve + glove meshes, split by
-which skeleton joint dominantly influences each vertex) out of the skinned
-mesh entirely and re-parents those pieces under a plain two-bone `Xform`
-chain (`RightArmRig -> ElbowPivot`) that this script drives directly with
+Pass #5 exploited that: it extracts the character's own right upper-arm and
+forearm+hand geometry (skin + sleeve + glove meshes, split by which
+skeleton joint dominantly influences each vertex) out of the skinned mesh
+entirely and re-parents those pieces under a plain two-bone `Xform` chain
+(`RightArmRig -> ElbowPivot`) that this script drives directly with
 `xformOp:orient` quaternions -- no UsdSkel, no Animation Graph, so neither
-of the previously-hit rendering bugs apply. The rest of the body (the
-original skinned character, with the right arm's faces removed so nothing
-overlaps) stays parented under the same seat translate as before.
+of the previously-hit rendering bugs apply. Verified on real hardware in
+pass 5 (shoulder cap + elbow cap spheres added to plug a rotation-swept gap
+at the boundary, see `GPU_RUN_LOG.txt`); the two-bone reach mechanism
+itself is solid.
 
-IMPORTANT: the chair (Chair_01, ~(-2.7,-3.2,0)) sits about 1.4m from
-TABLE_HAND_TARGET in a straight line, and this character's own two-bone arm
-(upper arm + forearm, measured from its own bind pose) only spans ~0.5m
-fully extended. A real arm cannot cover a 1.4m gap by rotating at a fixed
-shoulder -- pass #1's whole-body slide existed for exactly this reason, and
-that physical constraint doesn't go away just because the arm can now bend.
-This pass therefore still leans the whole body most of the way (using the
-same translateOp pass #1 already had), but only as far as leaving the last
-~85% of the arm's own reach to close -- so the elbow visibly bends into a
-natural-looking reach for the final stretch instead of the arm staying
-rigidly glued to the side while the whole body does 100% of the work. The
-lean is computed from the actual SHOULDER position (seat + yawed P_UP), not
-the character root, and still needs to bring the root below its rest Z
-(the target sits well below this standing character's shoulder height) --
-same "sinks toward the table" characteristic pass #1 already documented,
-just less pronounced and now paired with a genuine elbow bend.
+Pass #5 still moved the whole body during every reach (a `translateOp`
+"lean" toward the target, on top of the arm rotation), because Chair_01's
+original seat, ~1.4m from `TABLE_HAND_TARGET` measured from the actual
+shoulder position, is far outside this character's ~0.5m two-bone reach --
+an arm-only reach was geometrically impossible from that seat. Pass #6
+(this one) removes the body motion entirely instead of shrinking it: the
+seat itself has been moved close enough to the table that the arm alone
+(shoulder + elbow rotation only, `SEAT_POSITION` never animates) covers the
+full distance. The character sits still for the entire reach; only
+`RightArmRig`'s and `ElbowPivot`'s `xformOp:orient` change.
 
-The two-bone shoulder/elbow angles and the lean distance are solved
-analytically each reach (`two_bone_ik.solve_two_bone_ik`), not
-baked/measured by hand, so this generalizes to any target position on the
-table without re-tuning. The solver, the extraction pivots, and the full
-lean+arm pipeline were unit-verified against the actual mesh data (see the
-asset-build notes at the bottom of this file) with sub-micron
-reconstruction error; what has NOT been verified is how it actually
-*renders* -- this pass was written and tested in a CPU-only environment
-without Isaac Sim. Confirm the reach visually before trusting this over the
-old whole-body version (env var `HAND_TEST_RIG_MODE=legacy` switches back
-to it).
+IMPORTANT geometric limit, worth understanding before moving the seat
+again: this character is a *standing*-pose asset, so its shoulder
+(`P_UP`) sits 1.44m above its own root regardless of where that root is
+placed, while `TABLE_HAND_TARGET` is only 0.83m up -- a 0.61m vertical gap
+by itself, before any horizontal distance is even considered. Since a
+`rotateZ`-only yaw doesn't change a point's Z, moving the seat's X/Y can
+NEVER close that vertical gap; only `SEAT_TORSO_Z` (i.e. sinking the root)
+can, and this character's two-bone reach (0.496m max, wrist to shoulder --
+see `_ARM_MAX_REACH`) is *less than* that 0.61m vertical gap on its own.
+Concretely: with zero root sink, no seat X/Y position whatsoever brings the
+target in reach. The shipped defaults below use a modest `SEAT_TORSO_Z`
+(-0.20, versus pass 5's worst-case dynamic -0.427) plus moving the seat's
+X/Y much closer to the table (from Chair_01's original ~(-2.7,-3.2) to
+~(-3.34,-2.22) -- close to the table's own footprint) to land at a natural
+~64deg elbow bend with 0.496m*0.85 of the arm's own reach used. This was
+computed from `P_UP`/`TABLE_HAND_TARGET`/bone lengths only, offline,
+without seeing the actual `TableSet_00`/`Chair_01` geometry or whether a
+seat that close visually clips into the table -- **the exact
+`HAND_TEST_SEAT_X`/`HAND_TEST_SEAT_Y`/`HAND_TEST_SEAT_Z` values need eyes
+on the real scene to confirm they don't clip**, this pass's log entry (or a
+follow-up) should record whatever adjustment was actually needed.
+
+The two-bone shoulder/elbow angles are solved analytically once at
+`ReachAnimator` construction (`two_bone_ik.solve_two_bone_ik`), not
+baked/measured by hand, so moving the seat via the env vars above
+re-solves the correct angles automatically -- no code change needed to
+retune. `solve_two_bone_ik` clamps its internal distance to the arm's
+reachable range, so an unreachable seat position doesn't crash; it just
+extends the arm to its max length short of the actual target (watch the
+"shoulder->target distance" log line at startup against `_ARM_MAX_REACH`
+to tell whether the current seat is actually in reach). The solver, the
+extraction pivots, and this seat placement were all unit-verified against
+the actual mesh data (see the asset-build notes at the bottom of this
+file) with sub-micron/near-float-precision error; what has NOT been
+verified is how it actually *renders* -- this pass was written and tested
+in a CPU-only environment without Isaac Sim, same as pass 5 prep was.
+Confirm the reach visually, and specifically confirm the seat doesn't
+visually clip into the table or look out of place, before trusting this
+over pass 5's lean-based version (env var `HAND_TEST_RIG_MODE=legacy`
+still switches all the way back to pass #1-4's original whole-body-slide
+mechanism if this needs A/B debugging).
 
 Usage (opt-in, from mobile_manipulator_demo.py):
 
@@ -114,14 +139,21 @@ TABLE_TOP_Z = 0.73  # collider center z (0.365) + half-height (0.365)
 HAND_TARGET_Z_OFFSET = float(os.environ.get("HAND_TEST_TARGET_Z_OFFSET", "0.10"))
 TABLE_HAND_TARGET = Gf.Vec3d(-3.2, -2.2, TABLE_TOP_Z + HAND_TARGET_Z_OFFSET)
 
-# Chair_01_Visual under TableSet_00: translate=(-2.7, -3.2, 0), rotateZ=180
-# (facing the table).
+# Chair_01_Visual under TableSet_00 was originally at translate=(-2.7,-3.2,0)
+# (pass #1-5), ~1.4m from TABLE_HAND_TARGET measured from the shoulder --
+# out of reach for a static arm-only pose (see module docstring). Moved much
+# closer to the table for pass #6's static-body reach, computed offline from
+# P_UP/TABLE_HAND_TARGET/bone lengths only -- NOT yet confirmed against the
+# real TableSet_00/Chair_01 geometry. This is very likely close enough to
+# the table's own footprint to need a visual nudge on hardware; treat these
+# three env vars as the primary tuning knobs for that, not code changes.
+# rotateZ=180 (facing the table) is unchanged from every prior pass.
 SEAT_XY = (
-    float(os.environ.get("HAND_TEST_SEAT_X", "-2.7")),
-    float(os.environ.get("HAND_TEST_SEAT_Y", "-3.2")),
+    float(os.environ.get("HAND_TEST_SEAT_X", "-3.337")),
+    float(os.environ.get("HAND_TEST_SEAT_Y", "-2.216")),
 )
 SEAT_YAW_DEGREES = float(os.environ.get("HAND_TEST_SEAT_YAW", "180.0"))
-SEAT_TORSO_Z = float(os.environ.get("HAND_TEST_SEAT_Z", "0.0"))
+SEAT_TORSO_Z = float(os.environ.get("HAND_TEST_SEAT_Z", "-0.20"))
 SEAT_POSITION = Gf.Vec3d(SEAT_XY[0], SEAT_XY[1], SEAT_TORSO_Z)
 
 PERSON_PRIM_PATH = "/World/HandSafetyTestActor"
@@ -151,12 +183,6 @@ U1_REST = P_FORE - P_UP  # shoulder -> elbow, upper-arm bone (~0.276m)
 U2_REST = P_HAND - P_FORE  # elbow -> wrist, forearm bone (~0.219m)
 _ARM_MAX_REACH = U1_REST.GetLength() + U2_REST.GetLength()
 
-# How much of the arm's own max reach to use for the final stretch (leaves
-# some elbow bend rather than locking the arm straight at 100%); the rest
-# of the seat-to-target gap is covered by the body lean below. Purely a
-# look/feel knob -- lower values lean the body more and bend the arm less.
-REACH_EXTENSION_RATIO = float(os.environ.get("HAND_TEST_REACH_EXTENSION_RATIO", "0.85"))
-
 # Pole hint biases the elbow to bend downward/forward, matching how a
 # seated person's elbow drops when reaching onto a table in front of them
 # rather than winging out to the side. Purely a disambiguator for the IK's
@@ -166,27 +192,24 @@ POLE_HINT_LOCAL_OFFSET = Gf.Vec3d(0.3, 0.0, -1.0)
 _seat_yaw_rotation = Gf.Rotation(Gf.Vec3d(0, 0, 1), SEAT_YAW_DEGREES)
 
 
-def _compute_lean_and_arm_target():
-    """Split the seat-to-target gap between a body lean (this actor's own
-    translateOp, same mechanism pass #1 used) and the two-bone arm's own
-    reach, so the arm ends up genuinely bent rather than fully extended or
-    doing nothing. Returns (lean_target_world, arm_target_local) -- the
-    person-root translate value at full reach progress, and the IK target
-    for the arm expressed in the character's own root frame (matching
-    P_UP/U1_REST/U2_REST's frame).
+def _solve_static_arm_target():
+    """Solve the two-bone IK target once against the STATIC `SEAT_POSITION`
+    -- no body motion is involved this pass, unlike pass 5's per-frame lean.
+    Returns the IK target expressed in the character's own root frame
+    (matching P_UP/U1_REST/U2_REST's frame). Logs the shoulder-to-target
+    distance against `_ARM_MAX_REACH` so an unreachable `SEAT_POSITION` is
+    obvious at startup instead of silently producing a fully-extended arm
+    that stops short of the table.
     """
-    shoulder_world_at_rest = _seat_yaw_rotation.TransformDir(P_UP) + SEAT_POSITION
-    d_vec = TABLE_HAND_TARGET - shoulder_world_at_rest
-    d_total = d_vec.GetLength()
-    target_arm_reach = REACH_EXTENSION_RATIO * _ARM_MAX_REACH
-    lean_distance = max(0.0, d_total - target_arm_reach)
-    lean_dir_world = d_vec.GetNormalized() if d_total > 1e-9 else Gf.Vec3d(0, 0, 0)
-    lean_target_world = SEAT_POSITION + lean_dir_world * lean_distance
-
-    arm_target_local = _seat_yaw_rotation.GetInverse().TransformDir(
-        TABLE_HAND_TARGET - lean_target_world
+    shoulder_world = _seat_yaw_rotation.TransformDir(P_UP) + SEAT_POSITION
+    distance = (TABLE_HAND_TARGET - shoulder_world).GetLength()
+    print(
+        f"[hand_test] shoulder->target distance={distance:.3f}m "
+        f"(arm max reach={_ARM_MAX_REACH:.3f}m, "
+        f"{'REACHABLE' if distance <= _ARM_MAX_REACH else 'OUT OF REACH -- move the seat closer via HAND_TEST_SEAT_X/Y/Z'})",
+        flush=True,
     )
-    return lean_target_world, arm_target_local
+    return _seat_yaw_rotation.GetInverse().TransformDir(TABLE_HAND_TARGET - SEAT_POSITION)
 
 
 def spawn_seated_person(stage):
@@ -255,11 +278,12 @@ def _smoothstep(t: float) -> float:
 
 
 class ReachAnimator:
-    """Drives the body lean (person root translateOp) and the two-bone
-    right-arm rig together, between rest and an IK-solved reach pose, on a
-    randomized 5-10s period. Call update() once per simulation_app frame;
-    timing is wall-clock (time.time()), matching this demo's non-headless
-    real-time frame pacing.
+    """Drives only the two-bone right-arm rig (shoulder + elbow rotation)
+    between rest and an IK-solved reach pose, on a randomized 5-10s period.
+    The body/seat never moves this pass -- `SEAT_POSITION` is authored once
+    in `spawn_seated_person` and never touched again. Call update() once per
+    simulation_app frame; timing is wall-clock (time.time()), matching this
+    demo's non-headless real-time frame pacing.
     """
 
     def __init__(self, prim):
@@ -274,18 +298,16 @@ class ReachAnimator:
             self._init_legacy(prim)
             return
 
-        self.translate_op = UsdGeom.Xformable(prim).GetOrderedXformOps()[0]
         self.shoulder_op = _get_orient_op(self.stage, ARM_RIG_PATH)
         self.elbow_op = _get_orient_op(self.stage, ELBOW_PATH)
 
-        self.lean_target_world, arm_target_local = _compute_lean_and_arm_target()
+        arm_target_local = _solve_static_arm_target()
         pole_hint_local = P_UP + POLE_HINT_LOCAL_OFFSET
         self.reach_shoulder_rot, self.reach_elbow_rot, elbow_pos = solve_two_bone_ik(
             P_UP, arm_target_local, U1_REST, U2_REST, pole_hint_local
         )
         print(
-            f"[hand_test] lean target={tuple(self.lean_target_world)} "
-            f"(seat={tuple(SEAT_POSITION)}), "
+            f"[hand_test] static seat={tuple(SEAT_POSITION)}, "
             f"shoulder_angle={self.reach_shoulder_rot.GetAngle():.1f}deg, "
             f"elbow_angle={self.reach_elbow_rot.GetAngle():.1f}deg",
             flush=True,
@@ -300,9 +322,7 @@ class ReachAnimator:
         return 1.0 - _smoothstep(retract_elapsed / REACH_TRAVEL_SECONDS)
 
     def _apply_progress(self, progress: float) -> None:
-        position = SEAT_POSITION + (self.lean_target_world - SEAT_POSITION) * progress
-        self.translate_op.Set(position)
-
+        # No body/seat motion this pass -- only the two rotate ops move.
         # Interpolating from the identity rotation to a target rotation R by
         # scaling R's own axis-angle by `progress` IS the slerp from
         # identity to R (there's no "shortest path" ambiguity to resolve
@@ -447,24 +467,43 @@ _LEGACY_PERSON_USD = os.environ.get(
 #    before solving "rotate the forearm's rest direction onto it" --
 #    using the raw world-space direction directly (skipping that inverse)
 #    gives a plausible-looking but wrong pose.
-# 7. First cut of this pass held the body fully fixed at SEAT_POSITION and
+# 7. Pass 5 prep's first cut held the body fully fixed at SEAT_POSITION and
 #    only rotated the arm -- verification caught that Chair_01 sits ~1.4m
 #    from TABLE_HAND_TARGET (measured from the actual shoulder position,
 #    not the root) while this character's own two-bone reach is only
 #    ~0.5m, so an arm-only reach cannot possibly work here regardless of
-#    IK correctness. `_compute_lean_and_arm_target()` now splits the gap:
-#    body leans until only REACH_EXTENSION_RATIO (0.85) of the arm's max
-#    reach remains, and the arm covers that remainder. Full pipeline
-#    (lean translate + shoulder rotate + elbow rotate, exactly as
-#    authored in spawn_seated_person/ReachAnimator) was re-verified to
-#    land the hand-marker on TABLE_HAND_TARGET to float precision.
+#    IK correctness. Pass 5's shipped version instead leaned the body (a
+#    `translateOp` animated per reach) to close most of that gap, letting
+#    the arm cover only the last ~15%. Verified on hardware in pass 5 (see
+#    GPU_RUN_LOG.txt): the two-bone mechanism itself rendered and detected
+#    correctly, but the body still visibly moved every reach, which pass 6
+#    was asked to eliminate.
+# 8. Pass 6: removed the per-reach body lean entirely and moved the SEAT
+#    itself (SEAT_XY/SEAT_TORSO_Z) close enough that a static arm-only pose
+#    reaches the target -- `_solve_static_arm_target()` solves the IK once
+#    against the fixed SEAT_POSITION, `ReachAnimator` never touches a
+#    translateOp for `rigid_arm` mode. Re-verified end to end against a
+#    synthetic hand marker exactly as pass 5 prep did: lands on
+#    TABLE_HAND_TARGET to ~1e-16 error at 113.5 deg shoulder / 64.4 deg
+#    elbow, using the shipped SEAT_POSITION default. Found and documented a
+#    hard geometric limit while deriving that default (see the module
+#    docstring's "IMPORTANT" paragraph): this standing-pose character's
+#    shoulder sits 1.44m up regardless of seat X/Y, so the 0.61m vertical
+#    gap to the 0.83m target alone exceeds the arm's 0.496m max reach --
+#    moving the seat's X/Y can only ever close the *horizontal* component,
+#    never that vertical one, so some `SEAT_TORSO_Z` sink is unavoidable
+#    for a fully static pose with this character. Chose a modest -0.20m
+#    (vs. pass 5's worst-case dynamic -0.427m) plus enough of an X/Y move
+#    that the seat now sits close to the table's own footprint -- NOT
+#    verified against the actual TableSet_00/Chair_01 mesh (no Isaac Sim
+#    access this pass either), flagged prominently for hardware follow-up.
 #
-# What is NOT verified (needs Isaac Sim / a GPU): whether the extracted
-# geometry actually looks right when rendered (seams at the shoulder/elbow
-# boundary, whether the removed-face gap in the body is visible, whether
-# YOLO's hand-detection confidence on the re-parented glove mesh matches
-# the ~0.88 seen on the original skinned version, and how the residual
-# body lean/sink -- still ~0.7-1.0m depending on REACH_EXTENSION_RATIO --
-# actually looks in motion). Set HAND_TEST_RIG_MODE=legacy to compare
-# directly against the old whole-body mechanism if the new rig looks wrong.
+# What is NOT verified (needs Isaac Sim / a GPU): whether the moved seat
+# position visually clips into the table, chairs, or looks out of place;
+# whether the fully-static body (no lean at all now) still looks natural at
+# a permanent -0.20m sink versus pass 5's brief dynamic one; and whether
+# YOLO's hand-detection confidence/ROI gating (both already confirmed good
+# in pass 5 on the rig mechanism itself) are unaffected by the new seat
+# position. Set HAND_TEST_RIG_MODE=legacy to compare directly against the
+# original whole-body mechanism if this pass's static pose looks wrong.
 # ----------------------------------------------------------------------

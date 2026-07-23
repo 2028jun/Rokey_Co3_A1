@@ -591,3 +591,95 @@ Still broken / follow-up:
   fallback rather than removing it, even though `rigid_arm` is now fit to
   be the shipped default (materially better reach motion, comparable
   detection confidence, clean gating).
+
+## Pass 6 prep -- 2026-07-23 (CPU-only environment, no Isaac Sim/GPU access)
+
+This is prep work, not a hardware pass -- nothing below is confirmed to
+render correctly on real hardware yet. See `VISION_TEST_GPU_PROMPT.md`'s
+current revision for the actual Pass 6 task this sets up. Two pieces of
+reviewer feedback on pass 5 drove this: (1) `/serving_robot/table_arrived`
+has no real publisher by design -- it's connected later during full-system
+integration, not part of this branch's own testing scope, so pass 5's
+"gap" finding there needs no fix; (2) the pass-5 rig still visibly moves
+the whole body during every reach (the lean), which needs to go away
+entirely -- the person should stay seated and still, with only the arm
+joints animating.
+
+Changed (offline only, none yet run on GPU):
+- `isaacpjt/hand_intrusion_test_actor.py`: removed the per-reach body lean
+  (`_compute_lean_and_arm_target()`/`REACH_EXTENSION_RATIO` deleted
+  entirely). `ReachAnimator` no longer touches a `translateOp` at all for
+  `rigid_arm` mode -- `SEAT_POSITION` is authored once in
+  `spawn_seated_person` and never animated again; only
+  `RightArmRig`/`ElbowPivot`'s `xformOp:orient` move. Added
+  `_solve_static_arm_target()`, which solves the two-bone IK once against
+  the fixed seat and logs the shoulder-to-target distance against the
+  arm's max reach at startup, so an unreachable seat position is an
+  obvious log line instead of a silently-short reach.
+- `isaacpjt/hand_intrusion_test_actor.py`: moved the default seat
+  (`SEAT_XY`/`SEAT_TORSO_Z`, still fully overridable via
+  `HAND_TEST_SEAT_X`/`Y`/`Z`) from Chair_01's original ~(-2.7,-3.2,0) to
+  ~(-3.337,-2.216,-0.20) -- close enough to the table that a fully static
+  arm-only pose actually reaches `TABLE_HAND_TARGET`. See "Observed" below
+  for why this had to move this much and the hard geometric limit found
+  while deriving it.
+- `HAND_TEST_RIG_MODE=legacy` untouched, still available as a fallback.
+
+Observed (offline, both analytic and via the same manual-rasterizer
+technique pass 5 prep used -- see that entry for why: pip `usd-core` has
+no Hydra/`UsdImagingGL`, so no real renderer is available without Isaac
+Sim):
+- A pure arm-only reach from Chair_01's *original* seat is not just
+  "harder to reach naturally", it is mathematically impossible regardless
+  of how the IK or seat X/Y is tuned: this character is a standing-pose
+  asset, so its shoulder (`P_UP`) sits 1.44m above its own root no matter
+  where that root is placed, while `TABLE_HAND_TARGET` is 0.83m up -- a
+  0.61m vertical gap that a `rotateZ`-only yaw can never reduce (yaw
+  around Z doesn't change Z), and this character's own two-bone reach
+  (0.496m, wrist to shoulder) is *less than* that 0.61m vertical gap by
+  itself. Moving the seat's X/Y alone, at any distance, cannot close it;
+  some `SEAT_TORSO_Z` sink is unavoidable for a fully static pose with
+  this specific character.
+- Given that constraint, chose the least-sink configuration that still
+  reads as a natural elbow bend rather than a fully-locked-straight arm:
+  `SEAT_TORSO_Z=-0.20` (recall pass 5's dynamic lean had reached -0.427 at
+  its worst) plus enough `SEAT_XY` displacement toward the table that the
+  arm covers the remaining distance at 85% of its own max reach, landing
+  a 113.5deg shoulder / 64.4deg elbow angle -- re-verified against a
+  synthetic hand marker in the identical Shoulder->Elbow hierarchy used by
+  the real rig: lands on `TABLE_HAND_TARGET` to ~1e-16 error. The
+  resulting `SEAT_XY`, ~(-3.337,-2.216), sits close to `TABLE_HAND_TARGET`
+  itself, ~(-3.2,-2.2) -- close enough to the table's own footprint that
+  it may visually clip into the table or another chair once the real
+  `TableSet_00` geometry is visible; this was derived purely from
+  `P_UP`/bone lengths/`TABLE_HAND_TARGET`, not from seeing the actual
+  scene, and is the single most important thing for the next GPU pass to
+  check and correct via `HAND_TEST_SEAT_X`/`Y`/`Z` if wrong.
+- Re-ran the manual wireframe render from pass 5 prep with a camera held
+  at a FIXED world-space position (not re-centered per frame, unlike pass
+  5 prep's renders) across rest and full-reach progress specifically to
+  make body movement visible if it existed: the torso/head silhouette is
+  pixel-identical between the two frames; only the arm moves. This is the
+  offline evidence that the lean removal actually worked as intended,
+  though it's still a crude non-Isaac-Sim rasterizer, not a real render.
+
+Still broken / follow-up (i.e., Pass 6's actual job):
+- Nothing above has been confirmed with Isaac Sim's real renderer. The
+  single highest-priority check is whether the new seat position
+  (~(-3.337,-2.216,-0.20)) visually clips into the table, another chair,
+  or otherwise looks physically wrong against the real `TableSet_00`
+  geometry -- adjust via `HAND_TEST_SEAT_X`/`Y`/`Z` if so (no code change
+  needed; `_solve_static_arm_target()` re-solves the IK angles
+  automatically for whatever seat position is set).
+- Whether a permanently-static -0.20m root sink (as opposed to pass 5's
+  brief, reach-only dynamic sink) reads as an acceptable "seated" posture
+  or looks like the character is sunk into the floor/chair the whole time,
+  now that it's no longer transient.
+- Detection confidence and `roi_intrusion` gating were already confirmed
+  good against the two-bone rig mechanism itself in pass 5 and are not the
+  focus this pass (per explicit reviewer direction -- motion correctness
+  is what needs judging on hardware this time, not detection, which the
+  reviewer will judge by eye in the simulation directly).
+- `/serving_robot/table_arrived` still has no publisher in this repo, by
+  design (connected later during full-system integration) -- not a gap to
+  fix in this branch.
