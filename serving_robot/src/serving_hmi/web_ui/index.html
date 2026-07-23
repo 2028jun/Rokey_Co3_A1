@@ -302,8 +302,16 @@
                             <i class="fa-solid fa-hand-slash"></i> 손 제거 (Remove)
                         </button>
                     </div>
+                    <div class="test-btn-group" style="margin-top: 6px;">
+                        <button class="test-btn spawn" onclick="setObstacleTestVisible(true)">
+                            <i class="fa-solid fa-user"></i> 사람 스폰 (Spawn)
+                        </button>
+                        <button class="test-btn remove" onclick="setObstacleTestVisible(false)">
+                            <i class="fa-solid fa-user-slash"></i> 사람 제거 (Remove)
+                        </button>
+                    </div>
                     <div class="test-status-info">
-                        <span>손 서비스 상태: <strong id="hand-service-status">대기 중</strong></span>
+                        <span>테스트 서비스 상태: <strong id="test-service-status">대기 중</strong></span>
                     </div>
                 </div>
             </section>

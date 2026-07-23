@@ -139,6 +139,7 @@ class HMIBridgeNode(Node):
         )
         self.manager_reset_client = self.create_client(Trigger, '/manager/reset_fault')
         self.hand_test_client = self.create_client(SetBool, '/hand_test/set_visible')
+        self.obstacle_test_client = self.create_client(SetBool, '/obstacle_test/set_visible')
         if ORDER_REQUEST_SRV_AVAILABLE:
             self.manager_order_client = self.create_client(OrderRequest, '/manager/order')
             self.get_logger().info("Manager /manager/order Service Client created.")
@@ -159,6 +160,16 @@ class HMIBridgeNode(Node):
         req.data = visible
         self.hand_test_client.call_async(req)
         return True, f"hand spawn visible={visible} request queued"
+
+    def set_obstacle_test_visible(self, visible: bool):
+        if not hasattr(self, 'obstacle_test_client'):
+            return False, "obstacle_test_client not initialized"
+        if not self.obstacle_test_client.service_is_ready():
+            return False, "/obstacle_test/set_visible service is not ready"
+        req = SetBool.Request()
+        req.data = visible
+        self.obstacle_test_client.call_async(req)
+        return True, f"corridor person spawn visible={visible} request queued"
 
     def table_camera_callback(self, msg):
         try:
@@ -664,6 +675,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     if ros_node:
                         sent, msg = ros_node.set_hand_test_visible(visible)
                         print(f"[HMI Backend] SET HAND TEST VISIBLE ({visible}): {msg}", flush=True)
+
+                elif msg_type == "SET_OBSTACLE_TEST_VISIBLE":
+                    visible = bool(data.get("visible", False))
+                    if ros_node:
+                        sent, msg = ros_node.set_obstacle_test_visible(visible)
+                        print(f"[HMI Backend] SET OBSTACLE TEST VISIBLE ({visible}): {msg}", flush=True)
 
                 elif msg_type == "RESET_FAULT":
                     if ros_node:

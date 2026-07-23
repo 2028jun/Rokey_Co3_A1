@@ -1130,10 +1130,16 @@ class NavBridge(Node):
         self.create_subscription(
             Int32, "/navigation/trigger", self._on_navigation_trigger, qos
         )
+        self._obstacle_test_controller = None
         self.create_service(
             SetBool,
             "/hand_test/set_visible",
             self._on_hand_test_set_visible,
+        )
+        self.create_service(
+            SetBool,
+            "/obstacle_test/set_visible",
+            self._on_obstacle_test_set_visible,
         )
 
         if TaskCommand is not None:
@@ -1202,6 +1208,22 @@ class NavBridge(Node):
         )
         return response
 
+    def set_obstacle_test_controller(self, controller):
+        self._obstacle_test_controller = controller
+
+    def _on_obstacle_test_set_visible(self, request, response):
+        controller = self._obstacle_test_controller
+        if controller is None:
+            response.success = False
+            response.message = "corridor obstacle test controller is not ready"
+            return response
+        controller.request_visible(bool(request.data))
+        response.success = True
+        response.message = (
+            "corridor person spawn queued" if request.data else "corridor person removal queued"
+        )
+        return response
+
     def _archive_delivered_payloads(self, payload_paths):
         """Preserve a visual-only snapshot without moving live physics prims."""
         table_id = self._completed_delivery_table
@@ -1263,14 +1285,12 @@ class NavBridge(Node):
         cmd = request.command
         self.get_logger().info(f"📥 [FoodSpawn] Received /food_spawn/command: {cmd}")
         response.success = True
-
-        def run_spawn():
-            self.spawn_status_pub.publish(Int32(data=1))  # 1 = WORKING
-            time.sleep(0.3)
-            with self._lock:
-                self._pending_food_spawn = int(cmd)
-
-        threading.Thread(target=run_spawn, daemon=True).start()
+        # The simulation loop services this callback, then performs the USD
+        # mutation from tick().  Do not publish or change bridge state from a
+        # detached worker while Isaac's native plugins are updating.
+        self.spawn_status_pub.publish(Int32(data=1))  # 1 = WORKING
+        with self._lock:
+            self._pending_food_spawn = int(cmd)
         return response
 
     def _on_arm_trigger(self, msg: Int32):
@@ -2415,8 +2435,6 @@ def main():
     bridge = NavBridge(articulation, dof_names, stage)
     executor = SingleThreadedExecutor()
     executor.add_node(bridge)
-    spin_thread = threading.Thread(target=executor.spin, name="nav_ros_spin", daemon=True)
-    spin_thread.start()
 
     timeline = omni.timeline.get_timeline_interface()
     if not timeline.is_playing():
@@ -2448,12 +2466,36 @@ def main():
         except Exception as exc:
             print(f"[hand_test] actor setup warning: {exc}", flush=True)
 
+    obstacle_person_controller = None
+    if os.environ.get("MOBILE_DEMO_OBSTACLE_TEST", "1") == "1":
+        try:
+            import corridor_obstacle_test_actor as obstacle_test
+            obstacle_person_controller = obstacle_test.CorridorPersonSpawnController(stage)
+            bridge.set_obstacle_test_controller(obstacle_person_controller)
+            print(
+                "[obstacle_test] enabled service-controlled corridor person test: "
+                "/obstacle_test/set_visible",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[obstacle_test] actor setup warning: {exc}", flush=True)
+
     try:
         while simulation_app.is_running():
             simulation_app.update()
+            # Serialize ROS callbacks with Isaac/PhysX access.  A background
+            # executor could receive the manager's follow-up command while
+            # tick() was publishing navigation completion, corrupting native
+            # rclpy/Fast DDS state and terminating with "stack smashing".
+            executor.spin_once(timeout_sec=0.0)
             if reach_animator is not None:
                 try:
                     reach_animator.update()
+                except Exception:
+                    pass
+            if obstacle_person_controller is not None:
+                try:
+                    obstacle_person_controller.update()
                 except Exception:
                     pass
             sim_time = timeline.get_current_time()
