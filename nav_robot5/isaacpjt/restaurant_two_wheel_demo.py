@@ -1,11 +1,12 @@
-"""Isaac Sim 5.1 restaurant + two-wheel Ridgeback bridge for nav_robot5.
+"""Isaac Sim 5.1 restaurant + two-wheel Ridgeback bridge & Physics Stage Executor for nav_robot5.
 
-Publishes raw scan/odometry for the ROS-side bridge, a monotonic /clock, and
-applies /cmd_vel to the two physical drive-wheel joints.
+Publishes raw scan/odometry, monotonic /clock, receives /two_wheel/stage_command,
+runs physics-tick level axis/pivot/docking/recovery stage execution, and applies wheel actions.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
@@ -65,6 +66,7 @@ import rclpy
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
+from std_msgs.msg import String as StringMsg
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -120,6 +122,8 @@ BASE_LINK_NAME = "ridgeback_base_link"
 RAW_ODOM_TOPIC = "/two_wheel/odom_raw"
 RAW_SCAN_TOPIC = "/two_wheel/scan_raw"
 TELEPORT_TOPIC = "/two_wheel/teleport"
+STAGE_CMD_TOPIC = "/two_wheel/stage_command"
+STAGE_STATUS_TOPIC = "/two_wheel/stage_status"
 CMD_TIMEOUT_SEC = 0.75
 
 LIDAR_MIN_RANGE = 0.20
@@ -144,6 +148,14 @@ def yaw_to_quat(yaw: float) -> Gf.Quatf:
         0.0,
         float(math.sin(yaw * 0.5)),
     )
+
+
+def normalize_angle(angle: float) -> float:
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    while angle < -math.pi:
+        angle += 2.0 * math.pi
+    return angle
 
 
 def open_restaurant_and_robot():
@@ -225,7 +237,6 @@ def configure_physics_stability(stage, articulation_path: str):
 
 
 def configure_wheel_contact_material(stage):
-    """Give drive wheels traction and let the passive casters swivel freely."""
     tire = UsdShade.Material.Define(stage, "/World/PhysicsMaterials/Nav5Tire")
     tire_api = UsdPhysics.MaterialAPI.Apply(tire.GetPrim())
     tire_api.CreateStaticFrictionAttr(TIRE_STATIC_FRICTION)
@@ -316,6 +327,230 @@ def initialize_robot(articulation_path: str):
     return articulation, dof_names
 
 
+class PhysicsStageExecutor:
+    """Integrated Isaac Physics Tick Stage Controller for Axis, Pivot, Micro-Docking & Recovery."""
+
+    def __init__(self, node: DiffNavBridge):
+        self.node = node
+        self.active_stage = None
+        self.stage_state = "idle"  # idle, running, completed, failed, cancelled
+        self.start_time = 0.0
+        self.dock_settle_count = 0
+        self.recovery_count = 0
+        self.recovery_sub_state = None
+        self.recovery_start_pose = None
+        self.recovery_start_time = 0.0
+        self.zero_ticks_count = 0
+
+    def handle_command(self, payload: dict):
+        kind = payload.get("kind")
+        mission_id = payload.get("mission_id", "")
+        sequence = payload.get("sequence", 0)
+
+        if kind == "cancel":
+            print(f"[stage_executor] cancel command received for mission={mission_id}", flush=True)
+            self.active_stage = None
+            self.stage_state = "cancelled"
+            self.node.publish_stage_status(mission_id, sequence, "cancelled", 0.0)
+            return
+
+        self.active_stage = {
+            "mission_id": mission_id,
+            "sequence": sequence,
+            "kind": kind,
+            "target_value": float(payload.get("target_value", 0.0)),
+            "target_yaw": float(payload.get("target_yaw", 0.0)),
+            "max_speed": float(payload.get("max_speed", 0.22)),
+            "position_tolerance": float(payload.get("position_tolerance", 0.05)),
+        }
+        self.stage_state = "running"
+        self.start_time = time.monotonic()
+        self.dock_settle_count = 0
+        self.recovery_count = 0
+        self.recovery_sub_state = None
+        self.zero_ticks_count = 0
+
+        self.node.publish_stage_status(mission_id, sequence, "accepted", 0.0)
+        print(
+            f"[stage_executor] {kind} accepted: mission={mission_id} seq={sequence} "
+            f"target_val={self.active_stage['target_value']:.3f} target_yaw={math.degrees(self.active_stage['target_yaw']):.1f}deg",
+            flush=True,
+        )
+
+    def tick(self, x: float, y: float, yaw: float) -> tuple[float, float]:
+        if self.active_stage is None or self.stage_state != "running":
+            return 0.0, 0.0
+
+        stage = self.active_stage
+        kind = stage["kind"]
+        mission_id = stage["mission_id"]
+        sequence = stage["sequence"]
+        target_val = stage["target_value"]
+        target_yaw = stage["target_yaw"]
+        max_speed = stage["max_speed"]
+        pos_tol = stage["position_tolerance"]
+
+        now = time.monotonic()
+        elapsed = now - self.start_time
+
+        # Timeout Checks
+        timeout_limit = 60.0
+        if kind in ("axis_x", "axis_y"):
+            timeout_limit = 15.0 + 12.0 * abs(target_val - (x if kind == "axis_x" else y))
+        elif kind == "pivot":
+            timeout_limit = 20.0
+
+        if elapsed > timeout_limit:
+            print(f"[stage_executor] {kind} timeout after {elapsed:.1f}s", flush=True)
+            self.stage_state = "failed"
+            self.node.publish_stage_status(mission_id, sequence, "failed", 0.0, reason="timeout")
+            self.active_stage = None
+            return 0.0, 0.0
+
+        vx, wz = 0.0, 0.0
+
+        if kind in ("axis_x", "axis_y"):
+            axis = x if kind == "axis_x" else y
+            error = target_val - axis
+            yaw_err = normalize_angle(target_yaw - yaw)
+
+            if abs(error) <= pos_tol:
+                if self.zero_ticks_count < 2:
+                    self.zero_ticks_count += 1
+                    return 0.0, 0.0
+                self.stage_state = "completed"
+                print(f"[stage_executor] {kind} completed: error={error:.3f}m (tol={pos_tol:.3f}m)", flush=True)
+                self.node.publish_stage_status(mission_id, sequence, "completed", abs(error))
+                self.active_stage = None
+                return 0.0, 0.0
+
+            direction = 1.0 if error >= 0.0 else -1.0
+            requested = min(abs(max_speed), max(0.045, abs(error) * 0.8))
+            vx = math.copysign(requested, direction)
+            wz = max(-0.28, min(0.28, 1.6 * yaw_err))
+
+        elif kind == "pivot":
+            yaw_err = normalize_angle(target_yaw - yaw)
+
+            if abs(yaw_err) <= math.radians(2.0):
+                if self.zero_ticks_count < 2:
+                    self.zero_ticks_count += 1
+                    return 0.0, 0.0
+                self.stage_state = "completed"
+                print(f"[stage_executor] pivot completed: yaw_err={math.degrees(yaw_err):.2f}deg", flush=True)
+                self.node.publish_stage_status(mission_id, sequence, "completed", abs(yaw_err))
+                self.active_stage = None
+                return 0.0, 0.0
+
+            vx = 0.0
+            raw_wz = max(-0.65, min(0.65, 1.8 * yaw_err))
+            if abs(raw_wz) < 0.18:
+                raw_wz = math.copysign(0.18, yaw_err)
+            wz = raw_wz
+
+        elif kind == "dock":
+            # Docking & Recovery State Machine
+            ctrl_dock_x = target_val
+            ctrl_dock_y = target_val  # Target encoded
+            ctrl_goal_yaw = target_yaw
+
+            dx = ctrl_dock_x - x
+            dy = ctrl_dock_y - y
+
+            forward_error = math.cos(ctrl_goal_yaw) * dx + math.sin(ctrl_goal_yaw) * dy
+            lateral_error = -math.sin(ctrl_goal_yaw) * dx + math.cos(ctrl_goal_yaw) * dy
+            yaw_err = normalize_angle(ctrl_goal_yaw - yaw)
+            dist_to_dock = math.hypot(dx, dy)
+
+            # Lateral Recovery Trigger
+            if self.recovery_sub_state is None and abs(lateral_error) > 0.05 and abs(forward_error) < 0.10:
+                if self.recovery_count < 3:
+                    self.recovery_count += 1
+                    self.recovery_sub_state = "recovery_backout"
+                    self.recovery_start_pose = (x, y, yaw)
+                    self.recovery_start_time = now
+                    print(f"[stage_executor] docking recovery_backout attempt={self.recovery_count}/3", flush=True)
+                else:
+                    print(f"[stage_executor] docking recovery limit exceeded", flush=True)
+
+            if self.recovery_sub_state == "recovery_backout":
+                vx = -0.06
+                wz = 0.0
+                if self.recovery_start_pose is not None:
+                    moved = math.hypot(x - self.recovery_start_pose[0], y - self.recovery_start_pose[1])
+                    if moved >= 0.50 or (now - self.recovery_start_time) > 8.0:
+                        self.recovery_sub_state = "recovery_align"
+                        self.recovery_start_time = now
+                        print(f"[stage_executor] docking recovery_align", flush=True)
+                return vx, wz
+
+            elif self.recovery_sub_state == "recovery_align":
+                target_entry_yaw = math.atan2(ctrl_dock_y - y, ctrl_dock_x - x)
+                e_yaw = normalize_angle(target_entry_yaw - yaw)
+                if abs(e_yaw) <= math.radians(2.0) or (now - self.recovery_start_time) > 6.0:
+                    self.recovery_sub_state = "recovery_reapproach"
+                    self.recovery_start_time = now
+                    print(f"[stage_executor] docking recovery_reapproach", flush=True)
+                    return 0.0, 0.0
+                vx = 0.0
+                raw_wz = max(-0.5, min(0.5, 1.8 * e_yaw))
+                wz = math.copysign(0.18, e_yaw) if abs(raw_wz) < 0.18 else raw_wz
+                return vx, wz
+
+            elif self.recovery_sub_state == "recovery_reapproach":
+                rem = math.hypot(ctrl_dock_x - x, ctrl_dock_y - y)
+                if rem <= 0.15 or (now - self.recovery_start_time) > 8.0:
+                    self.recovery_sub_state = "recovery_final_align"
+                    self.recovery_start_time = now
+                    print(f"[stage_executor] docking recovery_final_align", flush=True)
+                    return 0.0, 0.0
+                vx = min(0.08, 0.4 * rem)
+                wz = 0.0
+                return vx, wz
+
+            elif self.recovery_sub_state == "recovery_final_align":
+                e_yaw = normalize_angle(ctrl_goal_yaw - yaw)
+                if abs(e_yaw) <= math.radians(2.0) or (now - self.recovery_start_time) > 6.0:
+                    self.recovery_sub_state = None
+                    print(f"[stage_executor] docking recovery complete; resuming docking loop", flush=True)
+                    return 0.0, 0.0
+                vx = 0.0
+                raw_wz = max(-0.5, min(0.5, 1.8 * e_yaw))
+                wz = math.copysign(0.18, e_yaw) if abs(raw_wz) < 0.18 else raw_wz
+                return vx, wz
+
+            # Normal Docking Forward/Lateral/Yaw Control
+            position_ok = (dist_to_dock <= 0.04)
+            yaw_ok = (abs(yaw_err) <= math.radians(2.0))
+
+            if position_ok and yaw_ok:
+                self.dock_settle_count += 1
+                if self.dock_settle_count >= 30:
+                    self.stage_state = "completed"
+                    print(f"[stage_executor] docking completed: dist={dist_to_dock:.3f}m yaw_err={math.degrees(yaw_err):.2f}deg", flush=True)
+                    self.node.publish_stage_status(mission_id, sequence, "completed", dist_to_dock)
+                    self.active_stage = None
+                    return 0.0, 0.0
+                return 0.0, 0.0
+            else:
+                self.dock_settle_count = 0
+
+                linear_cmd = max(-0.04, min(0.08, 0.45 * forward_error))
+                if abs(linear_cmd) < 0.015 and abs(forward_error) > 0.004:
+                    linear_cmd = math.copysign(0.015, forward_error)
+
+                raw_wz = max(-0.20, min(0.20, 1.8 * yaw_err + 1.4 * lateral_error))
+                needs_corr = (abs(yaw_err) > math.radians(0.8) or abs(lateral_error) > 0.02)
+                if needs_corr and abs(raw_wz) < 0.04:
+                    direction_source = raw_wz if abs(raw_wz) > 1e-6 else yaw_err
+                    raw_wz = math.copysign(0.04, direction_source)
+
+                vx = linear_cmd
+                wz = raw_wz
+
+        return vx, wz
+
+
 class DiffNavBridge(Node):
     def __init__(self, articulation, dof_names):
         super().__init__("nav_robot_isaac_bridge")
@@ -345,22 +580,49 @@ class DiffNavBridge(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
         )
-        # Nav2 velocity_smoother publishes its final command on /cmd_vel.
-        # Subscribing to cmd_vel_nav as well races raw and smoothed commands.
-        self.create_subscription(Twist, "cmd_vel", self._on_cmd_vel, qos)
         self.create_subscription(
             PoseStamped, TELEPORT_TOPIC, self._on_teleport, qos
+        )
+        self.create_subscription(
+            StringMsg, STAGE_CMD_TOPIC, self._on_stage_command, qos
         )
 
         self.odom_pub = self.create_publisher(Odometry, RAW_ODOM_TOPIC, qos)
         self.scan_pub = self.create_publisher(LaserScan, RAW_SCAN_TOPIC, 10)
         self.clock_pub = self.create_publisher(Clock, "/clock", qos)
+        self.stage_status_pub = self.create_publisher(StringMsg, STAGE_STATUS_TOPIC, qos)
 
-    def _on_cmd_vel(self, msg: Twist):
-        with self._lock:
-            self._target_vx = float(msg.linear.x)
-            self._target_wz = float(msg.angular.z)
-            self._last_cmd_time = time.monotonic()
+        self.stage_executor = PhysicsStageExecutor(self)
+
+    def _on_stage_command(self, msg: StringMsg):
+        try:
+            payload = json.loads(msg.data)
+            with self._lock:
+                self.stage_executor.handle_command(payload)
+        except Exception as exc:
+            print(f"[bridge] failed to parse stage command JSON: {exc}", flush=True)
+
+    def publish_stage_status(self, mission_id: str, sequence: int, state: str, error: float, reason: str | None = None):
+        position, orientation = self.articulation.get_world_pose()
+        x = float(position[0])
+        y = float(position[1])
+        yaw = quaternion_to_yaw(orientation)
+
+        data = {
+            "mission_id": mission_id,
+            "sequence": sequence,
+            "state": state,
+            "error": round(error, 4),
+            "x": round(x, 4),
+            "y": round(y, 4),
+            "yaw": round(yaw, 4),
+        }
+        if reason:
+            data["reason"] = reason
+
+        msg = StringMsg()
+        msg.data = json.dumps(data)
+        self.stage_status_pub.publish(msg)
 
     def _on_teleport(self, msg: PoseStamped):
         x = float(msg.pose.position.x)
@@ -424,8 +686,6 @@ class DiffNavBridge(Node):
         angle_min = -math.pi
         angle_increment = (2.0 * math.pi) / LIDAR_SAMPLES
         query = omni.physx.get_physx_scene_query_interface()
-        # Start just outside the front face of the 0.84 m-long base. Starting
-        # at base center makes every closest hit the robot's own collision.
         sensor_forward = 0.48
         origin = (
             x + sensor_forward * math.cos(yaw),
@@ -470,12 +730,9 @@ class DiffNavBridge(Node):
         now = time.monotonic()
         dt = 1.0 / 120.0
 
+        # Run Physics Stage Executor directly in Isaac Physics Tick
         with self._lock:
-            target_vx = self._target_vx
-            target_wz = self._target_wz
-            if now - self._last_cmd_time > CMD_TIMEOUT_SEC:
-                target_vx = 0.0
-                target_wz = 0.0
+            target_vx, target_wz = self.stage_executor.tick(x, y, yaw)
 
         self._cmd_vx = self._slew(
             self._cmd_vx, target_vx, LINEAR_ACCEL_LIMIT, LINEAR_DECEL_LIMIT, dt
@@ -508,8 +765,6 @@ class DiffNavBridge(Node):
         self.clock_pub.publish(clock)
         self._publish_scan(stamp, sim_time_sec, x, y, yaw)
 
-        # Absolute Isaac pose is intentionally raw. The ROS-side bridge rebases
-        # it after spawn/teleport and owns the odom->base transform.
         odom = Odometry()
         odom.header.stamp = stamp
         odom.header.frame_id = "world"
@@ -553,9 +808,6 @@ def main():
         flush=True,
     )
 
-    # The restaurant USD has a very short looping timeline range. Reading
-    # timeline.get_current_time() therefore jumps backwards every few frames.
-    # Maintain one monotonic ROS simulation clock, as Nav2/TF require.
     sim_time = 0.0
     sim_dt = 1.0 / 60.0
     try:
