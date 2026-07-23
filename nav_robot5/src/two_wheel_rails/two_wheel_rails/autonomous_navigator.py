@@ -15,6 +15,7 @@ from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as NavPath
 from nav2_simple_commander.robot_navigator import BasicNavigator
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
 from two_wheel_rails.nav_bootstrap import (
     AmclPoseTracker,
@@ -38,7 +39,7 @@ class MotionConfig:
     turn_penalty: float = 8.0
     obstacle_cost_weight: float = 3.0
     corner_replan_attempts: int = 3
-    rotation_clearance_radius_m: float = 0.60
+    rotation_clearance_radius_m: float = 0.45
 
     dock_approach_distance_m: float = 0.60
     dock_step_distance_m: float = 0.15
@@ -205,9 +206,16 @@ class SimplifiedPathNavigator:
             20,
         )
 
-        self._pub_l_candidates = nav.create_publisher(NavPath, "/orthogonal_path/l_candidates", 1)
-        self._pub_selected = nav.create_publisher(NavPath, "/orthogonal_path/selected", 1)
-        self._pub_dock_approach = nav.create_publisher(NavPath, "/orthogonal_path/dock_approach", 1)
+        path_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+
+        self._pub_l_cand_x = nav.create_publisher(NavPath, "/orthogonal_path/l_candidate_x_first", path_qos)
+        self._pub_l_cand_y = nav.create_publisher(NavPath, "/orthogonal_path/l_candidate_y_first", path_qos)
+        self._pub_selected = nav.create_publisher(NavPath, "/orthogonal_path/selected", path_qos)
+        self._pub_dock_approach = nav.create_publisher(NavPath, "/orthogonal_path/dock_approach", path_qos)
 
     def _on_costmap(self, msg: OccupancyGrid) -> None:
         self._costmap = msg
@@ -235,6 +243,49 @@ class SimplifiedPathNavigator:
         for _ in range(8):
             self._publish_cmd(stop)
             rclpy.spin_once(self._nav, timeout_sec=0.03)
+
+    def _spin_sleep(self, duration_sec: float) -> None:
+        deadline = time.monotonic() + duration_sec
+        while time.monotonic() < deadline:
+            rclpy.spin_once(self._nav, timeout_sec=0.03)
+
+    def _wait_for_navigation_inputs(self, timeout_sec: float = 8.0) -> bool:
+        started = time.monotonic()
+        last_log = 0.0
+
+        while time.monotonic() - started < timeout_sec:
+            rclpy.spin_once(self._nav, timeout_sec=0.03)
+
+            costmap_ready = self._costmap is not None
+            raw_odom_ready = self._control_pose is not None
+
+            if costmap_ready and raw_odom_ready:
+                map_pose = self._map_pose()
+                if map_pose is not None:
+                    print(
+                        "[auto] navigation inputs ready: costmap=OK raw_odom=OK map_pose=OK",
+                        flush=True,
+                    )
+                    return True
+
+            now = time.monotonic()
+            if now - last_log >= 1.0:
+                print(
+                    "[auto] waiting for navigation inputs: "
+                    f"costmap={'OK' if costmap_ready else 'WAIT'} "
+                    f"raw_odom={'OK' if raw_odom_ready else 'WAIT'}",
+                    flush=True,
+                )
+                last_log = now
+
+        print(
+            "[auto] navigation input timeout: "
+            f"costmap={self._costmap is not None} "
+            f"raw_odom={self._control_pose is not None} "
+            f"map_pose={self._map_pose() is not None}",
+            flush=True,
+        )
+        return False
 
     def _map_pose(self) -> tuple[float, float, float] | None:
         xy = resolve_map_xy(self._nav, self._tf, self._tracker)
@@ -372,7 +423,6 @@ class SimplifiedPathNavigator:
         first_w = cell_to_world(path_cells[0])
         last_w = cell_to_world(path_cells[-1])
 
-        # Strictly orthogonal connector at start and goal to eliminate tiny diagonal segments
         raw_pts = [
             start,
             (first_w[0], start[1]),
@@ -400,20 +450,14 @@ class SimplifiedPathNavigator:
 
     def _plan_orthogonal_path(self, start: Point, goal: Point) -> list[Point]:
         if self._costmap is None:
-            print("[auto] waiting for /global_costmap/costmap topic...", flush=True)
-            wait_start = time.monotonic()
-            while self._costmap is None and time.monotonic() - wait_start < 5.0:
-                rclpy.spin_once(self._nav, timeout_sec=0.1)
-
-        if self._costmap is None:
             raise RuntimeError("global costmap (/global_costmap/costmap) has not been received yet")
 
         # Step 1 & 2: Evaluate 2 L-shaped candidates
         l_cands = make_l_candidates(start, goal)
-        all_cand_pts = []
-        for c in l_cands:
-            all_cand_pts.extend(c)
-        self._publish_rviz_path(self._pub_l_candidates, all_cand_pts)
+        if len(l_cands) >= 1:
+            self._publish_rviz_path(self._pub_l_cand_x, l_cands[0])
+        if len(l_cands) >= 2:
+            self._publish_rviz_path(self._pub_l_cand_y, l_cands[1])
 
         best_cand = None
         best_score = float("inf")
@@ -463,7 +507,6 @@ class SimplifiedPathNavigator:
             center_col = int(math.floor((invalid_corner[0] - ox) / res))
             center_row = int(math.floor((invalid_corner[1] - oy) / res))
 
-            # Expand forbidden area around uncleared corner by rotation_clearance_radius_m
             for dr in range(-rad_cells, rad_cells + 1):
                 for dc in range(-rad_cells, rad_cells + 1):
                     if math.hypot(dr, dc) <= rad_cells:
@@ -510,7 +553,12 @@ class SimplifiedPathNavigator:
     def _drive_segment(self, map_start: Point, map_end: Point, label: str) -> bool:
         map_p = self._map_pose()
         raw_p = self._motion_pose()
-        if map_p is None or raw_p is None:
+
+        if map_p is None:
+            print(f"[{label}] segment rejected: map pose unavailable", flush=True)
+            return False
+        if raw_p is None:
+            print(f"[{label}] segment rejected: /two_wheel/odom_raw not received", flush=True)
             return False
 
         yaw_offset = normalize_angle(raw_p[2] - map_p[2])
@@ -534,6 +582,16 @@ class SimplifiedPathNavigator:
             raw_p[1] + (s_rot * dx_end + c_rot * dy_end),
         )
         length = math.hypot(control_end[0] - control_start[0], control_end[1] - control_start[1])
+
+        print(
+            f"[{label}] control transform: "
+            f"map_start=({map_start[0]:.2f},{map_start[1]:.2f}) "
+            f"map_end=({map_end[0]:.2f},{map_end[1]:.2f}) "
+            f"ctrl_start=({control_start[0]:.2f},{control_start[1]:.2f}) "
+            f"ctrl_end=({control_end[0]:.2f},{control_end[1]:.2f}) "
+            f"yaw_offset={math.degrees(yaw_offset):.1f}deg",
+            flush=True,
+        )
 
         if not self._rotate_to(control_target_yaw, f"{label}:align"):
             return False
@@ -587,6 +645,10 @@ class SimplifiedPathNavigator:
         return False
 
     def navigate_to(self, goal: PoseStamped, *, label: str = "goal") -> bool:
+        if not self._wait_for_navigation_inputs(timeout_sec=8.0):
+            print(f"[{label}] navigation aborted: required inputs are unavailable", flush=True)
+            return False
+
         gx = goal.pose.position.x
         gy = goal.pose.position.y
         q = goal.pose.orientation
@@ -614,7 +676,7 @@ class SimplifiedPathNavigator:
             except RuntimeError as exc:
                 print(f"[{label}] orthogonal planning failed (attempt {attempt}): {exc}", flush=True)
                 if attempt < self._cfg.replan_attempts:
-                    time.sleep(0.5)
+                    self._spin_sleep(0.5)
                     continue
                 return False
 
@@ -627,7 +689,7 @@ class SimplifiedPathNavigator:
 
             if failed:
                 if attempt < self._cfg.replan_attempts:
-                    time.sleep(0.5)
+                    self._spin_sleep(0.5)
                     continue
                 return False
 
@@ -652,11 +714,9 @@ class SimplifiedPathNavigator:
         ctrl_dock_x = raw_p[0] + (c_rot * dx_map - s_rot * dy_map)
         ctrl_dock_y = raw_p[1] + (s_rot * dx_map + c_rot * dy_map)
 
-        # 1. Initial Rotate with strict dock yaw tolerance
         if not self._rotate_to(ctrl_goal_yaw, f"{label}:dock_align", self._cfg.dock_yaw_tolerance_rad):
             return False
 
-        # 2. Incremental 0.15m Step Docking Loop
         dock_start_time = time.monotonic()
         step_dist = self._cfg.dock_step_distance_m
 
@@ -685,7 +745,6 @@ class SimplifiedPathNavigator:
                     return False
                 continue
 
-            # Execute 1 incremental step of 0.15m
             step_start = (x, y)
             step_target_dist = min(step_dist, dist_to_dock)
             step_started = time.monotonic()
