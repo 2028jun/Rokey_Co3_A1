@@ -466,28 +466,11 @@ def attach_front_rplidar_ros2(stage):
 
 
 def add_parking_brake(stage, articulation_path):
-    brake_prim = stage.GetPrimAtPath("/World/NavRobot/ParkingBrake")
-    if not brake_prim.IsValid():
-        joint = UsdPhysics.FixedJoint.Define(stage, "/World/NavRobot/ParkingBrake")
-        joint.CreateBody1Rel().SetTargets([Sdf.Path(articulation_path)])
-        base_prim = stage.GetPrimAtPath(articulation_path)
-        if base_prim.IsValid():
-            transform = UsdGeom.XformCache().GetLocalToWorldTransform(base_prim)
-            base_position = transform.ExtractTranslation()
-            base_rotation = transform.ExtractRotationQuat()
-            imag = base_rotation.GetImaginary()
-            joint.CreateLocalPos0Attr().Set(Gf.Vec3f(*map(float, base_position)))
-            joint.CreateLocalRot0Attr().Set(Gf.Quatf(float(base_rotation.GetReal()), Gf.Vec3f(*map(float, imag))))
-            joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
-            joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
-            print("[mobile robot] parking brake=on (fixed base via UsdPhysics.FixedJoint)", flush=True)
+    pass
 
 
 def remove_parking_brake(stage):
-    brake_prim = stage.GetPrimAtPath("/World/NavRobot/ParkingBrake")
-    if brake_prim.IsValid():
-        stage.RemovePrim("/World/NavRobot/ParkingBrake")
-        print("[mobile robot] parking brake=off (unlocked base)", flush=True)
+    pass
 
 
 def open_restaurant_and_robot():
