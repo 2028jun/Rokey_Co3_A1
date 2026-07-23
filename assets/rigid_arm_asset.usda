@@ -47,34 +47,15 @@ def Xform "Root" (
         double3 xformOp:translate = (-0.19073455810546874, 0.06624944686889649, 1.43966064453125)
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
 
-        # Pass 5 hardware fix: a sphere centered exactly on this Xform's own
-        # pivot (the shoulder joint) is invariant under any xformOp:orient
-        # rotation applied to this same Xform, so it plugs the torso's
-        # armhole opening at every reach angle instead of only at rest --
-        # a rigid two-piece (non-skinned) shoulder has no other way to stay
-        # sealed through a ~115deg reach rotation. Radius covers the
-        # upper-arm's own cross-section with margin.
-        def Sphere "ShoulderCap"
+        # Tapered sleeve transition overlaps the torso armhole and upper arm.
+        # Unlike the old pivot sphere, its silhouette reads as clothing.
+        def Cone "ShoulderSleeveTransition"
         {
-            # Hardware testing showed the false "hand" detection this cap
-            # caused (see below) is driven by its projected SIZE/shape, not
-            # material color -- switching material alone (0.105, fabric)
-            # left the same static ~54x56px bbox at ~0.4-0.6 confidence, and
-            # 0.085 only pushed it to a borderline ~0.40-0.56 (still above
-            # the 0.40 confidence threshold often enough to matter). Shrunk
-            # further to sit clearly under threshold; trades a somewhat
-            # larger cosmetic seam (still only visible during an active
-            # reach, not at rest) for reliably not registering as a hand.
-            double radius = 0.065
-            # Fabric, not skin: the real shoulder joint sits under the
-            # tshirt's short sleeve, so this is the anatomically correct
-            # material anyway -- and hardware testing found a skin-toned
-            # cap here got misdetected as a second "hand" by YOLO at a
-            # fixed ~0.4-0.7 confidence throughout every reach (bbox
-            # stayed static near the shoulder while the real hand bbox
-            # moved), a new false positive this fix must not introduce
-            # (same class of bug pass 3 fixed for the RG2 gripper, just
-            # self-inflicted this time).
+            double height = 0.12
+            double radius = 0.058
+            float xformOp:rotateY = 90
+            double3 xformOp:translate = (0.025, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateY"]
             rel material:binding = </Root/male_adult_construction_01/Looks/opaque__fabric__tshirt>
         }
 
@@ -114,12 +95,15 @@ def Xform "Root" (
             double3 xformOp:translate = (-0.27621589660644535, 0.0013567495346069325, -0.005702972412109375)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
 
-            # Same shoulder-cap trick, applied at the elbow pivot (see
-            # RightArmRig/ShoulderCap above for why a pivot-centered sphere
-            # is the fix). Smaller radius matching the slimmer forearm.
-            def Sphere "ElbowCap"
+            # Tapered skin transition overlaps both rigid segments without
+            # exposing the old ball-joint silhouette.
+            def Cone "ElbowTransition"
             {
-                double radius = 0.06
+                double height = 0.10
+                double radius = 0.048
+                float xformOp:rotateY = 90
+                double3 xformOp:translate = (0.025, 0, 0)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateY"]
                 rel material:binding = </Root/male_adult_construction_01/Looks/opaque__organic__whitemaleskin>
             }
 
@@ -155,4 +139,3 @@ def Xform "Root" (
         }
     }
 }
-

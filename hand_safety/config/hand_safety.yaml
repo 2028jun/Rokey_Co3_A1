@@ -5,7 +5,8 @@ hand_detector_node:
     detections_topic: /hand_detection/detections
     roi_intrusion_topic: /hand_safety/roi_intrusion
     table_arrived_topic: /serving_robot/table_arrived
-    model_path: src/hand_safety/models/YOLOv10n_hands.pt
+    # model_path is intentionally omitted: the node resolves the model from
+    # the installed hand_safety package, independent of the current directory.
     # The rendered table-2 hand measures about 0.44-0.77 across live frames.
     # ROI cropping/filtering rejects the stronger robot-arm candidate.
     confidence: 0.40
@@ -23,6 +24,6 @@ hand_detector_node:
     device: "0"
     process_rate: 30.0
     confirmation_frames: 3
-    # Large debug images and OpenCV HighGUI can make the process appear hung.
-    publish_annotated_image: false
+    # ROS-native annotated output is the primary observable workflow.
+    publish_annotated_image: true
     show_window: false

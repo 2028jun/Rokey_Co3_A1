@@ -136,8 +136,15 @@ RIG_MODE = os.environ.get("HAND_TEST_RIG_MODE", "rigid_arm")  # or "legacy"
 # this workspace.
 TABLE_COLLIDER_CENTER = Gf.Vec3d(-3.2, -2.2, 0.365)
 TABLE_TOP_Z = 0.73  # collider center z (0.365) + half-height (0.365)
-HAND_TARGET_Z_OFFSET = float(os.environ.get("HAND_TEST_TARGET_Z_OFFSET", "0.10"))
-TABLE_HAND_TARGET = Gf.Vec3d(-3.2, -2.2, TABLE_TOP_Z + HAND_TARGET_Z_OFFSET)
+HAND_TARGET_Z_OFFSET = float(os.environ.get("HAND_TEST_TARGET_Z_OFFSET", "0.25"))
+# Customer-side intrusion point: still over the real tabletop, but close
+# enough to its south edge for a person standing behind Chair_01 to reach
+# without entering the table footprint.
+TABLE_HAND_TARGET = Gf.Vec3d(
+    float(os.environ.get("HAND_TEST_TARGET_X", "-3.25")),
+    float(os.environ.get("HAND_TEST_TARGET_Y", "-3.33")),
+    TABLE_TOP_Z + HAND_TARGET_Z_OFFSET,
+)
 
 # Chair_01_Visual under TableSet_00 was originally at translate=(-2.7,-3.2,0)
 # (pass #1-5), ~1.4m from TABLE_HAND_TARGET measured from the shoulder --
@@ -149,11 +156,12 @@ TABLE_HAND_TARGET = Gf.Vec3d(-3.2, -2.2, TABLE_TOP_Z + HAND_TARGET_Z_OFFSET)
 # three env vars as the primary tuning knobs for that, not code changes.
 # rotateZ=180 (facing the table) is unchanged from every prior pass.
 SEAT_XY = (
-    float(os.environ.get("HAND_TEST_SEAT_X", "-3.337")),
-    float(os.environ.get("HAND_TEST_SEAT_Y", "-2.216")),
+    float(os.environ.get("HAND_TEST_SEAT_X", "-3.40")),
+    float(os.environ.get("HAND_TEST_SEAT_Y", "-3.58")),
 )
 SEAT_YAW_DEGREES = float(os.environ.get("HAND_TEST_SEAT_YAW", "180.0"))
-SEAT_TORSO_Z = float(os.environ.get("HAND_TEST_SEAT_Z", "-0.20"))
+SEAT_TORSO_Z = float(os.environ.get("HAND_TEST_SEAT_Z", "0.0"))
+PERSON_SCALE = float(os.environ.get("HAND_TEST_PERSON_SCALE", "0.85"))
 SEAT_POSITION = Gf.Vec3d(SEAT_XY[0], SEAT_XY[1], SEAT_TORSO_Z)
 
 PERSON_PRIM_PATH = "/World/HandSafetyTestActor"
@@ -201,15 +209,22 @@ def _solve_static_arm_target():
     obvious at startup instead of silently producing a fully-extended arm
     that stops short of the table.
     """
-    shoulder_world = _seat_yaw_rotation.TransformDir(P_UP) + SEAT_POSITION
+    shoulder_world = (
+        _seat_yaw_rotation.TransformDir(P_UP * PERSON_SCALE) + SEAT_POSITION
+    )
     distance = (TABLE_HAND_TARGET - shoulder_world).GetLength()
     print(
         f"[hand_test] shoulder->target distance={distance:.3f}m "
-        f"(arm max reach={_ARM_MAX_REACH:.3f}m, "
-        f"{'REACHABLE' if distance <= _ARM_MAX_REACH else 'OUT OF REACH -- move the seat closer via HAND_TEST_SEAT_X/Y/Z'})",
+        f"(scaled arm max reach={_ARM_MAX_REACH * PERSON_SCALE:.3f}m, "
+        f"{'REACHABLE' if distance <= _ARM_MAX_REACH * PERSON_SCALE else 'OUT OF REACH -- move the seat/target or adjust scale'})",
         flush=True,
     )
-    return _seat_yaw_rotation.GetInverse().TransformDir(TABLE_HAND_TARGET - SEAT_POSITION)
+    return (
+        _seat_yaw_rotation.GetInverse().TransformDir(
+            TABLE_HAND_TARGET - SEAT_POSITION
+        )
+        / PERSON_SCALE
+    )
 
 
 def spawn_seated_person(stage):
@@ -252,10 +267,13 @@ def spawn_seated_person(stage):
     translate_op.Set(SEAT_POSITION)
     rotate_op = xformable.AddRotateZOp(precision=UsdGeom.XformOp.PrecisionDouble)
     rotate_op.Set(SEAT_YAW_DEGREES)
+    scale_op = xformable.AddScaleOp(precision=UsdGeom.XformOp.PrecisionDouble)
+    scale_op.Set(Gf.Vec3d(PERSON_SCALE))
     print(
         f"[hand_test] spawned rig={RIG_ASSET_USD if RIG_MODE != 'legacy' else _LEGACY_PERSON_USD} "
         f"(mode={RIG_MODE}) at {PERSON_PRIM_PATH}, "
-        f"seat={tuple(SEAT_POSITION)} yaw={SEAT_YAW_DEGREES}",
+        f"standing_position={tuple(SEAT_POSITION)} yaw={SEAT_YAW_DEGREES} "
+        f"scale={PERSON_SCALE} target={tuple(TABLE_HAND_TARGET)}",
         flush=True,
     )
     return prim
@@ -306,6 +324,17 @@ class ReachAnimator:
         self.reach_shoulder_rot, self.reach_elbow_rot, elbow_pos = solve_two_bone_ik(
             P_UP, arm_target_local, U1_REST, U2_REST, pole_hint_local
         )
+        # A relaxed arm alongside the right hip replaces the extracted
+        # character's identity/T-pose. Only this arm transitions to reach.
+        rest_target_local = P_UP + Gf.Vec3d(-0.10, 0.02, -0.38)
+        self.rest_shoulder_rot, self.rest_elbow_rot, _ = solve_two_bone_ik(
+            P_UP,
+            rest_target_local,
+            U1_REST,
+            U2_REST,
+            P_UP + Gf.Vec3d(0.0, -0.35, -0.4),
+        )
+        self._apply_progress(0.0)
         print(
             f"[hand_test] static seat={tuple(SEAT_POSITION)}, "
             f"shoulder_angle={self.reach_shoulder_rot.GetAngle():.1f}deg, "
@@ -328,14 +357,31 @@ class ReachAnimator:
         # identity to R (there's no "shortest path" ambiguity to resolve
         # when one endpoint is identity), so this needs no quaternion
         # slerp helper.
+        if progress <= 0.0:
+            shoulder_pose = self.rest_shoulder_rot
+            elbow_pose = self.rest_elbow_rot
+            self.shoulder_op.Set(Gf.Quatd(shoulder_pose.GetQuat()))
+            self.elbow_op.Set(Gf.Quatd(elbow_pose.GetQuat()))
+            return
+        if progress >= 1.0:
+            shoulder_pose = self.reach_shoulder_rot
+            elbow_pose = self.reach_elbow_rot
+            self.shoulder_op.Set(Gf.Quatd(shoulder_pose.GetQuat()))
+            self.elbow_op.Set(Gf.Quatd(elbow_pose.GetQuat()))
+            return
+
+        shoulder_delta = self.rest_shoulder_rot.GetInverse() * self.reach_shoulder_rot
+        elbow_delta = self.rest_elbow_rot.GetInverse() * self.reach_elbow_rot
         shoulder_partial = Gf.Rotation(
-            self.reach_shoulder_rot.GetAxis(), self.reach_shoulder_rot.GetAngle() * progress
+            shoulder_delta.GetAxis(), shoulder_delta.GetAngle() * progress
         )
         elbow_partial = Gf.Rotation(
-            self.reach_elbow_rot.GetAxis(), self.reach_elbow_rot.GetAngle() * progress
+            elbow_delta.GetAxis(), elbow_delta.GetAngle() * progress
         )
-        self.shoulder_op.Set(Gf.Quatd(shoulder_partial.GetQuat()))
-        self.elbow_op.Set(Gf.Quatd(elbow_partial.GetQuat()))
+        shoulder_pose = self.rest_shoulder_rot * shoulder_partial
+        elbow_pose = self.rest_elbow_rot * elbow_partial
+        self.shoulder_op.Set(Gf.Quatd(shoulder_pose.GetQuat()))
+        self.elbow_op.Set(Gf.Quatd(elbow_pose.GetQuat()))
 
     def update(self) -> None:
         if RIG_MODE == "legacy":

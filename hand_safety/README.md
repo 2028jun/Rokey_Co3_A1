@@ -1,113 +1,91 @@
 # hand_safety
 
-ROS 2 Humble에서 `sensor_msgs/msg/Image` RGB 토픽을 구독해 HaGRIDv2
-YOLOv10n 손 탐지를 수행합니다. 원본 모델의 제스처 클래스는 모두
-`hand` 단일 클래스로 통합하고 class-agnostic NMS를 적용합니다.
+ROS 2 Humble에서 Isaac Sim의 RGB 영상을 받아 YOLOv10n 손 탐지와 고정
+테이블 ROI 침입 판정을 수행합니다.
 
-## 토픽
+## 화면과 토픽
 
+- Isaac viewport: 시뮬레이션 자체를 보는 창입니다. `MOBILE_DEMO_HEADLESS=0`
+  및 유효한 `DISPLAY`가 필요합니다.
+- `/hand_detection/image`: 박스와 ROI가 그려진 ROS 영상입니다. 기본으로
+  발행되며 `rqt_image_view`로 보는 것을 권장합니다.
+- OpenCV 창: `show_window:=true`일 때만 열립니다. X11/Wayland 환경에 따라
+  불안정할 수 있어 기본값은 `false`입니다.
 - 입력: `/serving_robot/table_camera/color/image_raw`
-  (`sensor_msgs/msg/Image`)
-- 박스가 표시된 영상: `/hand_detection/image` (`sensor_msgs/msg/Image`,
-  디버그 옵션을 켰을 때만 발행)
-- 탐지 결과: `/hand_detection/detections` (`std_msgs/msg/String`, JSON)
-- ROI 침입 상태: `/hand_safety/roi_intrusion` (`std_msgs/msg/Bool`)
-- 도착 상태 입력: `/serving_robot/table_arrived` (`std_msgs/msg/Bool`)
+- JSON 탐지: `/hand_detection/detections`
+- ROI 상태: `/hand_safety/roi_intrusion`
+- 도착 게이트: `/serving_robot/table_arrived`
 
-`/hand_detection/detections`에는 단일 클래스 ID `0`, 클래스 이름
-`hand`, confidence, `[x1, y1, x2, y2]` 형식의 bounding box가
-포함됩니다.
+손 추론은 `/serving_robot/table_arrived=true`를 받은 뒤에만 시작합니다.
+이 독립 테스트 브랜치에는 실제 도착 발행자가 없으므로 아래처럼 수동으로
+발행해야 합니다.
 
-고정 테이블 ROI는 `hand_safety/roi_intrusion.py` 상단의
-`TABLE_ROI_NORMALIZED`에 화면 비율 기준 네 꼭짓점으로 설정합니다.
-손 바운딩 박스가 테이블 폴리곤과 조금이라도 겹치면 침입으로 판단하며, ROI와
-겹치는 손만 검출 영상과 결과 메시지에 표시합니다.
+## GPU 시각 검증 워크플로
 
-손 추론은 이동 로봇이 테이블 도킹을 완료하여
-`/serving_robot/table_arrived`가 `true`일 때만 실행됩니다. 이동 요청을
-받으면 도착 상태가 즉시 `false`로 바뀌고, ROI 침입 출력도 즉시
-`false`로 초기화됩니다. 도착 상태를 아직 받지 못한 경우에도 탐지는
-비활성 상태를 유지합니다. 시뮬레이터 시작 위치가 도킹 허용오차 안이면
-해당 초기 위치도 정상 도착 상태로 발행합니다.
+저장소 루트에서 네 터미널을 사용합니다. 모든 터미널에서
+`ROS_DOMAIN_ID=102`를 사용합니다.
 
-## 빌드
+터미널 1 — Isaac Sim GUI:
 
 ```bash
-cd "$(git rev-parse --show-toplevel)/hand_safety"
+cd "$(git rev-parse --show-toplevel)"
+export ROS_DOMAIN_ID=102
+export MOBILE_DEMO_HEADLESS=0
+export MOBILE_DEMO_ROS_CAMERA=1
+/home/rokey/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/python.sh \
+  isaacpjt/mobile_manipulator_demo.py
+```
+
+터미널 2 — 검출기:
+
+```bash
+cd "$(git rev-parse --show-toplevel)"
 source /opt/ros/humble/setup.bash
 colcon build --symlink-install --packages-select hand_safety
 source install/setup.bash
-```
-
-손 검출 모델은 패키지와 함께 설치되며 노드가 설치 경로에서 자동으로
-찾습니다.
-
-## 실행
-
-```bash
-ros2 run hand_safety hand_detector_node
-```
-
-이 프로젝트의 Isaac Sim과 통신할 때는 두 터미널 모두 같은 도메인을
-사용합니다.
-
-```bash
-export ROS_DOMAIN_ID=101
-```
-
-입력 토픽을 변경하는 예:
-
-```bash
-ros2 run hand_safety hand_detector_node \
-  --ros-args \
-  -p input_topic:=/camera/color/image_raw
-```
-
-CUDA가 사용 가능한 환경에서 GPU를 지정하는 예:
-
-```bash
-ros2 run hand_safety hand_detector_node \
-  --ros-args \
-  -p device:=0
-```
-
-OpenCV 창을 표시하지 않으려면 다음과 같이 실행합니다.
-
-```bash
-ros2 run hand_safety hand_detector_node \
-  --ros-args \
+export ROS_DOMAIN_ID=102
+ros2 run hand_safety hand_detector_node --ros-args \
+  --params-file hand_safety/config/hand_safety.yaml \
+  -p publish_annotated_image:=true \
   -p show_window:=false
 ```
 
-기본 실행은 안정성을 위해 OpenCV 창과 1280×960 결과 영상 발행을 모두
-끄고, 테이블 ROI에 여백을 더한 영역 한 장만 1280 크기로 추론하여 JSON 및
-ROI 상태만 발행합니다. 이 방식은 손을 확대하면서 ROI 밖 로봇 팔을 입력에서
-제외하고, Isaac Sim과 같은 GPU에서 네 장의 타일 추론을 동시에 돌리지 않아
-GPU 부하와 응답 지연도 줄입니다. 박스 영상을 확인할 때만 다음처럼
-일시적으로 활성화합니다.
+터미널 3 — 도착 게이트:
 
 ```bash
-ros2 run hand_safety hand_detector_node \
-  --ros-args \
-  -p publish_annotated_image:=true
+source /opt/ros/humble/setup.bash
+source "$(git rev-parse --show-toplevel)/install/setup.bash"
+export ROS_DOMAIN_ID=102
+ros2 topic pub --once --qos-durability transient_local \
+  /serving_robot/table_arrived std_msgs/msg/Bool "{data: true}"
 ```
 
-이 경우 별도 터미널에서 다음 명령으로 영상을 확인합니다.
+터미널 4 — 주석 영상:
 
 ```bash
+source /opt/ros/humble/setup.bash
+source "$(git rev-parse --show-toplevel)/install/setup.bash"
+export ROS_DOMAIN_ID=102
 ros2 run rqt_image_view rqt_image_view /hand_detection/image
 ```
 
-## 확인
+OpenCV 창을 별도로 시험하려면 그래픽 세션에서만
+`-p show_window:=true`로 실행합니다. `DISPLAY`가 없으면 노드는 이유와
+`rqt_image_view` 대안을 명시한 오류로 종료합니다.
+
+## 확인 명령
 
 ```bash
-ros2 topic info /serving_robot/table_camera/color/image_raw
+ros2 param get /hand_detector_node publish_annotated_image
+ros2 param get /hand_detector_node show_window
+ros2 topic info /serving_robot/table_camera/color/image_raw -v
 ros2 topic hz /serving_robot/table_camera/color/image_raw
-ros2 topic echo /serving_robot/table_arrived
+ros2 topic info /hand_detection/image -v
+ros2 topic hz /hand_detection/image
 ros2 topic echo /hand_detection/detections
-ros2 run rqt_image_view rqt_image_view /hand_detection/image
+ros2 topic echo /hand_safety/roi_intrusion
 ```
 
-입력 토픽은 `sensor_msgs/msg/Image`여야 합니다.
-`sensor_msgs/msg/CompressedImage` 토픽은 이 노드에서 직접 구독하지
-않습니다.
+고정 ROI는 `hand_safety/roi_intrusion.py` 상단의
+`TABLE_ROI_NORMALIZED`에 정의됩니다. ROI와 겹치는 손만 영상과 JSON에
+포함되며 3프레임 연속 확인 후 침입을 발행합니다.

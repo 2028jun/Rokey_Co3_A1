@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import traceback
@@ -80,7 +81,7 @@ class HandDetectorNode(Node):
         # hand_detector_node` alone now opens a live cv2 window and
         # publishes the annotated stream, no --ros-args needed.
         self.declare_parameter("publish_annotated_image", True)
-        self.declare_parameter("show_window", True)
+        self.declare_parameter("show_window", False)
 
         self.input_topic = str(
             self.get_parameter("input_topic").value
@@ -132,6 +133,12 @@ class HandDetectorNode(Node):
         self.show_window = bool(
             self.get_parameter("show_window").value
         )
+        if self.show_window and not os.environ.get("DISPLAY"):
+            raise RuntimeError(
+                "show_window:=true requires a graphical DISPLAY. Use "
+                "publish_annotated_image:=true and view "
+                "/hand_detection/image with rqt_image_view instead."
+            )
 
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError("confidence must be between 0.0 and 1.0")
@@ -254,7 +261,8 @@ class HandDetectorNode(Node):
         )
         if self.publish_annotated_image:
             self.get_logger().info(
-                f"Publishing debug images to {output_image_topic}"
+                f"Publishing debug images to {output_image_topic}; view with "
+                f"'ros2 run rqt_image_view rqt_image_view {output_image_topic}'"
             )
         else:
             self.get_logger().info(

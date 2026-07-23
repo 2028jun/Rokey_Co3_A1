@@ -797,3 +797,53 @@ Still broken / follow-up:
   is not representative of what should ship.
 - `HAND_TEST_RIG_MODE=legacy` and `/serving_robot/table_arrived`'s missing
   publisher are both unchanged and still exactly as pass 5 left them.
+
+## Pass 7 partial -- 2026-07-23 (GPU hardware, commit pending)
+
+Tested:
+- Launched the modified actor on the RTX 5080 in Isaac Sim 5.1, both
+  headless and with the real GUI/table-camera viewport.
+- Ran the real ROS camera, CUDA YOLO node, manual transient-local
+  `table_arrived=true` gate, and `/hand_detection/image` publication.
+- Captured and visually inspected rest and forced-full-reach annotated
+  frames from the fixed table camera.
+
+Changed:
+- Moved the actor out of the table to a standing pose behind the south-side
+  chairs at `(-3.40, -3.58, 0.0)`, yaw 180 degrees, uniform scale 0.85.
+- Moved the test target toward the customer edge to
+  `(-3.25, -3.33, 0.98)` and scaled the IK reach calculation coherently.
+- Added a relaxed target for the detached reaching arm.
+- Replaced visible `ShoulderCap`/`ElbowCap` spheres with tapered cone
+  transition geometry.
+- Made annotated ROS image publication the observable default, kept
+  OpenCV HighGUI opt-in, and added an explicit missing-DISPLAY error.
+- Removed the broken YAML model path (`src/hand_safety/...`) so the node
+  resolves the installed model; rewrote the README with the four-terminal
+  `ROS_DOMAIN_ID=102` workflow.
+
+Observed:
+- Actor and revised USD load successfully. The chosen target is reachable:
+  shoulder-to-target 0.392 m versus scaled arm maximum 0.421 m; solved
+  reach angles are shoulder 97.2 degrees and elbow 43.3 degrees.
+- The person is visibly outside the table and no longer embedded in its
+  top or underside structure.
+- CUDA warm-up completed in 1.44 s. Resolved parameters were
+  `publish_annotated_image=true`, `show_window=false`. Camera input was
+  1280x960; measured input varied around 7-15 Hz and annotated output
+  around 3 Hz under concurrent Isaac/YOLO load.
+- The documented YAML command initially failed because its model path did
+  not exist; removing that override fixed startup. The node printed the
+  exact `rqt_image_view` command and published real annotated frames.
+
+Still broken / follow-up:
+- The untouched opposite arm remains in the source character's spread pose.
+  Both arms therefore do not yet read as relaxed.
+- In the forced full-reach table-camera capture, the detached glove stopped
+  near the chair instead of entering the drawn ROI. YOLO consequently
+  reported zero hands throughout the sampled run. The endpoint interpolation
+  was changed to author the exact IK rotations, but that final adjustment has
+  not yet been re-rendered.
+- Front/side/overhead close-ups and four-cycle root/body invariance still
+  need final capture after the arm endpoint and opposite-arm pose are fixed.
+- This is a useful GPU-tested intermediate revision, not acceptance-complete.
