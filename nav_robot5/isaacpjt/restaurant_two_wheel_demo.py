@@ -528,7 +528,7 @@ class DiffNavBridge(Node):
         else:
             self.get_logger().error(f"direct navigation failed mission={mission_id}: {reason}")
 
-    # Method: _update_direct_navigation with Always Positive vx & Heading Mismatch Check
+    # Method: _update_direct_navigation with completion check evaluated BEFORE heading mismatch check
     def _update_direct_navigation(self, x: float, y: float, yaw: float) -> tuple[float, float] | None:
         mission = self._direct_nav
         if mission is None:
@@ -578,37 +578,37 @@ class DiffNavBridge(Node):
         else:
             axis = x if kind == "axis_x" else y
             error = stage["value"] - axis
-
-            # Heading Mismatch Check upon stage start
-            expected_sign = 1.0 if stage["value"] >= axis else -1.0
-            heading_axis_sign = (
-                math.cos(stage["yaw"])
-                if kind == "axis_x"
-                else math.sin(stage["yaw"])
-            )
-            if expected_sign * heading_axis_sign <= 0.0:
-                self._finish_direct_navigation(
-                    False,
-                    (
-                        f"stage heading mismatch: "
-                        f"kind={kind} target={stage['value']:.3f} "
-                        f"axis={axis:.3f} yaw={math.degrees(stage['yaw']):.1f}"
-                    ),
-                    x,
-                    y,
-                    yaw,
-                )
-                return 0.0, 0.0
-
             done = abs(error) <= 0.05
-            desired_yaw = stage["yaw"]
-            yaw_error = self._angle_error(desired_yaw, yaw)
+
             if not done:
+                # Heading Mismatch Check is evaluated ONLY when not done
+                expected_sign = 1.0 if error >= 0.0 else -1.0
+                heading_axis_sign = (
+                    math.cos(stage["yaw"])
+                    if kind == "axis_x"
+                    else math.sin(stage["yaw"])
+                )
+                if expected_sign * heading_axis_sign <= 0.0:
+                    self._finish_direct_navigation(
+                        False,
+                        (
+                            f"stage heading mismatch: "
+                            f"kind={kind} target={stage['value']:.3f} "
+                            f"axis={axis:.3f} yaw={math.degrees(stage['yaw']):.1f}"
+                        ),
+                        x,
+                        y,
+                        yaw,
+                    )
+                    return 0.0, 0.0
+
+                desired_yaw = stage["yaw"]
+                yaw_error = self._angle_error(desired_yaw, yaw)
                 requested = min(abs(stage["speed"]), max(0.045, abs(error) * 0.8))
                 vx = requested  # Always forward linear velocity since pivot pre-aligned heading
                 wz = float(np.clip(1.6 * yaw_error, -0.28, 0.28))
             timeout = 90.0
-            detail = f"axis_error={error:.3f}m yaw_error={math.degrees(yaw_error):.1f}deg"
+            detail = f"axis_error={error:.3f}m yaw_error={math.degrees(self._angle_error(stage['yaw'], yaw)):.1f}deg"
 
         now = time.monotonic()
         if now - mission["last_log"] >= 1.0:
