@@ -400,6 +400,12 @@ class SimplifiedPathNavigator:
 
     def _plan_orthogonal_path(self, start: Point, goal: Point) -> list[Point]:
         if self._costmap is None:
+            print("[auto] waiting for /global_costmap/costmap topic...", flush=True)
+            wait_start = time.monotonic()
+            while self._costmap is None and time.monotonic() - wait_start < 5.0:
+                rclpy.spin_once(self._nav, timeout_sec=0.1)
+
+        if self._costmap is None:
             raise RuntimeError("global costmap (/global_costmap/costmap) has not been received yet")
 
         # Step 1 & 2: Evaluate 2 L-shaped candidates

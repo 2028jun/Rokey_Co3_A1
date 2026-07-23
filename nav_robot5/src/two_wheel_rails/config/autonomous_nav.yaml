@@ -1,6 +1,6 @@
 # Nav2 free-path planning and rotate/drive-only execution with orthogonal A* and L-path.
 sample_spacing_m: 0.05
-maximum_cost: 50
+maximum_cost: 70
 
 # Orthogonal A*
 turn_penalty: 8.0
@@ -8,7 +8,7 @@ obstacle_cost_weight: 3.0
 corner_replan_attempts: 3
 
 # Corner Rotation Check
-rotation_clearance_radius_m: 0.60
+rotation_clearance_radius_m: 0.45
 
 # Docking
 dock_approach_distance_m: 0.60
