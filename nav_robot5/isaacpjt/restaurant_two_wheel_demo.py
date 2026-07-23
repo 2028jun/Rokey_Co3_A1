@@ -343,6 +343,7 @@ class PhysicsStageExecutor:
         self.zero_ticks_count = 0
         self.previous_axis_error = None
         self.stage_timeout_limit = None
+        self.axis_completion_latched = False
 
     def handle_command(self, payload: dict):
         kind = payload.get("kind")
@@ -353,6 +354,7 @@ class PhysicsStageExecutor:
             print(f"[stage_executor] cancel command received for mission={mission_id}", flush=True)
             self.active_stage = None
             self.stage_state = "cancelled"
+            self.axis_completion_latched = False
             self.node.publish_stage_status(mission_id, sequence, "cancelled", 0.0)
             return
 
@@ -375,6 +377,7 @@ class PhysicsStageExecutor:
         self.zero_ticks_count = 0
         self.previous_axis_error = None
         self.stage_timeout_limit = None
+        self.axis_completion_latched = False
 
         self.node.publish_stage_status(mission_id, sequence, "accepted", 0.0)
         if kind == "dock":
@@ -407,7 +410,6 @@ class PhysicsStageExecutor:
         now = time.monotonic()
         elapsed = now - self.start_time
 
-        # Calculate timeout limit once upon first tick
         if self.stage_timeout_limit is None:
             if kind in ("axis_x", "axis_y"):
                 initial_dist = abs(target_val - (x if kind == "axis_x" else y))
@@ -437,9 +439,11 @@ class PhysicsStageExecutor:
             )
 
             if abs(error) <= pos_tol or crossed:
+                self.axis_completion_latched = True
+
+            if self.axis_completion_latched:
                 if self.zero_ticks_count < 2:
                     self.zero_ticks_count += 1
-                    self.previous_axis_error = error
                     return 0.0, 0.0
                 self.stage_state = "completed"
                 print(f"[stage_executor] {kind} completed: error={error:.3f}m crossed={crossed}", flush=True)
@@ -449,7 +453,7 @@ class PhysicsStageExecutor:
 
             self.previous_axis_error = error
             requested = min(abs(max_speed), max(0.045, abs(error) * 0.8))
-            vx = requested  # Always forward velocity since robot is pre-aligned
+            vx = requested
             wz = max(-0.28, min(0.28, 1.6 * yaw_err))
 
         elif kind == "pivot":
@@ -564,7 +568,7 @@ class PhysicsStageExecutor:
                 raw_wz = max(-0.20, min(0.20, 1.8 * yaw_err + 1.4 * lateral_error))
                 needs_corr = (abs(yaw_err) > math.radians(0.8) or abs(lateral_error) > 0.02)
                 if needs_corr and abs(raw_wz) < 0.04:
-                    direction_source = raw_wz if abs(raw_wz) > 1e-6 else yaw_err
+                    direction_source = raw_wz if abs(raw_wz) > 1e-6 else yaw_error
                     raw_wz = math.copysign(0.04, direction_source)
 
                 vx = linear_cmd
