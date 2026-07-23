@@ -1,123 +1,106 @@
-# Vision-test GPU prompt: joint-cap cosmetics + live multi-cycle confirmation
+# Vision-test GPU prompt: replace hand-built arm rig with Actor SDG animation
 
 Paste this entire document into a coding-agent session on the GPU machine.
 Target: Isaac Sim 5.1.0-rc.19, ROS 2 Humble, RTX 5080, branch `vision-test`,
 `ROS_DOMAIN_ID=102` (matches `AGENTS.md`).
 
-This prompt is self-contained: reading it plus `AGENTS.md` and
-`GPU_RUN_LOG.txt` is enough to do the whole task and finish it, including
-pushing the result back to `vision-test`. Do not wait for further
+This prompt is self-contained: reading it plus `AGENTS.md`, `GPU_RUN_LOG.txt`,
+and `ANIM_SPIKE_RESULTS.txt` is enough to do the whole task and finish it,
+including pushing the result back to `vision-test`. Do not wait for further
 instructions mid-task, and do not stop after implementing -- run it, look at
-the rendered frames, and finish per "Finishing" below.
+the rendered frames and real topic output, and finish per "Finishing" below.
 
 ## Bootstrap (do this first, every time)
 
 - `git status`, then `git fetch origin` and `git pull --ff-only origin
   vision-test`. Never discard existing work with reset/checkout/clean.
-- Read `AGENTS.md`, `GPU_RUN_LOG.txt` (all prior passes, especially pass 8),
-  and this file completely before changing anything.
-- Do not repeat work already logged as done: pass 6's seat-coordinate search
-  and static-arm proof, pass 7's terminal/YAML/observability diagnosis, and
-  pass 8's opposite-arm fix, cone-to-sphere revert, ROI recalibration, and
-  the `MOBILE_DEMO_CAPTURE_POSES=1` visual-QA capture path it added to
-  `isaacpjt/mobile_manipulator_demo.py` (reuse that path -- it's the fast,
-  cheap way to check this actor's pose; see its own code for usage).
+- Read `AGENTS.md`, `GPU_RUN_LOG.txt` (passes 1-8), `ANIM_SPIKE_RESULTS.txt`,
+  and `isaacpjt/anim_spike_test.py` completely before changing anything. The
+  spike already proved the API chain works headless with no crash -- reuse
+  it, don't re-derive it.
 
-## Non-negotiable visual acceptance criteria
+## Direction change -- read this before touching any code
 
-The reviewer judges this by eye, not by IK math passing silently. All of
-the following must be true in rendered frames (front, side, overhead, and
-the fixed table camera) before this is considered done:
+Passes 5-8 built a hand-authored substitute for a real arm: extracting arm
+geometry out of the character's skinned mesh, driving it with a hand-rolled
+two-bone IK solver, and patching the resulting seam with primitive sphere
+caps. That entire approach is discarded, reviewer's explicit call -- it kept
+producing wrong-looking joints/caps every pass and is not worth further
+cosmetic iteration.
 
-1. **Body pose.** The person is naturally standing beside/behind the
-   south-side chairs (body/legs not clipping the chair or table). Both arms
-   rest in a normal relaxed pose when not reaching -- no T-pose, no
-   permanently spread/winged arm, on *either* arm. Only the single reaching
-   arm moves during an intrusion event; everything else, including the idle
-   arm, must look like a person standing still.
-2. **Joint realism.** No visible twisting, hyperextension, or bend outside
-   normal human range of motion, at rest, mid-reach, and full reach. No
-   visible hole, gap, or detachment at the shoulder/elbow transitions at
-   any of those stages either.
-3. **ROI/detection.** A full reach cycle produces at least one real
-   annotated hand frame and at least one `roi_intrusion: true` pulse on
-   `/hand_safety/roi_intrusion`, observed on real hardware, not just IK
-   math.
+Replace it with the Actor SDG / omni.anim.people behavior-animation
+mechanism `ANIM_SPIKE_RESULTS.txt` already proved works: trigger real,
+professionally-authored `push_button`/`type_keyboard` (or similar) skelanim
+clips on a normal biped character via `CustomCommand` + the behavior-script
+command-file path, exactly as `isaacpjt/anim_spike_test.py` does. Do not
+resume tuning `RightArmRig`/`LeftArmRig`/`ShoulderCap`/`ElbowCap` or the
+two-bone IK solver in `hand_intrusion_test_actor.py` -- delete/replace that
+mechanism rather than patch it further.
 
-## Current state (do not re-litigate)
+## What "done" means this pass
 
-Pass 8 fixed three real, previously-undiscovered defects, all confirmed on
-hardware (see `GPU_RUN_LOG.txt` pass 8 for full detail):
+A character, placed and scaled correctly at `TableSet_00`, plays a real
+behavior animation (push_button, typing, or another `~/Downloads` clip that
+visibly brings a hand into the table's intrusion zone) on the same
+5-10s-period reach cycle the old mechanism used, integrated into the actual
+`hand_safety` pipeline -- not the spike's empty stage. Non-negotiable
+acceptance criteria, judged by eye on rendered frames (front, side,
+overhead, fixed table camera) plus real topic output, not by code executing
+without error:
 
-1. The opposite (left) arm now has its own static relaxed rig
-   (`LeftArmRig`/`ElbowPivotL`), matching the reaching arm's technique --
-   criterion 1 is met for both arms.
-2. The shoulder/elbow transition caps are `Sphere` prims again (not
-   `Cone`), centered on each rotation pivot, sized to close the seam at
-   this pass's more relaxed rest angle (shoulder radius 0.085, elbow 0.06)
-   -- no hole or floating spike at rest, mid-reach, or full reach in any of
-   the four camera angles.
-3. `hand_safety/hand_safety/roi_intrusion.py`'s `TABLE_ROI_NORMALIZED` was
-   stale (calibrated for pass 1-5's seat/target position) and never
-   overlapped the hand's actual position after pass 6/7 moved the target --
-   this silently zeroed out every ROI-confirmed detection for two passes
-   even though the reach itself was geometrically correct. Recalibrated by
-   projecting the reach arm's true glove mesh bounding box through the real
-   camera's own intrinsics/extrinsics; confirmed on hardware: 46 `true`
-   samples over a 45 s / 45-cycle-ish window, one confirmed detection
-   captured directly (confidence 0.884, bbox [241,339,318,393] px).
-
-Known open defect going into this pass:
-
-1. The shoulder/elbow sphere caps close the seam but still read as a
-   visible bulbous ball rather than a seamless joint, especially at the
-   elbow (fabric-colored sphere against bare-skin-textured
-   forearm/upper-arm). This is a known limitation already flagged back in
-   pass 5's log: a primitive sphere has diminishing returns, and a proper
-   fix needs non-primitive, UV/normal-matched cap geometry shaped to the
-   character's actual joint cross-section. Not attempted in pass 8 --
-   the hole/spike defect is fixed, this cosmetic one is not.
+1. **Body pose.** Character stands/sits naturally at the table, matching
+   whichever placement (standing behind the south-side chairs, or seated)
+   reads as natural for the chosen animation. No T-pose, no idle/broken
+   pose before or after the behavior plays.
+2. **Joint realism.** Since this is now a real authored animation, this
+   should hold for free -- confirm it does, don't re-litigate it by hand.
+3. **ROI/detection.** The animation's hand motion actually enters
+   `hand_safety`'s ROI at the right moment. Measure this the way pass 8 did
+   for the old rig -- project the real hand/glove geometry's world bbox
+   through the table camera's intrinsics/extrinsics and compare against
+   `TABLE_ROI_NORMALIZED` in `hand_safety/hand_safety/roi_intrusion.py` --
+   do not assume the old ROI calibration still applies to a differently
+   shaped/positioned reach. Confirm on real hardware: at least one real
+   annotated hand frame and one `roi_intrusion: true` pulse on
+   `/hand_safety/roi_intrusion` per cycle.
 
 ## Required work
 
-- Decide whether the pass-8 sphere-cap bulge is acceptable as shipped, or
-  build proper non-primitive cap geometry (extract a short cylindrical
-  "cuff" segment from the same source mesh the arm pieces came from,
-  tapered/blended into both the torso-side and arm-side cut boundaries,
-  instead of a primitive sphere) if the reviewer wants it fully seamless.
-  Use `isaacpjt/mobile_manipulator_demo.py`'s `MOBILE_DEMO_CAPTURE_POSES=1`
-  path to iterate quickly (front/side/overhead/table PNGs at progress
-  0/0.25/0.5/0.75/1.0 in ~20s, no ROS/GUI needed) before ever touching the
-  live pipeline.
-- Run a live four-terminal `hand_safety` session (see `hand_safety/README.md`)
-  and specifically watch at least four complete reach cycles end to end,
-  confirming: the person's root never translates (compare
-  `ComputeLocalToWorldTransform` across cycles, not just a visual
-  spot-check, the way pass 6 did for the old rest pose), the reach still
-  lands cleanly and produces `roi_intrusion: true` on every cycle (not just
-  one, as pass 8 only directly captured), and nothing about repeated cycles
-  degrades detection confidence or introduces jitter.
-- While that live session is running, also sanity-check
-  `/hand_detection/detections` for any spurious non-reach-cycle "hand"
-  detections (e.g. from the RG2 gripper or the new sphere caps themselves)
-  now that the ROI has moved -- pass 3's gripper false-positive and pass
-  5's shoulder-cap false-positive were both real, camera/ROI-position-
-  dependent issues, and the ROI just moved to a new part of the frame.
+- Delete or clearly disable the old rigid-arm mechanism in
+  `isaacpjt/hand_intrusion_test_actor.py` (`RightArmRig`/`LeftArmRig`
+  extraction usage, `solve_two_bone_ik` driving, `ReachAnimator`'s
+  progress-based rotation code) and `assets/rigid_arm_asset.usda`'s
+  purpose-built arm/cap geometry -- keep them only if still useful as an
+  opt-in fallback (e.g. `HAND_TEST_RIG_MODE=legacy`-style), but the shipped
+  default must be the Actor SDG path.
+- Wire the spike's character-spawn + custom-command + behavior-script
+  mechanism into `hand_intrusion_test_actor.py`/`mobile_manipulator_demo.py`
+  in place of the old rig: correct placement/scale at `TableSet_00`, correct
+  intrusion target, and the same randomized 5-10s reach period
+  (`HAND_TEST_MIN_PERIOD`/`MAX_PERIOD` envs) driving when the behavior
+  command fires, followed by a return to idle.
+- Re-measure and, if needed, recalibrate `TABLE_ROI_NORMALIZED` against this
+  new animation's actual hand trajectory -- do not assume pass 8's
+  calibration (tuned for the old rig's exact hand position) still applies.
+- Run the real four-terminal `hand_safety` workflow
+  (`hand_safety/README.md`), watch at least four complete cycles, and
+  confirm `roi_intrusion: true` fires on each one.
+- Reuse `MOBILE_DEMO_CAPTURE_POSES=1` (or extend it) for fast headless
+  visual QA before every live pipeline run, the way pass 8 did.
 
 ## Iterate until it actually meets the criteria
 
-A single attempt that "runs" is not the deliverable. If a fix doesn't
-visually resolve a defect, try a different approach and re-render,
-repeating until every criterion above genuinely holds -- not until the code
-merely executes without error.
+A single attempt that "runs" is not the deliverable. If integration doesn't
+visually and numerically satisfy the criteria above, keep adjusting
+placement/timing/ROI and re-render/re-run until it genuinely does -- not
+until the code merely executes without error.
 
 Never paper over a real defect to make it look finished: don't lower YOLO
-confidence, move/shrink the ROI without a measured, camera-projected reason
-the way pass 8 did, hide the person or a body part from the camera, disable
-a check, or claim a criterion is met without an actual rendered frame or
-real topic echo proving it. If, after genuinely trying alternatives,
-something still cannot be fixed in this pass, say so plainly in the log and
-in the final report -- do not claim done, and do not silently leave broken
+confidence, move/shrink the ROI without a measured, camera-projected reason,
+hide the person or a body part from the camera, disable a check, or claim a
+criterion is met without an actual rendered frame or real topic echo proving
+it. If something still cannot be fixed this pass, say so plainly in the log
+and the final report -- do not claim done, and do not silently leave broken
 behavior as the shipped default. An honest "still broken, here's what I
 tried and why it didn't work" is the correct outcome if that's the truth; a
 fake pass is not.
