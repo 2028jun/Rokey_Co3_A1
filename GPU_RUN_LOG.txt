@@ -683,3 +683,117 @@ Still broken / follow-up (i.e., Pass 6's actual job):
 - `/serving_robot/table_arrived` still has no publisher in this repo, by
   design (connected later during full-system integration) -- not a gap to
   fix in this branch.
+
+## Pass 6 -- 2026-07-23 (commit <fill in after committing>)
+
+Tested:
+- Task 1: opened the real restaurant scene (`lightweight_pizza_restaurant.usda`,
+  the same asset production uses) directly, spawned the pass-6 static-arm
+  actor at its shipped seat (`HAND_TEST_SEAT_X/Y/Z` defaults
+  -3.337/-2.216/-0.20), and captured free-camera frames from three angles
+  (overview, closeup, side profile) at rest to check for clipping against
+  the real `TableSet_00`/`Chair_01` geometry. Also ran the full
+  `mobile_manipulator_demo.py` + real fixed table camera and captured a
+  live frame during an active reach for a second, independent view.
+- Task 2: drove the real `ReachAnimator._apply_progress()` at checkpoints
+  0/0.3/0.6/1.0 and recorded the person root's world position
+  (`ComputeLocalToWorldTransform`) at each one to check for any body
+  translation, not just a visual spot-check.
+- Task 1 follow-up (once clipping was confirmed): queried the actual
+  `TableSet_00`/`Chair_00-03` world transforms and the table's world
+  bounding box directly from the opened stage (not estimated), then ran an
+  offline numeric search over `HAND_TEST_SEAT_X/Y/Z` (all four table
+  edges, `HAND_TEST_SEAT_Z` from 0 to -1.5, plus a fine grid for the
+  north/original-chair-side approach) to determine whether *any* seat
+  placement outside the table's footprint can reach `TABLE_HAND_TARGET`
+  within this character's `_ARM_MAX_REACH` (0.496m), using the exact same
+  `P_UP`-offset-plus-yaw math `_solve_static_arm_target()` uses.
+
+Changed:
+- None. See Observed/Still-broken below for why -- this pass found the
+  shipped pass-6-prep defaults are already the best mathematically-
+  reachable configuration; no combination of the three tuning env vars
+  fixes the clipping, so there was nothing to safely tune to, and the
+  actual fix is out of scope for an env-var change (see below).
+
+Observed:
+- Task 2 (static body): confirmed programmatically, not just visually --
+  the person root's world position was bit-for-bit identical
+  ((-3.337, -2.216, -0.2)) across all four reach-progress checkpoints
+  (max delta 0.000000000m). `ReachAnimator` genuinely never touches a
+  translateOp in `rigid_arm` mode any more; only `RightArmRig`'s and
+  `ElbowPivot`'s `xformOp:orient` change. This part of pass 6 prep's intent
+  is fully verified working.
+- Task 1 (seat clipping) -- confirmed broken, badly, from both the
+  standalone free-camera views and the real table camera: the character's
+  torso protrudes up through the middle of the tabletop and its legs are
+  tangled in the table's underside cross-bracing, sitting in the dead
+  center of the table between two empty rows of chairs on either side --
+  not "sitting at the table," but "sitting inside/under the table." This
+  matches pass 6 prep's own stated risk almost exactly, but is
+  substantially worse than "may need a nudge": the shipped seat position
+  isn't close to the table's footprint, it's deep inside it (see next
+  finding for why no nudge fixes this).
+- Root cause, quantified: `TABLE_HAND_TARGET` sits at `TableSet_00`'s
+  horizontal *center* (queried directly: table world bbox
+  x:[-4.095,-2.305], y:[-3.380,-1.020], center exactly (-3.2,-2.2) --
+  matches `TABLE_HAND_TARGET`'s x/y precisely), which is 0.895m from the
+  nearest (long/x) edge and 1.18m from the nearest (short/y, the original
+  Chair_01 side) edge. This character's total static horizontal reach
+  tops out around 0.42-0.50m even using its full `_ARM_MAX_REACH` at the
+  deepest sane `SEAT_TORSO_Z` (the same 0.61m fixed vertical gap pass 6
+  prep's log already derived, from the 1.44m standing shoulder height vs
+  the 0.83m target height, eats most of the reach budget). The numeric
+  search confirms: from *any* point just outside the table's footprint (a
+  5cm margin past any of the four edges), at *any* `SEAT_TORSO_Z` from 0
+  to -1.5m, the minimum achievable shoulder-to-target distance is
+  0.757-1.31m depending on which edge -- never under the 0.496m arm max.
+  The absolute best case found for the original (north-side, Chair_01)
+  approach direction specifically is a seat still 0.76m *inside* the
+  table's footprint, and only at `SEAT_TORSO_Z=-0.63` (deeper than the
+  shipped -0.20, and pass 5's worst-case dynamic -0.427). In short: **no
+  value of `HAND_TEST_SEAT_X`/`Y`/`Z` places this character both outside
+  the table and within arm's reach of `TABLE_HAND_TARGET` -- it is a hard
+  geometric impossibility with this character asset and this target, not
+  a tuning problem.** The shipped pass-6-prep defaults are in fact a
+  locally-good choice (least `SEAT_TORSO_Z` sink among reachable options),
+  they just aren't a *visually acceptable* one, because no reachable
+  option is.
+- Task 3 (motion/posture quality): not meaningfully assessable beyond the
+  clipping problem above -- the shoulder/elbow articulation itself (angles
+  113.5deg/64.4deg, unchanged from pass 6 prep's analytic solve) is the
+  same mechanism pass 5 already confirmed looks like a real bend on
+  hardware, but judging whether the *overall* reach "looks natural" is
+  moot while the torso is embedded in the tabletop -- that dominates the
+  frame regardless of how the arm itself moves.
+
+Still broken / follow-up:
+- **Blocking finding for reviewer decision, not a bug to keep chasing**:
+  this character (`male_adult_construction_01_new`, a standing-pose asset)
+  cannot physically satisfy all three of (a) reach `TABLE_HAND_TARGET` at
+  the table's center, (b) stay completely seated/static with zero body
+  translation, and (c) stay visually outside the table's own footprint,
+  simultaneously -- proven by exhaustive numeric search this pass, not
+  just "not found yet." Two real fixes, neither attempted this pass since
+  both are bigger than an env-var tune:
+  1. Swap to a character asset with an actual seated rest pose (shoulder
+     height much closer to table height when seated, drastically
+     shrinking the fixed vertical gap that's currently eating most of the
+     reach budget). This is the fix the pass-6-prep log already flagged as
+     the "real fix" if `-0.20m` wasn't acceptable -- it now isn't, so this
+     is the recommended next step.
+  2. Get explicit reviewer sign-off to reintroduce *some* limited torso
+     motion (not necessarily pass 5's full lean-to-target, even a small
+     fixed forward lean might be enough) -- not applied unilaterally this
+     pass since it directly contradicts this pass's own explicit
+     instruction ("the person should stay seated and completely still").
+- The shipped `HAND_TEST_SEAT_X/Y/Z` defaults were left unchanged (no
+  alternative value is actually better -- see Observed) rather than
+  swapped for a marginally-different but still-broken configuration that
+  might look like a real fix without being one.
+- Detection/`roi_intrusion` confidence was intentionally not re-measured
+  this pass (per this pass's own explicit scope), and shouldn't be until
+  the clipping above is resolved one way or another -- the current pose
+  is not representative of what should ship.
+- `HAND_TEST_RIG_MODE=legacy` and `/serving_robot/table_arrived`'s missing
+  publisher are both unchanged and still exactly as pass 5 left them.
