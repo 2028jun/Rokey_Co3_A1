@@ -193,5 +193,36 @@ class RestaurantMap {
         ctx.font = "bold 11px Outfit";
         ctx.textAlign = "center";
         ctx.fillText("PIZZA BOT", rPos.x, rPos.y - 18);
+
+        // 8. Draw Obstacle Person on Map if Active
+        if (this.obstaclePerson && this.obstaclePerson.active) {
+            const oPos = this.worldToCanvas(this.obstaclePerson.x || 0.0, this.obstaclePerson.y || 2.8);
+
+            // Pulsing Red Warning Outer Aura
+            ctx.fillStyle = "rgba(239, 68, 68, 0.25)";
+            ctx.strokeStyle = "#ef4444";
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.arc(oPos.x, oPos.y, 18, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.stroke();
+
+            // Inner Person Circle
+            ctx.fillStyle = "#dc2626";
+            ctx.beginPath();
+            ctx.arc(oPos.x, oPos.y, 8, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Obstacle Label
+            ctx.fillStyle = "#f87171";
+            ctx.font = "bold 11px Outfit";
+            ctx.textAlign = "center";
+            ctx.fillText("⚠️ PERSON (STOPPED)", oPos.x, oPos.y - 22);
+        }
+    }
+
+    setObstaclePerson(active, x = 0.0, y = 2.8) {
+        this.obstaclePerson = { active: !!active, x: x, y: y };
+        this.render();
     }
 }

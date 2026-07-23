@@ -65,6 +65,7 @@ class HMIBridgeNode(Node):
         self.parking_brake = True
         self.battery_level = 98.0
         self.arm_state = "HOME"
+        self.obstacle_info = {"active": False, "x": 0.0, "y": 2.8, "stop": False}
         
         # Publishers
         self.order_pub = self.create_publisher(String, '/serving_robot/order', 10)
@@ -103,6 +104,14 @@ class HMIBridgeNode(Node):
             String,
             '/serving_robot/event',
             self.robot_status_callback,
+            10
+        )
+
+        # Obstacle Event Subscriber (/serving_robot/obstacle_event)
+        self.obstacle_event_sub = self.create_subscription(
+            String,
+            '/serving_robot/obstacle_event',
+            self.obstacle_event_callback,
             10
         )
 
@@ -244,8 +253,20 @@ class HMIBridgeNode(Node):
         }
         self.last_robot_status_recv_time = time.time()
         self.robot_connected = True
-        if self.drive_mode != "LIVE":
-            self.drive_mode = "LIVE"
+    def obstacle_event_callback(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+            active = bool(data.get("active", False))
+            self.obstacle_info = {
+                "active": active,
+                "x": float(data.get("x", 0.0)),
+                "y": float(data.get("y", 2.8)),
+                "stop": active,
+            }
+            if active:
+                self.robot_state = "🛑 OBSTACLE DETECTED (STOPPED)"
+        except Exception:
+            pass
 
     def robot_status_callback(self, msg: String):
         self.last_robot_status_recv_time = time.time()
@@ -572,6 +593,7 @@ def get_system_status_payload():
             "domain_id": os.environ.get("ROS_DOMAIN_ID", "101")
         },
         "camera_connected": camera_connected,
+        "obstacle": (ros_node.obstacle_info if ros_node else {"active": False, "x": 0.0, "y": 2.8, "stop": False}),
         "camera_image": (
             ros_node.last_camera_base64 if camera_connected else ""),
         "orders": order_manager.get_all_orders_dict(),

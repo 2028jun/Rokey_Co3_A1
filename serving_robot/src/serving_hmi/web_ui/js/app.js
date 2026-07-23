@@ -126,9 +126,12 @@ function updateSystemTelemetry(data) {
     document.getElementById('val-sim-hz').innerText = `${(isaac.hz || 0).toFixed(1)} Hz`;
     document.getElementById('val-arm-mode').innerText = robot.state || "READY";
 
-    // Update 2D Canvas Robot Pose
+    // Update 2D Canvas Robot Pose & Obstacle Marker
     if (mapRenderer) {
         mapRenderer.updateRobotPose(pose.x, pose.y, pose.yaw || 0);
+        if (data.obstacle) {
+            mapRenderer.setObstaclePerson(data.obstacle.active, data.obstacle.x, data.obstacle.y);
+        }
     }
 
     // 5. Orders & Active Stepper Progress

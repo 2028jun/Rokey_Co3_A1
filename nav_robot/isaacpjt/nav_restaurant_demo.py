@@ -1116,6 +1116,7 @@ class NavBridge(Node):
             PoseStamped, "/nav_robot/teleport", self._on_teleport, qos
         )
         self.odom_pub = self.create_publisher(Odometry, "/nav_robot/odom", qos)
+        self.obstacle_pub = self.create_publisher(String, "/serving_robot/obstacle_event", qos)
         self.tf_broadcaster = TransformBroadcaster(self)
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
 
@@ -1645,6 +1646,7 @@ class NavBridge(Node):
         self._obstacle_scale = 0.0
         self._target_vx = 0.0
         self._target_wz = 0.0
+        self._publish_obstacle_event(True)
         self.get_logger().warning(
             f"전방 장애물(사람) 최근접 감지: distance={distance:.2f}m <= {1.0}m, 주행 정지"
         )
@@ -1659,6 +1661,7 @@ class NavBridge(Node):
         self._obstacle_stop_started = None
         self._clearance_start = None
         self._obstacle_scale = 1.0
+        self._publish_obstacle_event(False)
         self.get_logger().info(
             f"전방 장애물(사람) 해제: distance={distance:.2f}m >= 1.2m, 0.5s 안전 지연 완료, 주행 재개"
         )
