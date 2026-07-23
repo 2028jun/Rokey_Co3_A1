@@ -76,9 +76,9 @@ SLIDING_TRAY_JOINTS = (
     "upper_tray_right_slide_joint",
 )
 SLIDING_TRAY_EXTENSION = 0.25
-# Three seconds at the 120 Hz scene rate keeps peak smoothstep velocity below
-# the URDF's 0.15 m/s joint limit, which is gentle enough for loaded drinks.
-SLIDING_TRAY_DEPLOY_STEPS = 360
+# Four seconds at the 120 Hz scene rate further reduces the reaction from the
+# loaded trays while the arm is simultaneously approaching the pizza bail.
+SLIDING_TRAY_DEPLOY_STEPS = 480
 # Reachable centreline target on the destination tabletop.  At local X=+0.55
 # the 39 cm board remains fully inside the table edge while the arm can first
 # translate there at its lifted height, then descend vertically.  The former
@@ -652,7 +652,8 @@ class TrayPizzaPickPlace:
         self._lift_orientation = None
         self._tray_joint_indices = None
         self._tray_deploy_steps = 0
-        self._trays_deployed = False
+        self._parallel_tray_deployment = False
+        self._trays_deployed = True
         self._magnet_force = 0.0
         self._magnet_gap = 0.0
         self.done = False
@@ -767,6 +768,12 @@ class TrayPizzaPickPlace:
             flush=True,
         )
 
+    def set_parallel_tray_deployment(self, enabled):
+        """Deploy payload trays while serving pizza when the order needs them."""
+        self._parallel_tray_deployment = bool(enabled)
+        self._trays_deployed = not self._parallel_tray_deployment
+        self._tray_deploy_steps = 0
+
     def local_to_world(self, position):
         point = self._arm_to_world.Transform(Gf.Vec3d(*map(float, position)))
         return np.array(point, dtype=float)
@@ -857,6 +864,20 @@ class TrayPizzaPickPlace:
         self._magnet_gap = gap
 
     def _enter_phase(self, phase, articulation):
+        if (
+            phase == 13
+            and self._parallel_tray_deployment
+            and not self._trays_deployed
+        ):
+            # Do not release the sequence to its first tray payload until the
+            # physical joints have reached their deployed positions.
+            if self._phase_steps % 60 == 0:
+                print(
+                    "[serving-bail] pizza motion complete; waiting for "
+                    "parallel tray deployment",
+                    flush=True,
+                )
+            return
         self._phase = phase
         self._phase_steps = 0
         self._settled_steps = 0
@@ -1140,58 +1161,67 @@ class TrayPizzaPickPlace:
             flush=True,
         )
         print(
-            "[sliding-tray] destination reached; deploying both trays "
-            f"to {SLIDING_TRAY_EXTENSION:.2f}m before pick-and-place",
+            "[sliding-tray] "
+            + (
+                "pizza phase 0 will run while both payload trays deploy "
+                f"to {SLIDING_TRAY_EXTENSION:.2f}m"
+                if self._parallel_tray_deployment
+                else "pizza-only order; payload trays remain retracted"
+            ),
             flush=True,
         )
+        self._enter_phase(0, articulation)
+
+    def _step_tray_deployment(self, articulation):
+        """Advance loaded trays independently of the pizza arm state machine."""
+        self._tray_deploy_steps += 1
+        raw_amount = min(
+            1.0,
+            self._tray_deploy_steps / SLIDING_TRAY_DEPLOY_STEPS,
+        )
+        amount = raw_amount * raw_amount * (3.0 - 2.0 * raw_amount)
+        target = np.full(
+            len(SLIDING_TRAY_JOINTS),
+            SLIDING_TRAY_EXTENSION * amount,
+            dtype=float,
+        )
+        articulation.apply_action(
+            ArticulationAction(
+                joint_positions=target,
+                joint_indices=self._tray_joint_indices,
+            )
+        )
+        actual = articulation.get_joint_positions()[self._tray_joint_indices]
+        error = float(np.max(np.abs(target - actual)))
+        if self._tray_deploy_steps % 60 == 0:
+            print(
+                "[sliding-tray] parallel "
+                f"target={target[0]:.3f}m "
+                f"actual={np.round(actual, 3).tolist()}m",
+                flush=True,
+            )
+        if raw_amount >= 1.0 and error < 0.005:
+            self._trays_deployed = True
+            print(
+                "[sliding-tray] parallel deployment complete",
+                flush=True,
+            )
+        elif self._tray_deploy_steps >= SLIDING_TRAY_DEPLOY_STEPS + 360:
+            self.failed = True
+            print(
+                "[sliding-tray] STOPPED: parallel deployment did not "
+                f"converge; joint error={error:.4f}m",
+                flush=True,
+            )
 
     def step(self, articulation):
         if self.done or self.failed:
             return
         self._apply_magnetic_retention()
-        if not self._trays_deployed:
-            self._tray_deploy_steps += 1
-            raw_amount = min(
-                1.0,
-                self._tray_deploy_steps / SLIDING_TRAY_DEPLOY_STEPS,
-            )
-            amount = raw_amount * raw_amount * (3.0 - 2.0 * raw_amount)
-            target = np.full(
-                len(SLIDING_TRAY_JOINTS),
-                SLIDING_TRAY_EXTENSION * amount,
-                dtype=float,
-            )
-            articulation.apply_action(
-                ArticulationAction(
-                    joint_positions=target,
-                    joint_indices=self._tray_joint_indices,
-                )
-            )
-            actual = articulation.get_joint_positions()[self._tray_joint_indices]
-            error = float(np.max(np.abs(target - actual)))
-            if self._tray_deploy_steps % 60 == 0:
-                print(
-                    "[sliding-tray] "
-                    f"target={target[0]:.3f}m "
-                    f"actual={np.round(actual, 3).tolist()}m",
-                    flush=True,
-                )
-            if raw_amount >= 1.0 and error < 0.005:
-                self._trays_deployed = True
-                print(
-                    "[sliding-tray] deployment complete; "
-                    "pick-and-place enabled",
-                    flush=True,
-                )
-                self._enter_phase(0, articulation)
-            elif self._tray_deploy_steps >= SLIDING_TRAY_DEPLOY_STEPS + 360:
-                self.failed = True
-                print(
-                    "[sliding-tray] STOPPED: deployment did not converge; "
-                    f"joint error={error:.4f}m",
-                    flush=True,
-                )
-            return
+        if self._parallel_tray_deployment and not self._trays_deployed:
+            self._step_tray_deployment(articulation)
+            if self.failed:
+                return
         self._phase_steps += 1
         if self._phase in (3, 10):
             wait_steps = 120 if self._phase == 3 else 90

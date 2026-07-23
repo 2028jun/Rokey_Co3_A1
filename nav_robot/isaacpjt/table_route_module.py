@@ -5,6 +5,11 @@ from __future__ import annotations
 import math
 
 
+BACKOUT_SPEED = 0.28
+AISLE_SPEED = 0.50
+TABLE_APPROACH_SPEED = 0.28
+
+
 TABLE_DOCKS = {
     0: (-1.82, -2.20, math.pi),
     1: (1.82, -2.20, 0.0),
@@ -27,7 +32,7 @@ def build_table_route(table_id: int, x: float, y: float):
                 {
                     "kind": "axis_x",
                     "value": 0.0,
-                    "speed": -0.22,
+                    "speed": -BACKOUT_SPEED,
                     "yaw": outward_yaw,
                 },
             ]
@@ -40,14 +45,14 @@ def build_table_route(table_id: int, x: float, y: float):
             {
                 "kind": "axis_y",
                 "value": goal_y,
-                "speed": 0.35,
+                "speed": AISLE_SPEED,
                 "yaw": aisle_yaw,
             },
             {"kind": "pivot", "yaw": goal_yaw},
             {
                 "kind": "axis_x",
                 "value": goal_x,
-                "speed": 0.22,
+                "speed": TABLE_APPROACH_SPEED,
                 "yaw": goal_yaw,
             },
         ]

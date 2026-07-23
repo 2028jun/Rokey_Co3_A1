@@ -988,17 +988,58 @@ def create_sensor_static_tf(stage, lidar_path: str, camera_path: str, node: Node
 class CommandServingSequence:
     """Frame-driven composition of the already tested serving tasks."""
 
+    TRAY_TASK_NAMES = frozenset({"soda1", "soda2", "cutlery"})
+    TRAY_EXTENSION = 0.25
+    TRAY_TOLERANCE = 0.005
+
     def __init__(self, named_tasks):
         self._named_tasks = list(named_tasks)
+        if not self._named_tasks:
+            raise ValueError("integrated serving sequence contains no tasks")
+        names = [name for name, _ in self._named_tasks]
+        self._has_pizza = "pizza" in names
+        self._has_tray_payload = any(
+            name in self.TRAY_TASK_NAMES for name in names
+        )
         self._index = 0
+        self._tray_indices = None
         self.done = False
         self.failed = False
 
     def initialize(self, articulation, dof_names):
+        self._tray_indices = np.asarray(
+            [dof_names.index(name) for name in SLIDING_TRAY_JOINTS],
+            dtype=np.int32,
+        )
         for name, task in self._named_tasks:
+            if name == "pizza":
+                if not hasattr(task, "set_parallel_tray_deployment"):
+                    raise RuntimeError(
+                        "pizza task does not support parallel tray deployment"
+                    )
+                task.set_parallel_tray_deployment(self._has_tray_payload)
             task.initialize(articulation, dof_names)
         names = " -> ".join(name for name, _ in self._named_tasks)
-        print(f"[integrated-serving] order={names} (all tasks initialized)", flush=True)
+        mode = (
+            "parallel-pizza-tray"
+            if self._has_pizza and self._has_tray_payload
+            else "pizza-only"
+            if self._has_pizza
+            else "first-payload-deploys-tray"
+        )
+        print(
+            f"[integrated-serving] order={names} mode={mode} "
+            "(all tasks initialized)",
+            flush=True,
+        )
+
+    def _trays_are_physically_deployed(self, articulation):
+        actual = np.asarray(
+            articulation.get_joint_positions()[self._tray_indices],
+            dtype=float,
+        )
+        error = float(np.max(np.abs(actual - self.TRAY_EXTENSION)))
+        return error <= self.TRAY_TOLERANCE, actual, error
 
     def step(self, articulation):
         if self.done or self.failed:
@@ -1019,6 +1060,19 @@ class CommandServingSequence:
         next_name, next_task = self._named_tasks[self._index]
         print(f"[integrated-serving] starting {next_name}", flush=True)
         if hasattr(next_task, "start_with_deployed_trays"):
+            deployed, actual, error = self._trays_are_physically_deployed(
+                articulation
+            )
+            if not deployed:
+                self.failed = True
+                print(
+                    "[integrated-serving] STOPPED: refusing to start "
+                    f"{next_name}; trays are not physically deployed "
+                    f"actual={np.round(actual, 4).tolist()}m "
+                    f"error={error:.4f}m",
+                    flush=True,
+                )
+                return
             next_task.start_with_deployed_trays()
 
     def close(self):
@@ -1626,9 +1680,10 @@ class NavBridge(Node):
                     self._clear_obstacle_state()
                     return
 
-            slow_distance = 1.4
-            stop_distance = 0.65
-            resume_distance = 0.95
+            # Start reacting earlier at the 0.50 m/s aisle cruise speed.
+            slow_distance = 1.70
+            stop_distance = 0.75
+            resume_distance = 1.05
             front_angle = math.radians(15.0)
 
             valid_ranges = []

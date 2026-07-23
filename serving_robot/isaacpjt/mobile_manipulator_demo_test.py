@@ -87,6 +87,7 @@ from cutlery_pick_place import CutleryBoxPickPlace
 from soda1_delivery import Soda1PickPlace
 from soda2_delivery import Soda2PickPlace
 from delivery_sequence import (
+    CommandServingSequence,
     PizzaThenSodaTask,
     PizzaSoda1Soda2Task,
     PizzaSoda1Soda2CutleryTask,
@@ -95,11 +96,12 @@ from delivery_sequence import (
 SERVING_TASK = os.environ.get("MOBILE_DEMO_TASK", "pizza").strip().lower()
 if SERVING_TASK not in {
     "pizza", "soda", "soda1", "soda2", "pizza_soda",
-    "pizza_soda1_soda2", "pizza_soda1_soda2_cutlery", "cutlery", "none"
+    "soda1_soda2", "soda1_soda2_cutlery", "pizza_soda1_soda2",
+    "pizza_soda1_soda2_cutlery", "cutlery", "none"
 }:
     raise ValueError(
         "MOBILE_DEMO_TASK must be one of: pizza, soda, soda1, soda2, "
-        "pizza_soda, pizza_soda1_soda2, "
+        "pizza_soda, soda1_soda2, soda1_soda2_cutlery, pizza_soda1_soda2, "
         "pizza_soda1_soda2_cutlery, cutlery, none; "
         f"got {SERVING_TASK!r}"
     )
@@ -1089,6 +1091,21 @@ def main():
         serving_task = Soda2PickPlace(stage)
     elif SERVING_TASK == "cutlery":
         serving_task = CutleryBoxPickPlace(stage)
+    elif SERVING_TASK == "soda1_soda2":
+        serving_task = CommandServingSequence(
+            [
+                ("soda1", Soda1PickPlace(stage)),
+                ("soda2", Soda2PickPlace(stage, wait_for_start=True)),
+            ]
+        )
+    elif SERVING_TASK == "soda1_soda2_cutlery":
+        serving_task = CommandServingSequence(
+            [
+                ("soda1", Soda1PickPlace(stage)),
+                ("soda2", Soda2PickPlace(stage, wait_for_start=True)),
+                ("cutlery", CutleryBoxPickPlace(stage, wait_for_start=True)),
+            ]
+        )
     elif SERVING_TASK == "pizza_soda" and PICK_PLACE_ENABLED:
         serving_task = PizzaThenSodaTask(
             TrayPizzaPickPlace(stage),

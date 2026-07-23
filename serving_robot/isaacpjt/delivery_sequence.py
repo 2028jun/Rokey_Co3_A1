@@ -1,138 +1,133 @@
 """Small task orchestrators for composed serving demonstrations."""
 
 
-class PizzaThenSodaTask:
-    """Run independent pizza and soda tasks in sequence."""
+class CommandServingSequence:
+    """Run an arbitrary non-empty payload order with safe tray ownership."""
 
-    def __init__(self, pizza_task, soda_task):
-        self._pizza = pizza_task
-        self._soda = soda_task
-        self._soda_started = False
-        self.done = False
-        self.failed = False
+    TRAY_TASK_NAMES = frozenset({"soda1", "soda2", "cutlery"})
 
-    def initialize(self, articulation, dof_names):
-        self._pizza.initialize(articulation, dof_names)
-        self._soda.initialize(articulation, dof_names)
-        print("[serving-sequence] order=pizza -> soda (all initialized)", flush=True)
-
-    def step(self, articulation):
-        if self.done or self.failed:
-            return
-        if not self._pizza.done:
-            self._pizza.step(articulation)
-            if self._pizza.failed:
-                self.failed = True
-                print("[serving-sequence] STOPPED: pizza task failed", flush=True)
-            return
-        if not self._soda_started:
-            self._soda_started = True
-            print("[serving-sequence] pizza complete; starting soda task", flush=True)
-            self._soda.start_with_deployed_trays()
-        self._soda.step(articulation)
-        if self._soda.failed:
-            self.failed = True
-            print("[serving-sequence] STOPPED: soda task failed", flush=True)
-        elif self._soda.done:
-            self.done = True
-            print("[serving-sequence] pizza and soda deliveries complete", flush=True)
-
-    def close(self):
-        for task in (self._pizza, self._soda):
-            try:
-                task.close()
-            except Exception:
-                pass
-
-
-class PizzaSoda1Soda2Task:
-    """Run pizza, soda1, then soda2 in sequence."""
-
-    def __init__(self, pizza_task, soda1_task, soda2_task):
-        self._tasks = [pizza_task, soda1_task, soda2_task]
-        self._names = ("pizza", "soda1", "soda2")
+    def __init__(self, named_tasks):
+        self._named_tasks = list(named_tasks)
+        if not self._named_tasks:
+            raise ValueError("serving sequence contains no delivery tasks")
+        names = [name for name, _ in self._named_tasks]
+        if len(names) != len(set(names)):
+            raise ValueError(f"serving sequence contains duplicate tasks: {names}")
+        unknown = set(names) - self.TRAY_TASK_NAMES - {"pizza"}
+        if unknown:
+            raise ValueError(f"serving sequence contains unknown tasks: {sorted(unknown)}")
+        self._has_pizza = "pizza" in names
+        self._has_tray_payload = any(
+            name in self.TRAY_TASK_NAMES for name in names
+        )
         self._index = 0
         self.done = False
         self.failed = False
 
     def initialize(self, articulation, dof_names):
-        for task in self._tasks:
+        for name, task in self._named_tasks:
+            if name == "pizza":
+                task.set_parallel_tray_deployment(self._has_tray_payload)
             task.initialize(articulation, dof_names)
-        print("[serving-sequence] order=pizza -> soda1 -> soda2 (all initialized)", flush=True)
-
-    def step(self, articulation):
-        if self.done or self.failed:
-            return
-        task = self._tasks[self._index]
-        task.step(articulation)
-        if task.failed:
-            self.failed = True
-            print(f"[serving-sequence] STOPPED: {self._names[self._index]} failed", flush=True)
-            return
-        if not task.done:
-            return
-        completed_name = self._names[self._index]
-        self._index += 1
-        if self._index >= len(self._tasks):
-            self.done = True
-            print("[serving-sequence] pizza, soda1 and soda2 deliveries complete", flush=True)
-            return
-        print(f"[serving-sequence] {completed_name} complete; starting {self._names[self._index]}", flush=True)
-        next_task = self._tasks[self._index]
-        if hasattr(next_task, "start_with_deployed_trays"):
-            next_task.start_with_deployed_trays()
-
-    def close(self):
-        for task in self._tasks:
-            try:
-                task.close()
-            except Exception:
-                pass
-
-
-class PizzaSoda1Soda2CutleryTask:
-    """Run the complete meal delivery sequence in sequence."""
-
-    def __init__(self, pizza_task, soda1_task, soda2_task, cutlery_task):
-        self._tasks = [pizza_task, soda1_task, soda2_task, cutlery_task]
-        self._names = ("pizza", "soda1", "soda2", "cutlery")
-        self._index = 0
-        self.done = False
-        self.failed = False
-
-    def initialize(self, articulation, dof_names):
-        for task in self._tasks:
-            task.initialize(articulation, dof_names)
+        order = " -> ".join(name for name, _ in self._named_tasks)
+        mode = (
+            "parallel-pizza-tray"
+            if self._has_pizza and self._has_tray_payload
+            else "pizza-only"
+            if self._has_pizza
+            else "first-payload-deploys-tray"
+        )
         print(
-            "[serving-sequence] order=pizza -> soda1 -> soda2 -> cutlery (all initialized)",
+            f"[serving-sequence] order={order} mode={mode} (all initialized)",
             flush=True,
         )
 
     def step(self, articulation):
         if self.done or self.failed:
             return
-        task = self._tasks[self._index]
+        name, task = self._named_tasks[self._index]
         task.step(articulation)
         if task.failed:
             self.failed = True
-            print(f"[serving-sequence] STOPPED: {self._names[self._index]} failed", flush=True)
+            print(f"[serving-sequence] STOPPED: {name} failed", flush=True)
             return
         if not task.done:
             return
-        completed_name = self._names[self._index]
         self._index += 1
-        if self._index >= len(self._tasks):
+        if self._index >= len(self._named_tasks):
             self.done = True
-            print("[serving-sequence] pizza, soda1, soda2 and cutlery deliveries complete", flush=True)
+            print("[serving-sequence] all deliveries complete", flush=True)
             return
-        print(f"[serving-sequence] {completed_name} complete; starting {self._names[self._index]}", flush=True)
-        next_task = self._tasks[self._index]
+        next_name, next_task = self._named_tasks[self._index]
+        print(
+            f"[serving-sequence] {name} complete; starting {next_name}",
+            flush=True,
+        )
+        # Pizza or the first payload task owns deployment. Every later tray
+        # payload re-reads its live pose but reuses the already-open trays.
         if hasattr(next_task, "start_with_deployed_trays"):
             next_task.start_with_deployed_trays()
 
     def close(self):
-        for task in self._tasks:
+        for _, task in self._named_tasks:
             try:
                 task.close()
             except Exception:
                 pass
+
+
+class PizzaThenSodaTask(CommandServingSequence):
+    """Run independent pizza and soda tasks in sequence."""
+
+    def __init__(self, pizza_task, soda_task):
+        super().__init__([("pizza", pizza_task), ("soda1", soda_task)])
+
+    def initialize(self, articulation, dof_names):
+        super().initialize(articulation, dof_names)
+
+    def step(self, articulation):
+        super().step(articulation)
+
+    def close(self):
+        super().close()
+
+
+class PizzaSoda1Soda2Task(CommandServingSequence):
+    """Run pizza, soda1, then soda2 in sequence."""
+
+    def __init__(self, pizza_task, soda1_task, soda2_task):
+        super().__init__(
+            [("pizza", pizza_task), ("soda1", soda1_task), ("soda2", soda2_task)]
+        )
+
+    def initialize(self, articulation, dof_names):
+        super().initialize(articulation, dof_names)
+
+    def step(self, articulation):
+        super().step(articulation)
+
+    def close(self):
+        super().close()
+
+
+class PizzaSoda1Soda2CutleryTask(CommandServingSequence):
+    """Run the complete meal delivery sequence in sequence."""
+
+    def __init__(self, pizza_task, soda1_task, soda2_task, cutlery_task):
+        super().__init__(
+            [
+                ("pizza", pizza_task),
+                ("soda1", soda1_task),
+                ("soda2", soda2_task),
+                ("cutlery", cutlery_task),
+            ]
+        )
+
+    def initialize(self, articulation, dof_names):
+        super().initialize(articulation, dof_names)
+
+    def step(self, articulation):
+        super().step(articulation)
+
+    def close(self):
+        super().close()
