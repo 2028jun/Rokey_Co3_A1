@@ -1466,9 +1466,9 @@ class NavBridge(Node):
                     self._obstacle_scale = 1.0
                     return
 
-            slow_distance = 2.5
-            stop_distance = 1.0
-            resume_distance = 1.4
+            slow_distance = 3.0
+            stop_distance = 1.5
+            resume_distance = 1.8
             front_angle = math.radians(20.0)
 
             valid_ranges = []
