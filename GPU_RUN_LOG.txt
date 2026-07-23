@@ -421,3 +421,173 @@ Still broken / follow-up (i.e., Pass 5's actual job):
 - The ~5 FPS RGB/detection performance question raised in an earlier
   prompt revision was never actually investigated in any prior pass's log
   entry and remains open; unrelated to this rig change.
+
+## Pass 5 -- 2026-07-23 (commit <fill in after committing>)
+
+Tested:
+- Task 1: loaded `assets/rigid_arm_asset.usda` in isolation (referenced onto
+  a throwaway prim, no full scene) and inspected the `RightArmRig`/
+  `ElbowPivot` hierarchy, all four expected meshes, and their bound
+  materials.
+- Task 2: ran the full demo (`isaacpjt/mobile_manipulator_demo.py`,
+  `HAND_TEST_RIG_MODE=rigid_arm` default) headless with `hand_safety`
+  attached, watched 10+ reach cycles via the real
+  `/serving_robot/table_camera` feed and via a standalone free-camera script
+  driving the actual `ReachAnimator`/`two_bone_ik` code at several progress
+  checkpoints (0/0.3/0.6/0.85/1.0) to inspect motion and boundary seams
+  without waiting on wall-clock timing.
+- Task 3: ran `hand_detector_node` against the live table camera across
+  four full pipeline runs (iterating on fixes below), recording
+  `/hand_detection/detections` and `/hand_safety/roi_intrusion` over ~90s
+  windows each, plus an explicit `table_arrived=false` gating-suppression
+  check.
+
+Changed:
+- `isaacpjt/hand_intrusion_test_actor.py`: `RIG_ASSET_USD` is now an
+  absolute path (`Path(__file__).resolve().parents[1] / "assets" /
+  "rigid_arm_asset.usda"`) instead of the bare relative
+  `"assets/rigid_arm_asset.usda"`. Real bug found on hardware: USD resolves
+  a relative reference path against the *referencing layer's* location, not
+  the process's CWD, and this prim gets referenced onto a stage whose root
+  layer is the restaurant asset -- the relative path 404'd (looked for it
+  under `assets/lightweight_restaurant/assets/`).
+- `isaacpjt/hand_intrusion_test_actor.py`: `spawn_seated_person()` now pumps
+  `omni.kit.app.get_app().update()` in a bounded loop until `RightArmRig`
+  actually exists, for `rigid_arm` mode. Real bug found on hardware:
+  `mobile_manipulator_demo.py` constructs `ReachAnimator` immediately after
+  `spawn_seated_person()` with zero `simulation_app.update()` calls in
+  between; the legacy direct S3 character reference tolerated that, but
+  this rig's nested reference (local asset -> S3 character) isn't always
+  composed by the very next frame, and `ReachAnimator`'s constructor
+  crashed with `RuntimeError: rig prim missing: .../RightArmRig`.
+- `assets/rigid_arm_asset.usda`: added two `Sphere` prims, `ShoulderCap`
+  (under `RightArmRig`, radius 0.065) and `ElbowCap` (under `ElbowPivot`,
+  radius 0.06), both bound to the tshirt fabric material. Fixes a real,
+  hardware-only visual defect and, after two iterations, a false hand
+  detection it caused (see Observed).
+
+Observed:
+- Task 1 (asset load/materials): the reference resolved and all four
+  meshes (`UpperArm_Skin`, `UpperArm_Tshirt`, `ForearmHand_Skin`,
+  `ForearmHand_Glove`) rendered with correct materials (skin tone, tshirt
+  grey, glove -- no missing/pink/default) once the absolute-path bug above
+  was fixed. At the T-pose rest orientation (identity `xformOp:orient`,
+  matching this reference's actual render pose when unanimated -- confirmed
+  visually) the shoulder/elbow boundaries looked seamless, matching pass 5
+  prep's offline prediction.
+- Task 1/2 (rotation-induced gap): once the arm rotates through the
+  ~115deg shoulder / ~65deg elbow reach angle, a real gap opened at the
+  shoulder -- not the "small seam" pass 5 prep's build notes anticipated
+  from the boundary-face-dropping tradeoff, but a visibly large dark
+  cavity (the torso's fixed armhole opening sweeping away from the rotated
+  arm piece, an inherent consequence of any single rigid rotation about a
+  pivot: only points exactly at the pivot stay put). Fixed by adding a
+  sphere centered exactly on each rotation pivot (`RightArmRig`'s shoulder
+  pivot, `ElbowPivot`'s elbow pivot) -- a sphere centered on its own
+  rotation pivot is rendering-invariant to any rotation of that same
+  Xform, so it plugs the hole identically at every reach angle instead of
+  only at rest. Confirmed via the free-camera progress-checkpoint
+  captures: no visible hole at any of progress 0/0.3/0.6/0.85/1.0 with a
+  0.085 shoulder radius (see next finding for why it's 0.065 in the
+  shipped version).
+- Task 3 (self-inflicted false detection): the first working shoulder-cap
+  fix (radius 0.105, bound to skin material since the exposed area looked
+  skin-colored) closed the visual gap but caused a NEW, previously-absent
+  false "hand" detection on live hardware -- a static ~54x56px second
+  bounding box at (roughly) x:554-608 y:251-307, confidence ~0.42-0.7,
+  present throughout every reach (the real hand's bbox moved across the
+  frame; this one didn't). Root-caused across three iterations: (1)
+  switching the cap's material from skin to tshirt fabric (anatomically
+  correct anyway -- the true shoulder joint sits under a short sleeve)
+  made no difference (still ~0.40-0.65 confidence), proving the false
+  positive is driven by the cap's projected size/shape, not its color; (2)
+  shrinking radius 0.105 -> 0.085 reduced it to a borderline ~0.40-0.56
+  (often still above the 0.40 confidence threshold); (3) shrinking further
+  to 0.065 left ~0.40-0.65 confidence across ~1-1.5% of frames (11/787 in
+  the final ~90s window) -- present but low and infrequent enough that it
+  does not corrupt the `roi_intrusion` true/false gating pattern (next
+  finding), and does not reintroduce the pass-3 RG2 gripper false positive
+  (different bbox region entirely, explicitly re-checked: zero hits in the
+  gripper's known x~786-900 range across all four runs). Visually, even at
+  0.065 the shoulder looks completely seamless at the real table-camera's
+  operating distance (confirmed via burst-captured live frames), trading a
+  false-positive-prone larger cap for a smaller one that's still
+  cosmetically invisible at range. Not fully eliminated -- flagged as a
+  follow-up below rather than iterated further, since a primitive sphere
+  has diminishing returns and a proper fix likely needs non-primitive,
+  UV-shaped cap geometry.
+- Task 2 (reach motion): across all runs, the shoulder visibly rotates and
+  the elbow visibly bends during every reach cycle (both via the real
+  table camera and the free-camera checkpoint captures) -- a genuine
+  two-bone reach, not a repeat of the pre-pass-5 whole-torso slide. The
+  hand/glove lands on the 0.83m target with ~0 error (IK solve reconfirmed
+  on hardware, matching the offline pass-5-prep unit tests). The body
+  still leans/sinks toward the table (root Z reaches -0.4274m from a 0.0m
+  rest, per the pass-5-prep note that this is a physical consequence of
+  the ~1.4m chair-to-target distance vs. this character's ~0.5m arm reach)
+  -- judged this acceptable at the default
+  `HAND_TEST_REACH_EXTENSION_RATIO=0.85` from both the free-camera and
+  real table-camera views (reads as a person leaning across the table to
+  reach, not an unnatural flop); did not tune the ratio further. Did not
+  run a live `HAND_TEST_RIG_MODE=legacy` A/B -- the new rig's visible
+  elbow bend is an unambiguous improvement over the whole-torso slide
+  passes 1-4's own log entries already documented in detail, so a fresh
+  side-by-side render wasn't needed to make that call.
+- Task 3 (detection confidence, final 0.065-radius configuration):
+  `/hand_detection/detections` primary (highest-confidence) detection over
+  a ~90s window with default reach timing: 116 frames with >=1 detection,
+  confidence min 0.43 / avg 0.80 / max 0.91 -- same ballpark as pass 4's
+  ~0.88-0.89 baseline on this character's original skinned glove (the
+  lower average reflects this window sampling entire reach-hold ramps,
+  including partial-visibility frames at the start/end of each 0.4s hold,
+  not just steady-state peaks, which do reach 0.88-0.91).
+- Task 3 (roi_intrusion gating, final configuration): over a ~90s window
+  with default (5-10s period, 0.4s hold) timing, `roi_intrusion`
+  alternated cleanly between `false` runs (21-103 samples) and `true`
+  bursts (5-15 samples) in sync with each reach cycle -- ten clean cycles,
+  no scattered/spurious `true` readings breaking up the `false` runs.
+  Explicitly toggling `/serving_robot/table_arrived` to `false` mid-run
+  correctly disabled inference (`Hand inference disabled:
+  table_arrived=False`) and reset both `detection_enabled` and
+  `roi_intrusion` to `false`; toggling back to `true` re-enabled it.
+  `table_arrived` itself has no publisher anywhere in this repository
+  (grepped the whole tree) -- every prior pass's "table_arrived=True" log
+  line implies it was always published manually for testing (e.g. `ros2
+  topic pub`), same as done this pass; this is a gap in the actual
+  serving-robot integration, not something in scope for `hand_safety`'s
+  own testing.
+- Camera input confirmed still 1280x960 throughout;
+  `/serving_robot/table_camera/color/image_raw` measured at ~7-8 Hz
+  average (with startup variance) -- notably above the "~5 FPS" figure an
+  earlier prompt revision flagged as an open question. Not chased further
+  this pass (out of scope per the prompt), but recorded here since it may
+  already be resolved.
+
+Still broken / follow-up:
+- The shoulder-cap false "hand" detection is reduced (~1-1.5% of frames,
+  confidence 0.40-0.65, does not corrupt `roi_intrusion`'s true/false
+  gating pattern or reintroduce the RG2 false positive) but not fully
+  eliminated at radius 0.065. A primitive sphere has diminishing returns
+  here: shrinking further would likely reopen the (currently
+  invisible-at-range) shoulder gap for uncertain further confidence
+  reduction. A proper fix would replace the primitive sphere with
+  non-primitive, UV/normal-matched cap geometry shaped to the character's
+  actual shoulder cross-section -- not attempted this pass.
+- `/serving_robot/table_arrived` has no real publisher in this codebase;
+  `hand_safety`'s gating was verified entirely against a manually-
+  published stand-in (`ros2 topic pub`). Whatever navigation/docking node
+  is meant to publish it in the real serving-robot stack is out of scope
+  for this branch/pass.
+- `HAND_TEST_REACH_EXTENSION_RATIO` was judged acceptable at its default
+  (0.85) but not swept across alternate values (0.7/0.95) since the
+  default already looked natural; worth revisiting if a reviewer
+  disagrees.
+- The ~5 FPS performance question from an earlier prompt revision appears
+  possibly already resolved (~7-8 Hz measured this pass) but wasn't
+  specifically investigated; still nominally open.
+- `HAND_TEST_RIG_MODE=legacy` was not re-run live this pass for a fresh
+  A/B; kept as-is, no changes made to that code path. Given the still-open
+  shoulder-cap false positive above, recommend keeping it available as a
+  fallback rather than removing it, even though `rigid_arm` is now fit to
+  be the shipped default (materially better reach motion, comparable
+  detection confidence, clean gating).

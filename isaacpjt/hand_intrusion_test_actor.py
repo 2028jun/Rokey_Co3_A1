@@ -76,7 +76,9 @@ from __future__ import annotations
 import os
 import random
 import time
+from pathlib import Path
 
+import omni.kit.app
 from pxr import Gf, Usd, UsdGeom
 
 from two_bone_ik import solve_two_bone_ik
@@ -89,9 +91,16 @@ from two_bone_ik import solve_two_bone_ik
 # original asset with just the right-arm faces removed so nothing overlaps.
 # Override with a local path if you haven't deployed this asset yet -- see
 # assets/rigid_arm_asset.usda in this same delivery.
+#
+# Must be absolute: this prim gets referenced onto a stage whose root layer
+# is the restaurant asset (assets/lightweight_restaurant/...), and USD
+# resolves a relative reference path against the *referencing layer's*
+# location, not this process's CWD -- a bare "assets/rigid_arm_asset.usda"
+# silently 404s on hardware as "Could not open asset ... for reference"
+# (looks for it under assets/lightweight_restaurant/assets/).
 RIG_ASSET_USD = os.environ.get(
     "HAND_TEST_RIG_ASSET",
-    "assets/rigid_arm_asset.usda",
+    str(Path(__file__).resolve().parents[1] / "assets" / "rigid_arm_asset.usda"),
 )
 RIG_MODE = os.environ.get("HAND_TEST_RIG_MODE", "rigid_arm")  # or "legacy"
 
@@ -193,6 +202,26 @@ def spawn_seated_person(stage):
         prim.GetReferences().AddReference(_LEGACY_PERSON_USD)
     else:
         prim.GetReferences().AddReference(RIG_ASSET_USD)
+        # mobile_manipulator_demo.py constructs ReachAnimator immediately
+        # after this call with no simulation_app.update() in between (the
+        # legacy character reference tolerated that; this one references
+        # rigid_arm_asset.usda, which itself references the S3 character --
+        # a nested reference that isn't always composed by the very next
+        # frame). Pump the app until RightArmRig actually exists so
+        # ReachAnimator._get_orient_op doesn't run against a stage that
+        # hasn't finished loading yet -- hit on hardware as
+        # "RuntimeError: rig prim missing: .../RightArmRig".
+        app = omni.kit.app.get_app()
+        arm_rig_path = f"{PERSON_PRIM_PATH}/RightArmRig"
+        for _ in range(300):  # ~5s at 60Hz app update; loads are normally <1s
+            if stage.GetPrimAtPath(arm_rig_path).IsValid():
+                break
+            app.update()
+        else:
+            raise RuntimeError(
+                f"timed out waiting for rig asset to load: {RIG_ASSET_USD} "
+                f"({arm_rig_path} never appeared)"
+            )
 
     xformable = UsdGeom.Xformable(prim)
     xformable.ClearXformOpOrder()
