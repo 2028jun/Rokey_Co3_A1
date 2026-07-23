@@ -1,6 +1,6 @@
 # Nav2 free-path planning and rotate/drive-only execution with orthogonal A* and L-path.
 sample_spacing_m: 0.05
-maximum_cost: 120
+maximum_cost: 50
 
 # Orthogonal A*
 turn_penalty: 8.0

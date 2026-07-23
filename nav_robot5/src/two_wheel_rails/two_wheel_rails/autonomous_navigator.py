@@ -1,4 +1,4 @@
-"""Nav2 free-path planning replaced with Orthogonal L-Path, Orthogonal A*, and Docking Stage."""
+"""Nav2 free-path planning replaced with Orthogonal L-Path, Orthogonal A*, and Control-Frame Docking."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ DIRECTIONS = [(1, 0), (0, 1), (-1, 0), (0, -1)]
 @dataclass(frozen=True)
 class MotionConfig:
     sample_spacing_m: float = 0.05
-    maximum_cost: int = 120
+    maximum_cost: int = 50
     turn_penalty: float = 8.0
     obstacle_cost_weight: float = 3.0
     corner_replan_attempts: int = 3
@@ -68,6 +68,22 @@ def load_motion_config() -> MotionConfig:
     with path.open(encoding="utf-8") as stream:
         raw = yaml.safe_load(stream) or {}
     return MotionConfig(**{k: v for k, v in raw.items() if k in MotionConfig.__dataclass_fields__})
+
+
+def _point_line_distance(point: Point, start: Point, end: Point) -> float:
+    px, py = point
+    ax, ay = start
+    bx, by = end
+    dx = bx - ax
+    dy = by - ay
+    denom = dx * dx + dy * dy
+    if denom <= 1e-12:
+        return math.hypot(px - ax, py - ay)
+    t = ((px - ax) * dx + (py - ay) * dy) / denom
+    t = max(0.0, min(1.0, t))
+    nearest_x = ax + t * dx
+    nearest_y = ay + t * dy
+    return math.hypot(px - nearest_x, py - nearest_y)
 
 
 def remove_near_duplicate_points(points: list[Point], min_dist_m: float = 0.02) -> list[Point]:
@@ -113,9 +129,9 @@ def segment_is_clear(
     spacing_m: float,
     max_cost: int,
 ) -> tuple[bool, float, int]:
-    """Check line segment clearance. Returns (is_clear, avg_cost, max_cost_found)."""
+    """Check line segment clearance. Costmap missing strictly fails."""
     if costmap is None:
-        return True, 0.0, 0
+        return False, float("inf"), 255
 
     dx = end[0] - start[0]
     dy = end[1] - start[1]
@@ -129,7 +145,7 @@ def segment_is_clear(
         x = start[0] + ratio * dx
         y = start[1] + ratio * dy
         c = get_costmap_cost(costmap, x, y)
-        if c is None or c > max_cost:
+        if c is None or c < 0 or c > max_cost:
             return False, float("inf"), 255
         costs.append(c)
         if c > max_c:
@@ -147,7 +163,7 @@ def corner_rotation_is_clear(
     max_cost: int,
 ) -> bool:
     if costmap is None:
-        return True
+        return False
 
     x0, y0 = corner
     steps = math.ceil((2.0 * radius_m) / spacing_m)
@@ -158,13 +174,13 @@ def corner_rotation_is_clear(
             if math.hypot(x - x0, y - y0) > radius_m:
                 continue
             c = get_costmap_cost(costmap, x, y)
-            if c is None or c > max_cost:
+            if c is None or c < 0 or c > max_cost:
                 return False
     return True
 
 
 class SimplifiedPathNavigator:
-    """Orthogonal L-path & A* navigator with corner rotation check and docking stage."""
+    """Orthogonal L-path & A* navigator with strict costmap, control-frame transformation, and 0.6m docking stage."""
 
     def __init__(self, nav: BasicNavigator, tf_buffer, tracker: AmclPoseTracker) -> None:
         self._nav = nav
@@ -178,7 +194,7 @@ class SimplifiedPathNavigator:
         self._costmap: OccupancyGrid | None = None
         self._costmap_sub = nav.create_subscription(
             OccupancyGrid,
-            "/global_costmap/costmap_raw",
+            "/global_costmap/costmap",
             self._on_costmap,
             1,
         )
@@ -245,7 +261,9 @@ class SimplifiedPathNavigator:
         pub.publish(path)
 
     def _evaluate_l_candidate(self, points: list[Point]) -> tuple[bool, float]:
-        """Check L-candidate clearance and score."""
+        if self._costmap is None:
+            return False, float("inf")
+
         tot_len = 0.0
         tot_avg_cost = 0.0
         max_cost_all = 0
@@ -261,7 +279,6 @@ class SimplifiedPathNavigator:
             if max_c > max_cost_all:
                 max_cost_all = max_c
 
-        # Corner rotation clearance
         for pt in points[1:-1]:
             if not corner_rotation_is_clear(
                 pt,
@@ -277,7 +294,7 @@ class SimplifiedPathNavigator:
 
     def _orthogonal_astar(self, start: Point, goal: Point, forbidden_cells: set[GridCell]) -> list[Point] | None:
         if self._costmap is None:
-            return make_l_candidates(start, goal)[0]
+            return None
 
         info = self._costmap.info
         res = info.resolution
@@ -295,7 +312,6 @@ class SimplifiedPathNavigator:
         start_cell = world_to_cell(start)
         goal_cell = world_to_cell(goal)
 
-        # Priority Queue: (f_score, g_score, cell, direction_idx)
         open_set = []
         for d in range(4):
             heapq.heappush(open_set, (0.0, 0.0, start_cell, d))
@@ -327,7 +343,7 @@ class SimplifiedPathNavigator:
 
                 nxt_pt = cell_to_world(nxt_cell)
                 cost_val = get_costmap_cost(self._costmap, nxt_pt[0], nxt_pt[1])
-                if cost_val is None or cost_val > self._cfg.maximum_cost:
+                if cost_val is None or cost_val < 0 or cost_val > self._cfg.maximum_cost:
                     continue
 
                 move_cost = res
@@ -346,7 +362,6 @@ class SimplifiedPathNavigator:
         if found_state is None:
             return None
 
-        # Reconstruct grid cell path
         path_cells = []
         curr = found_state
         while curr in came_from:
@@ -355,10 +370,8 @@ class SimplifiedPathNavigator:
         path_cells.append(start_cell)
         path_cells.reverse()
 
-        # Convert to world points
         raw_pts = [start] + [cell_to_world(c) for c in path_cells[1:-1]] + [goal]
 
-        # Compress grid path to corner direction changes only
         compressed = [raw_pts[0]]
         for i in range(1, len(raw_pts) - 1):
             p_prev, p_curr, p_next = compressed[-1], raw_pts[i], raw_pts[i + 1]
@@ -371,6 +384,9 @@ class SimplifiedPathNavigator:
         return remove_near_duplicate_points(compressed)
 
     def _plan_orthogonal_path(self, start: Point, goal: Point) -> list[Point]:
+        if self._costmap is None:
+            raise RuntimeError("global costmap (/global_costmap/costmap) has not been received yet")
+
         # Step 1 & 2: Evaluate 2 L-shaped candidates
         l_cands = make_l_candidates(start, goal)
         all_cand_pts = []
@@ -395,17 +411,16 @@ class SimplifiedPathNavigator:
 
         # Step 3 & 4: Orthogonal A* with corner clearance validation
         forbidden_cells: set[GridCell] = set()
-        info = self._costmap.info if self._costmap else None
-        res = info.resolution if info else 0.05
-        ox = info.origin.position.x if info else 0.0
-        oy = info.origin.position.y if info else 0.0
+        info = self._costmap.info
+        res = info.resolution
+        ox = info.origin.position.x
+        oy = info.origin.position.y
 
         for attempt in range(self._cfg.corner_replan_attempts + 1):
             astar_pts = self._orthogonal_astar(start, goal, forbidden_cells)
             if astar_pts is None:
                 raise RuntimeError("Orthogonal A* failed to find path")
 
-            # Validate corners
             invalid_corner = None
             for corner in astar_pts[1:-1]:
                 if not corner_rotation_is_clear(
@@ -465,21 +480,34 @@ class SimplifiedPathNavigator:
         self._stop()
         return False
 
-    def _drive_segment(self, start: Point, end: Point, label: str) -> bool:
-        map_heading = math.atan2(end[1] - start[1], end[0] - start[0])
-        length = math.hypot(end[0] - start[0], end[1] - start[1])
-
-        # Convert map points to control frame target
+    def _drive_segment(self, map_start: Point, map_end: Point, label: str) -> bool:
         map_p = self._map_pose()
         raw_p = self._motion_pose()
-        if map_p is not None and raw_p is not None:
-            yaw_offset = normalize_angle(raw_p[2] - map_p[2])
-            map_yaw_deg = math.degrees(map_p[2])
-        else:
-            yaw_offset = 0.0
-            map_yaw_deg = 0.0
+        if map_p is None or raw_p is None:
+            return False
 
+        # Convert Map Frame Start & End to Control Frame Start & End
+        yaw_offset = normalize_angle(raw_p[2] - map_p[2])
+        map_heading = math.atan2(map_end[1] - map_start[1], map_end[0] - map_start[0])
         control_target_yaw = normalize_angle(map_heading + yaw_offset)
+
+        dx_start = map_start[0] - map_p[0]
+        dy_start = map_start[1] - map_p[1]
+        dx_end = map_end[0] - map_p[0]
+        dy_end = map_end[1] - map_p[1]
+
+        c_rot = math.cos(yaw_offset)
+        s_rot = math.sin(yaw_offset)
+
+        control_start = (
+            raw_p[0] + (c_rot * dx_start - s_rot * dy_start),
+            raw_p[1] + (s_rot * dx_start + c_rot * dy_start),
+        )
+        control_end = (
+            raw_p[0] + (c_rot * dx_end - s_rot * dy_end),
+            raw_p[1] + (s_rot * dx_end + c_rot * dy_end),
+        )
+        length = math.hypot(control_end[0] - control_start[0], control_end[1] - control_start[1])
 
         if not self._rotate_to(control_target_yaw, f"{label}:align"):
             return False
@@ -493,7 +521,9 @@ class SimplifiedPathNavigator:
             if pose is None:
                 continue
             x, y, yaw = pose
-            distance = math.hypot(end[0] - x, end[1] - y)
+
+            # Distance & CTE calculated purely in Control Frame!
+            distance = math.hypot(control_end[0] - x, control_end[1] - y)
             if distance <= self._cfg.waypoint_tolerance_m:
                 self._stop()
                 return True
@@ -505,10 +535,10 @@ class SimplifiedPathNavigator:
                     return False
                 continue
 
-            cte = _point_line_distance((x, y), start, end)
+            cte = _point_line_distance((x, y), control_start, control_end)
             if cte > self._cfg.replan_cte_m:
                 self._stop()
-                print(f"[{label}] CTE {cte:.2f}m -> replan requested", flush=True)
+                print(f"[{label}] CTE {cte:.2f}m > limit {self._cfg.replan_cte_m:.2f}m -> segment failed", flush=True)
                 return False
 
             cmd = Twist()
@@ -524,7 +554,7 @@ class SimplifiedPathNavigator:
                 print(
                     f"[{label}] drive dist={distance:.2f}m cte={cte:.2f}m "
                     f"ctrl_err={math.degrees(heading_error):.1f}deg "
-                    f"(ctrl_yaw={math.degrees(yaw):.1f}deg, map_yaw={map_yaw_deg:.1f}deg)",
+                    f"(ctrl_yaw={math.degrees(yaw):.1f}deg, map_yaw={math.degrees(map_p[2]):.1f}deg)",
                     flush=True,
                 )
                 last_log = now
@@ -532,13 +562,6 @@ class SimplifiedPathNavigator:
         return False
 
     def navigate_to(self, goal: PoseStamped, *, label: str = "goal") -> bool:
-        # Extract map start and final goal pose
-        map_p = self._map_pose()
-        if map_p is None:
-            print(f"[{label}] planning failed: cannot resolve map pose", flush=True)
-            return False
-
-        start_pt = (map_p[0], map_p[1])
         gx = goal.pose.position.x
         gy = goal.pose.position.y
         q = goal.pose.orientation
@@ -547,7 +570,6 @@ class SimplifiedPathNavigator:
             1.0 - 2.0 * (q.y * q.y + q.z * q.z),
         )
 
-        # Step 5: Compute Docking Approach Point (0.60m before final dock)
         app_dist = self._cfg.dock_approach_distance_m
         approach_pt = (
             gx - app_dist * math.cos(goal_yaw),
@@ -555,33 +577,68 @@ class SimplifiedPathNavigator:
         )
         self._publish_rviz_path(self._pub_dock_approach, [approach_pt, (gx, gy)])
 
-        # Plan orthogonal path to approach point
-        try:
-            points = self._plan_orthogonal_path(start_pt, approach_pt)
-        except RuntimeError as exc:
-            print(f"[{label}] orthogonal planning failed: {exc}", flush=True)
-            return False
-
-        # Execute main path up to approach point
-        for index, (s, e) in enumerate(zip(points, points[1:]), start=1):
-            if not self._drive_segment(s, e, f"{label}:seg{index}"):
-                print(f"[{label}] main path execution failed at seg{index}", flush=True)
+        # Outer Re-planning Loop
+        for attempt in range(self._cfg.replan_attempts + 1):
+            map_p = self._map_pose()
+            if map_p is None:
+                print(f"[{label}] planning failed: cannot resolve map pose", flush=True)
                 return False
 
-        # Step 5 (Continued): Final 0.60m Docking Stage
+            start_pt = (map_p[0], map_p[1])
+            try:
+                points = self._plan_orthogonal_path(start_pt, approach_pt)
+            except RuntimeError as exc:
+                print(f"[{label}] orthogonal planning failed (attempt {attempt}): {exc}", flush=True)
+                if attempt < self._cfg.replan_attempts:
+                    time.sleep(0.5)
+                    continue
+                return False
+
+            # Execute main path up to approach point
+            failed = False
+            for index, (s, e) in enumerate(zip(points, points[1:]), start=1):
+                if not self._drive_segment(s, e, f"{label}:seg{index}"):
+                    print(f"[{label}] segment {index} failed; replanning (attempt {attempt + 1})...", flush=True)
+                    failed = True
+                    break
+
+            if failed:
+                if attempt < self._cfg.replan_attempts:
+                    time.sleep(0.5)
+                    continue
+                return False
+
+            # Approach point successfully reached! Proceed to Docking Stage
+            break
+
         print(f"[{label}] approach point reached; starting 0.6m slow docking stage", flush=True)
 
+        # Final Docking Stage with Map -> Control Frame Goal Transformation
         raw_p = self._motion_pose()
         map_p = self._map_pose()
-        yaw_offset = normalize_angle(raw_p[2] - map_p[2]) if (map_p and raw_p) else 0.0
+        if map_p is None or raw_p is None:
+            print(f"[{label}] docking failed: missing pose", flush=True)
+            return False
+
+        yaw_offset = normalize_angle(raw_p[2] - map_p[2])
         ctrl_goal_yaw = normalize_angle(goal_yaw + yaw_offset)
+
+        dx_map = gx - map_p[0]
+        dy_map = gy - map_p[1]
+        c_rot = math.cos(yaw_offset)
+        s_rot = math.sin(yaw_offset)
+
+        ctrl_dock_x = raw_p[0] + (c_rot * dx_map - s_rot * dy_map)
+        ctrl_dock_y = raw_p[1] + (s_rot * dx_map + c_rot * dy_map)
 
         # 1. Rotate to final dock yaw
         if not self._rotate_to(ctrl_goal_yaw, f"{label}:dock_align"):
             return False
 
-        # 2. Slow incremental straight drive toward final dock point
+        # 2. Slow 0.15m step-based straight drive toward final dock point
         started = time.monotonic()
+        step_dist = self._cfg.dock_step_distance_m
+
         while time.monotonic() - started < 30.0:
             rclpy.spin_once(self._nav, timeout_sec=0.03)
             pose = self._motion_pose()
@@ -589,7 +646,7 @@ class SimplifiedPathNavigator:
                 continue
 
             x, y, yaw = pose
-            dist_to_dock = math.hypot(gx - x, gy - y)
+            dist_to_dock = math.hypot(ctrl_dock_x - x, ctrl_dock_y - y)
             yaw_err = normalize_angle(ctrl_goal_yaw - yaw)
 
             if dist_to_dock <= self._cfg.dock_xy_tolerance_m and abs(yaw_err) <= self._cfg.dock_yaw_tolerance_rad:
@@ -599,15 +656,18 @@ class SimplifiedPathNavigator:
 
             if abs(yaw_err) >= self._cfg.dock_realign_threshold_rad:
                 self._stop()
+                print(f"[{label}] docking yaw drift ({math.degrees(yaw_err):.1f}deg); realigning...", flush=True)
                 if not self._rotate_to(ctrl_goal_yaw, f"{label}:dock_realign"):
                     return False
                 continue
 
+            # Move in incremental steps of 0.15m
+            current_step = min(step_dist, dist_to_dock)
             cmd = Twist()
             cmd.angular.z = 0.0
             cmd.linear.x = max(
                 self._cfg.dock_min_linear_speed_mps,
-                min(self._cfg.dock_max_linear_speed_mps, 0.4 * dist_to_dock),
+                min(self._cfg.dock_max_linear_speed_mps, 0.4 * current_step),
             )
             self._publish_cmd(cmd)
 
