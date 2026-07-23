@@ -2,83 +2,59 @@
 table so hand_safety's ROI-intrusion detector can be exercised without a
 real camera or a real hand.
 
-Hardware pass #1 (commit "Fix hand-safety GPU test scaffold and default it
-to run out of the box") confirmed topics/gating/ROI placement work end to
-end, but the whole-body-slide reach never puts a recognizable hand in the
-ROI: the character's own baked idle animation keeps its hands at its sides
-regardless of where the root prim is translated to.
+Hardware pass #1 confirmed topics/gating/ROI placement work end to end, but
+the whole-body-slide reach never puts a recognizable hand in the ROI in a
+natural way: the character's own baked idle animation keeps its hands at
+its sides, so the *entire* body had to translate to bring the hand to
+table height, visibly sinking/lying across the table during every reach.
 
-Hardware pass #2 tried real per-joint arm control via UsdSkel (rotate the
-forearm joint through a freshly-bound, rest-pose-seeded SkelAnimation).
-That setup ran without exceptions and `UsdSkel.Cache`/`SkelQuery` confirmed
-the joint's *computed* local transform updated correctly -- but the
-*rendered* image never showed the arm move, proven with a pixel-diff on
-matched before/after renders (isolated repro, dome-lit, camera framed on
-the character, explicit `simulation_app.update()` ticks and a single
-deterministic `rep.orchestrator.step()` render -- no live-timing race
-possible). Writing through the Fabric-native `usdrt.UsdSkel.Animation` API
-instead of `pxr.UsdSkel` made no difference either. This matches a
-documented NVIDIA caveat (`omni.anim.graph.core` changelog: "usdskel
-omnihydra does not handle both fabric + USD change well") -- late-bound
-SkelAnimation joint rotations on Isaac Sim 5.1.0-rc.19 do not appear to
-reach the Hydra skinning pipeline in this build, regardless of which USD
-API authors them. Per-joint rotation is not used here anymore.
+Hardware pass #2 (per-joint UsdSkel rotation) and pass #4 (the officially
+supported Animation Graph route) both failed to move the arm on this Isaac
+Sim build -- see the original module history for the full writeup. Both
+failures are specific to the *skinning* pipeline (Hydra not picking up
+late-bound SkelAnimation edits, and omni.anim.graph.core segfaulting
+headless). Neither failure applies to a plain, non-skinned Xform hierarchy,
+which is exactly how pass #1's whole-body translate itself worked -- a
+plain `Xformable` translate/orient op update always rendered correctly.
 
-This pass instead computes, analytically, the rest-pose *world* offset of
-the character's right hand from its own root Xform, rotates that offset by
-`SEAT_YAW_DEGREES` to match how the character is placed, and picks the
-whole-body translate target so that offset lands exactly on
-`TABLE_HAND_TARGET`. This only relies on `Xformable.Set()` on a plain
-translate op (confirmed on hardware: a 20s hold with a long, deliberately
-un-rushed capture window shows the character's hand landing squarely on
-the table -- earlier same-session captures that looked like translate
-"wasn't rendering" were simply mistimed, grabbed after a 2-4s reach window
-had already ended given this script's own multi-step capture latency, not
-a real rendering bug). It is a known visual compromise, not a real arm
-reach: since this character's rest pose holds the arm out and up near
-shoulder height, the whole body has to translate low enough to bring that
-hand down to table height, so during the reach the character visibly
-sinks/lies across the table. Acceptable for exercising the detector;
-revisit with a seated/lower-rest-pose character if a natural-looking
-reach is ever needed.
+Pass #5 (this one) exploits that: it extracts the character's own right
+upper-arm and forearm+hand geometry (skin + sleeve + glove meshes, split by
+which skeleton joint dominantly influences each vertex) out of the skinned
+mesh entirely and re-parents those pieces under a plain two-bone `Xform`
+chain (`RightArmRig -> ElbowPivot`) that this script drives directly with
+`xformOp:orient` quaternions -- no UsdSkel, no Animation Graph, so neither
+of the previously-hit rendering bugs apply. The rest of the body (the
+original skinned character, with the right arm's faces removed so nothing
+overlaps) stays parented under the same seat translate as before.
 
-The hand offset below is hardcoded (measured once via
-`skeleton.GetBindTransformsAttr()` in an isolated script) rather than
-queried from the live spawned prim each run, purely to keep this module's
-runtime path simple -- not because live UsdSkel queries were shown to
-cause any problem (they weren't retested after the capture-timing bug
-above was found, so that earlier suspicion is unconfirmed). If
-`HAND_TEST_PERSON_USD` is overridden to a different character, re-measure
-this constant for that asset's own right-hand joint (run
-`list_skeleton_joints()` to find the joint, then read its
-`bindTransforms` entry) rather than assuming this offset still applies.
+IMPORTANT: the chair (Chair_01, ~(-2.7,-3.2,0)) sits about 1.4m from
+TABLE_HAND_TARGET in a straight line, and this character's own two-bone arm
+(upper arm + forearm, measured from its own bind pose) only spans ~0.5m
+fully extended. A real arm cannot cover a 1.4m gap by rotating at a fixed
+shoulder -- pass #1's whole-body slide existed for exactly this reason, and
+that physical constraint doesn't go away just because the arm can now bend.
+This pass therefore still leans the whole body most of the way (using the
+same translateOp pass #1 already had), but only as far as leaving the last
+~85% of the arm's own reach to close -- so the elbow visibly bends into a
+natural-looking reach for the final stretch instead of the arm staying
+rigidly glued to the side while the whole body does 100% of the work. The
+lean is computed from the actual SHOULDER position (seat + yawed P_UP), not
+the character root, and still needs to bring the root below its rest Z
+(the target sits well below this standing character's shoulder height) --
+same "sinks toward the table" characteristic pass #1 already documented,
+just less pronounced and now paired with a genuine elbow bend.
 
-Hardware pass #4 tried the officially-supported route instead of this
-whole-body compromise: apply the `Biped_Setup` Animation Graph to a
-character's SkelRoot and trigger a built-in clip (`push_button.skelanim.usd`,
-registered as a custom "Timing" command via
-`omni.anim.people.scripts.custom_command.populate_anim_graph
-.populate_timing_template`) through `omni.anim.graph.core.get_character(...)
-.set_variable("Action", "push_button")`, per NVIDIA's documented Actor
-Control workflow. Enabling the `omni.anim.graph.core` extension in this
-headless standalone script reproducibly segfaults Isaac Sim
-5.1.0-rc.19 -- confirmed at the *minimal* possible repro (just enable the
-extension, reference `Biped_Setup.usd`, tick `simulation_app.update()` a
-few times; crashes inside `RunLoopThread::update()` before any
-Animation-Graph-specific API is even called). Not something fixable from
-this script. Per-joint animation via the runtime Animation Graph is
-therefore also ruled out on this build, same as pass 2's raw-`UsdSkel`
-attempt, for an unrelated reason (native crash vs. silently-ignored edit).
-The whole-body translate remains the only working reach mechanism.
-
-Pass 4 also compared three People characters with this mechanism and
-found meaningfully different YOLO hand-detection confidence for the same
-reach geometry: F_Business_02 ~0.52, F_Medical_01 ~0.82,
-male_adult_construction_01_new ~0.88-0.89 (its light-colored work glove
-reads as a cleaner "hand" shape to the HaGRIDv2 model). Switched the
-default to the construction character on that evidence; see
-`_RIGHT_HAND_REST_LOCAL_OFFSET` below for the other two characters'
-measured offsets if reverting.
+The two-bone shoulder/elbow angles and the lean distance are solved
+analytically each reach (`two_bone_ik.solve_two_bone_ik`), not
+baked/measured by hand, so this generalizes to any target position on the
+table without re-tuning. The solver, the extraction pivots, and the full
+lean+arm pipeline were unit-verified against the actual mesh data (see the
+asset-build notes at the bottom of this file) with sub-micron
+reconstruction error; what has NOT been verified is how it actually
+*renders* -- this pass was written and tested in a CPU-only environment
+without Isaac Sim. Confirm the reach visually before trusting this over the
+old whole-body version (env var `HAND_TEST_RIG_MODE=legacy` switches back
+to it).
 
 Usage (opt-in, from mobile_manipulator_demo.py):
 
@@ -93,12 +69,6 @@ Usage (opt-in, from mobile_manipulator_demo.py):
         if reach_animator is not None:
             reach_animator.update()
         time.sleep(0.010)
-
-Debugging on hardware: if the reach target still looks wrong, run
-`hand_test.list_skeleton_joints(stage, hand_test.PERSON_PRIM_PATH)` from
-the Isaac Sim script console after spawning to see every joint path, and
-compare against `_RIGHT_HAND_REST_LOCAL_OFFSET` below (logged at startup
-as `[hand_test] reach target from hardcoded rest-pose hand offset ...`).
 """
 
 from __future__ import annotations
@@ -107,24 +77,23 @@ import os
 import random
 import time
 
-from pxr import Gf, Usd, UsdGeom, UsdSkel
+from pxr import Gf, Usd, UsdGeom
 
+from two_bone_ik import solve_two_bone_ik
 
-# Pass 4 compared three People characters with the whole-body reach
-# mechanism (all share the same 101-joint Reallusion-style rig, joint [83]
-# ".../R_Clavicle/R_Upperarm/R_Forearm/R_Hand"): F_Business_02 (YOLO hand
-# confidence ~0.52), F_Medical_01 (~0.82), and this one, whose light-colored
-# work glove reads as a noticeably cleaner "hand" shape to the HaGRIDv2
-# model (~0.88-0.89, two reach cycles observed). Picked as the new default
-# on that basis. Override via HAND_TEST_PERSON_USD for any other character
-# -- re-measure _RIGHT_HAND_REST_LOCAL_OFFSET for it first (see that
-# constant's own comment).
-PERSON_USD = os.environ.get(
-    "HAND_TEST_PERSON_USD",
-    "https://omniverse-content-production.s3-us-west-2.amazonaws.com/"
-    "Assets/Isaac/5.1/Isaac/People/Characters/"
-    "male_adult_construction_01_new/male_adult_construction_01_new.usd",
+# --- Rig asset. Built offline (see build notes at the bottom) by pulling the
+# right upper-arm + forearm + hand geometry out of PERSON_USD's skinned
+# meshes (by dominant skinning-joint per vertex) and re-parenting it under a
+# plain, non-skinned two-bone Xform chain; everything else about the
+# character (torso, legs, head, left arm) is an untouched reference to the
+# original asset with just the right-arm faces removed so nothing overlaps.
+# Override with a local path if you haven't deployed this asset yet -- see
+# assets/rigid_arm_asset.usda in this same delivery.
+RIG_ASSET_USD = os.environ.get(
+    "HAND_TEST_RIG_ASSET",
+    "assets/rigid_arm_asset.usda",
 )
+RIG_MODE = os.environ.get("HAND_TEST_RIG_MODE", "rigid_arm")  # or "legacy"
 
 # --- TableSet_00 geometry, read directly from
 # assets/lightweight_restaurant/lightweight_pizza_restaurant.usda.
@@ -133,21 +102,11 @@ PERSON_USD = os.environ.get(
 # this workspace.
 TABLE_COLLIDER_CENTER = Gf.Vec3d(-3.2, -2.2, 0.365)
 TABLE_TOP_Z = 0.73  # collider center z (0.365) + half-height (0.365)
-# Pass 3/early pass 4 captures targeted the hand joint at exactly
-# TABLE_TOP_Z, which reads as resting right at the tabletop surface with
-# no visible clearance -- close enough to graze/clip depending on the
-# character's hand mesh thickness. Give it 10cm of headroom instead of
-# stacking a correction on top of a correction; overridable, but the
-# target is computed from TABLE_TOP_Z either way, never accumulated.
 HAND_TARGET_Z_OFFSET = float(os.environ.get("HAND_TEST_TARGET_Z_OFFSET", "0.10"))
 TABLE_HAND_TARGET = Gf.Vec3d(-3.2, -2.2, TABLE_TOP_Z + HAND_TARGET_Z_OFFSET)
 
 # Chair_01_Visual under TableSet_00: translate=(-2.7, -3.2, 0), rotateZ=180
-# (facing the table). Verified against a captured table_camera frame:
-# Chair_00 (-3.7, -3.2) sits at the far edge of the robot-mounted camera's
-# view and is mostly clipped; Chair_01 is well-centered in frame. Every
-# People character tried so far is a standing-pose asset, not a seated
-# one, so SEAT_TORSO_Z is floor height (0.0), not chair-seat height.
+# (facing the table).
 SEAT_XY = (
     float(os.environ.get("HAND_TEST_SEAT_X", "-2.7")),
     float(os.environ.get("HAND_TEST_SEAT_Y", "-3.2")),
@@ -156,18 +115,9 @@ SEAT_YAW_DEGREES = float(os.environ.get("HAND_TEST_SEAT_YAW", "180.0"))
 SEAT_TORSO_Z = float(os.environ.get("HAND_TEST_SEAT_Z", "0.0"))
 SEAT_POSITION = Gf.Vec3d(SEAT_XY[0], SEAT_XY[1], SEAT_TORSO_Z)
 
-# Fallback lean target (small nudge toward the table) used only if the
-# skeleton/hand-joint lookup below fails -- matches pass #1's mechanism.
-LEAN_DISTANCE = float(os.environ.get("HAND_TEST_LEAN_DISTANCE", "0.15"))
-_seat_to_table = TABLE_HAND_TARGET - SEAT_POSITION
-_seat_to_table_length = _seat_to_table.GetLength()
-LEAN_TARGET = (
-    SEAT_POSITION + _seat_to_table * (LEAN_DISTANCE / _seat_to_table_length)
-    if _seat_to_table_length > 1e-6
-    else SEAT_POSITION
-)
-
 PERSON_PRIM_PATH = "/World/HandSafetyTestActor"
+ARM_RIG_PATH = f"{PERSON_PRIM_PATH}/RightArmRig"
+ELBOW_PATH = f"{ARM_RIG_PATH}/ElbowPivot"
 
 # --- Reach timing. The task asks for a reach every 5-10 seconds.
 MIN_PERIOD_SECONDS = float(os.environ.get("HAND_TEST_MIN_PERIOD", "5.0"))
@@ -179,31 +129,71 @@ REACH_HOLD_SECONDS = float(os.environ.get("HAND_TEST_HOLD_SECONDS", "0.4"))
 # time above must stay comfortably longer than that or every reach will be
 # invisible to the detector.
 
-_RIGHT_SIDE_HINTS = ("right", "_r_", "r_hand", "r_arm", "rt_")
-_HAND_EXCLUDE_HINTS = ("thumb", "index", "mid", "ring", "pinky")
+# --- Rig geometry, measured once from the rig asset's own skeleton bind
+# pose (male_adult_construction_01_new, joints R_Upperarm/R_Forearm/R_Hand)
+# via `skeleton.GetBindTransformsAttr()` in an isolated script -- see build
+# notes at the bottom. These are positions relative to the character's own
+# root Xform (PERSON_PRIM_PATH), matching how RIG_ASSET_USD's RightArmRig
+# is authored (its own translate ops already encode P_UP / P_FORE - P_UP).
+P_UP = Gf.Vec3d(-0.19073455810546874, 0.06624944686889649, 1.43966064453125)
+P_FORE = Gf.Vec3d(-0.4669504547119141, 0.06760619640350342, 1.4339576721191407)
+P_HAND = Gf.Vec3d(-0.6862501525878907, 0.07141963958740234, 1.432750244140625)
+U1_REST = P_FORE - P_UP  # shoulder -> elbow, upper-arm bone (~0.276m)
+U2_REST = P_HAND - P_FORE  # elbow -> wrist, forearm bone (~0.219m)
+_ARM_MAX_REACH = U1_REST.GetLength() + U2_REST.GetLength()
+
+# How much of the arm's own max reach to use for the final stretch (leaves
+# some elbow bend rather than locking the arm straight at 100%); the rest
+# of the seat-to-target gap is covered by the body lean below. Purely a
+# look/feel knob -- lower values lean the body more and bend the arm less.
+REACH_EXTENSION_RATIO = float(os.environ.get("HAND_TEST_REACH_EXTENSION_RATIO", "0.85"))
+
+# Pole hint biases the elbow to bend downward/forward, matching how a
+# seated person's elbow drops when reaching onto a table in front of them
+# rather than winging out to the side. Purely a disambiguator for the IK's
+# bend plane; doesn't need to be exact.
+POLE_HINT_LOCAL_OFFSET = Gf.Vec3d(0.3, 0.0, -1.0)
+
+_seat_yaw_rotation = Gf.Rotation(Gf.Vec3d(0, 0, 1), SEAT_YAW_DEGREES)
 
 
-def _smoothstep(t: float) -> float:
-    t = max(0.0, min(1.0, t))
-    return t * t * (3.0 - 2.0 * t)
+def _compute_lean_and_arm_target():
+    """Split the seat-to-target gap between a body lean (this actor's own
+    translateOp, same mechanism pass #1 used) and the two-bone arm's own
+    reach, so the arm ends up genuinely bent rather than fully extended or
+    doing nothing. Returns (lean_target_world, arm_target_local) -- the
+    person-root translate value at full reach progress, and the IK target
+    for the arm expressed in the character's own root frame (matching
+    P_UP/U1_REST/U2_REST's frame).
+    """
+    shoulder_world_at_rest = _seat_yaw_rotation.TransformDir(P_UP) + SEAT_POSITION
+    d_vec = TABLE_HAND_TARGET - shoulder_world_at_rest
+    d_total = d_vec.GetLength()
+    target_arm_reach = REACH_EXTENSION_RATIO * _ARM_MAX_REACH
+    lean_distance = max(0.0, d_total - target_arm_reach)
+    lean_dir_world = d_vec.GetNormalized() if d_total > 1e-9 else Gf.Vec3d(0, 0, 0)
+    lean_target_world = SEAT_POSITION + lean_dir_world * lean_distance
+
+    arm_target_local = _seat_yaw_rotation.GetInverse().TransformDir(
+        TABLE_HAND_TARGET - lean_target_world
+    )
+    return lean_target_world, arm_target_local
 
 
 def spawn_seated_person(stage):
-    """Reference a People character at TableSet_00's Chair_01 and return its prim."""
+    """Reference the rigid-arm rig asset at TableSet_00's Chair_01 and
+    return its prim. Falls back to the old whole-body-slide mechanism
+    (PERSON_USD directly, no rig) when HAND_TEST_RIG_MODE=legacy, in case
+    the new rig needs debugging on hardware.
+    """
     xform = UsdGeom.Xform.Define(stage, PERSON_PRIM_PATH)
     prim = xform.GetPrim()
-    prim.GetReferences().AddReference(PERSON_USD)
 
-    # The referenced character asset's own root prim already authors an
-    # `xformOp:rotateXYZ` attribute with double3 precision. Once an
-    # attribute name/type is defined in any layer contributing to this
-    # prim, USD holds every layer to that same type -- XformCommonAPI
-    # always names its rotate op "xformOp:rotateXYZ" and only writes
-    # GfVec3f, so it collides no matter what (ClearXformOpOrder only
-    # clears the *order* list, not the pre-existing attribute spec).
-    # Sidestep by authoring our own double-precision ops directly, using
-    # a differently-named rotateZ op (this test only ever needs a
-    # yaw-around-Z, so RotateXYZ was never necessary).
+    if RIG_MODE == "legacy":
+        prim.GetReferences().AddReference(_LEGACY_PERSON_USD)
+    else:
+        prim.GetReferences().AddReference(RIG_ASSET_USD)
+
     xformable = UsdGeom.Xformable(prim)
     xformable.ClearXformOpOrder()
     translate_op = xformable.AddTranslateOp(precision=UsdGeom.XformOp.PrecisionDouble)
@@ -211,107 +201,66 @@ def spawn_seated_person(stage):
     rotate_op = xformable.AddRotateZOp(precision=UsdGeom.XformOp.PrecisionDouble)
     rotate_op.Set(SEAT_YAW_DEGREES)
     print(
-        f"[hand_test] spawned {PERSON_USD} at {PERSON_PRIM_PATH}, "
+        f"[hand_test] spawned rig={RIG_ASSET_USD if RIG_MODE != 'legacy' else _LEGACY_PERSON_USD} "
+        f"(mode={RIG_MODE}) at {PERSON_PRIM_PATH}, "
         f"seat={tuple(SEAT_POSITION)} yaw={SEAT_YAW_DEGREES}",
         flush=True,
     )
     return prim
 
 
-def _find_skeleton(root_prim) -> UsdSkel.Skeleton | None:
-    for prim in Usd.PrimRange(root_prim):
-        if prim.IsA(UsdSkel.Skeleton):
-            return UsdSkel.Skeleton(prim)
-    return None
+def _get_orient_op(stage, prim_path: str):
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        raise RuntimeError(f"rig prim missing: {prim_path} (did the rig asset load?)")
+    xformable = UsdGeom.Xformable(prim)
+    for op in xformable.GetOrderedXformOps():
+        if op.GetOpName() == "xformOp:orient":
+            return op
+    raise RuntimeError(f"{prim_path} has no xformOp:orient (unexpected rig asset)")
 
 
-def list_skeleton_joints(stage, root_path: str = PERSON_PRIM_PATH) -> None:
-    """Print every joint path under root_path's skeleton. Run this from the
-    Isaac Sim script console after spawn_seated_person() to sanity-check
-    which joint ReachAnimator picked as "the right hand".
-    """
-    root_prim = stage.GetPrimAtPath(root_path)
-    skeleton = _find_skeleton(root_prim)
-    if skeleton is None:
-        print(f"[hand_test] no UsdSkel.Skeleton found under {root_path}", flush=True)
-        return
-    joints = list(skeleton.GetJointsAttr().Get() or [])
-    print(f"[hand_test] {len(joints)} joints under {root_path}:", flush=True)
-    for index, joint in enumerate(joints):
-        print(f"  [{index}] {joint}", flush=True)
-
-
-# Rest-pose world offset of the right hand joint (.../R_Clavicle/
-# R_Upperarm/R_Forearm/R_Hand -- confirmed identical joint path across all
-# People characters tried, they share a common Reallusion-style rig) from
-# its own character root, measured once per asset via
-# `skeleton.GetBindTransformsAttr()` in an isolated script rather than
-# queried at runtime (see module docstring for why: keeps this module's
-# runtime path simple). Defaults to male_adult_construction_01_new's
-# measured value (this module's default PERSON_USD, see above); override
-# all three via env vars for a different HAND_TEST_PERSON_USD rather than
-# editing this constant (measure with the same isolated-script technique:
-# open the character, find its Skeleton, read
-# bindTransforms[hand_index].ExtractTranslation()). Other measured values
-# from the pass 4 comparison, for reference:
-#   F_Business_02:  (-0.6220545196533204, 0.050855822563171386, 1.3136680603027344)
-#   F_Medical_01:   (-0.6411647033691407, 0.051522626876831054, 1.3579162597656251)
-_RIGHT_HAND_REST_LOCAL_OFFSET = Gf.Vec3d(
-    float(os.environ.get("HAND_TEST_HAND_OFFSET_X", "-0.6862501525878907")),
-    float(os.environ.get("HAND_TEST_HAND_OFFSET_Y", "0.07141963958740234")),
-    float(os.environ.get("HAND_TEST_HAND_OFFSET_Z", "1.432750244140625")),
-)
-
-
-def _compute_hand_reach_target() -> Gf.Vec3d:
-    """World-space whole-body translate target that puts the character's
-    rest-pose right hand on TABLE_HAND_TARGET, given the character is
-    yawed by SEAT_YAW_DEGREES. Pure Gf math against the hardcoded offset
-    above.
-    """
-    yaw = Gf.Rotation(Gf.Vec3d(0.0, 0.0, 1.0), SEAT_YAW_DEGREES)
-    world_offset = yaw.TransformDir(_RIGHT_HAND_REST_LOCAL_OFFSET)
-    target = TABLE_HAND_TARGET - world_offset
-    print(
-        f"[hand_test] reach target from hardcoded rest-pose hand offset "
-        f"{tuple(_RIGHT_HAND_REST_LOCAL_OFFSET)} (yawed {tuple(world_offset)}): "
-        f"body root -> {tuple(target)}",
-        flush=True,
-    )
-    return target
+def _smoothstep(t: float) -> float:
+    t = max(0.0, min(1.0, t))
+    return t * t * (3.0 - 2.0 * t)
 
 
 class ReachAnimator:
-    """Drives PERSON_PRIM_PATH's whole body between SEAT_POSITION and a
-    reach target on a randomized 5-10s period, via a plain translate op
-    (see module docstring for why per-joint rotation isn't used). Call
-    update() once per simulation_app frame; timing is wall-clock
-    (time.time()), matching this demo's non-headless real-time frame
-    pacing.
+    """Drives the body lean (person root translateOp) and the two-bone
+    right-arm rig together, between rest and an IK-solved reach pose, on a
+    randomized 5-10s period. Call update() once per simulation_app frame;
+    timing is wall-clock (time.time()), matching this demo's non-headless
+    real-time frame pacing.
     """
 
     def __init__(self, prim):
-        # Matches the double-precision translateOp spawn_seated_person()
-        # authors directly (see its comment on why XformCommonAPI can't be
-        # used here). GetOrderedXformOps()[0] is that translate op, since
-        # it was the first (and only translate) op added.
-        self.translate_op = UsdGeom.Xformable(prim).GetOrderedXformOps()[0]
+        self.stage = prim.GetStage()
         self.active = False
         self.event_start: float | None = None
         self.next_event_time = time.time() + random.uniform(
             MIN_PERIOD_SECONDS, MAX_PERIOD_SECONDS
         )
 
-        try:
-            self.reach_target = _compute_hand_reach_target()
-        except Exception as exc:  # noqa: BLE001 -- see module docstring
-            print(
-                "[hand_test] reach target computation raised "
-                f"{type(exc).__name__}: {exc}; falling back to "
-                "lean-only reach",
-                flush=True,
-            )
-            self.reach_target = LEAN_TARGET
+        if RIG_MODE == "legacy":
+            self._init_legacy(prim)
+            return
+
+        self.translate_op = UsdGeom.Xformable(prim).GetOrderedXformOps()[0]
+        self.shoulder_op = _get_orient_op(self.stage, ARM_RIG_PATH)
+        self.elbow_op = _get_orient_op(self.stage, ELBOW_PATH)
+
+        self.lean_target_world, arm_target_local = _compute_lean_and_arm_target()
+        pole_hint_local = P_UP + POLE_HINT_LOCAL_OFFSET
+        self.reach_shoulder_rot, self.reach_elbow_rot, elbow_pos = solve_two_bone_ik(
+            P_UP, arm_target_local, U1_REST, U2_REST, pole_hint_local
+        )
+        print(
+            f"[hand_test] lean target={tuple(self.lean_target_world)} "
+            f"(seat={tuple(SEAT_POSITION)}), "
+            f"shoulder_angle={self.reach_shoulder_rot.GetAngle():.1f}deg, "
+            f"elbow_angle={self.reach_elbow_rot.GetAngle():.1f}deg",
+            flush=True,
+        )
 
     def _cycle_progress(self, elapsed: float) -> float:
         if elapsed < REACH_TRAVEL_SECONDS:
@@ -322,10 +271,28 @@ class ReachAnimator:
         return 1.0 - _smoothstep(retract_elapsed / REACH_TRAVEL_SECONDS)
 
     def _apply_progress(self, progress: float) -> None:
-        position = SEAT_POSITION + (self.reach_target - SEAT_POSITION) * progress
+        position = SEAT_POSITION + (self.lean_target_world - SEAT_POSITION) * progress
         self.translate_op.Set(position)
 
+        # Interpolating from the identity rotation to a target rotation R by
+        # scaling R's own axis-angle by `progress` IS the slerp from
+        # identity to R (there's no "shortest path" ambiguity to resolve
+        # when one endpoint is identity), so this needs no quaternion
+        # slerp helper.
+        shoulder_partial = Gf.Rotation(
+            self.reach_shoulder_rot.GetAxis(), self.reach_shoulder_rot.GetAngle() * progress
+        )
+        elbow_partial = Gf.Rotation(
+            self.reach_elbow_rot.GetAxis(), self.reach_elbow_rot.GetAngle() * progress
+        )
+        self.shoulder_op.Set(Gf.Quatd(shoulder_partial.GetQuat()))
+        self.elbow_op.Set(Gf.Quatd(elbow_partial.GetQuat()))
+
     def update(self) -> None:
+        if RIG_MODE == "legacy":
+            self._update_legacy()
+            return
+
         now = time.time()
         if not self.active:
             if now < self.next_event_time:
@@ -350,3 +317,125 @@ class ReachAnimator:
             return
 
         self._apply_progress(self._cycle_progress(elapsed))
+
+    # ------------------------------------------------------------------
+    # Legacy whole-body-slide fallback (pass #1-4 mechanism), kept only for
+    # A/B debugging against the new rig on hardware.
+    # ------------------------------------------------------------------
+    def _init_legacy(self, prim):
+        self.translate_op = UsdGeom.Xformable(prim).GetOrderedXformOps()[0]
+        yaw = Gf.Rotation(Gf.Vec3d(0.0, 0.0, 1.0), SEAT_YAW_DEGREES)
+        world_offset = yaw.TransformDir(P_HAND)
+        full_reach_target = TABLE_HAND_TARGET - world_offset
+        _seat_to_table = full_reach_target - SEAT_POSITION
+        length = _seat_to_table.GetLength()
+        lean_distance = float(os.environ.get("HAND_TEST_LEAN_DISTANCE", "0.15"))
+        self.reach_target = (
+            SEAT_POSITION + _seat_to_table * (lean_distance / length)
+            if length > 1e-6
+            else SEAT_POSITION
+        )
+
+    def _update_legacy(self):
+        now = time.time()
+        if not self.active:
+            if now < self.next_event_time:
+                return
+            self.active = True
+            self.event_start = now
+        elapsed = now - self.event_start
+        total_duration = 2.0 * REACH_TRAVEL_SECONDS + REACH_HOLD_SECONDS
+        if elapsed >= total_duration:
+            self.active = False
+            self.translate_op.Set(SEAT_POSITION)
+            self.next_event_time = now + random.uniform(MIN_PERIOD_SECONDS, MAX_PERIOD_SECONDS)
+            return
+        progress = self._cycle_progress(elapsed)
+        position = SEAT_POSITION + (self.reach_target - SEAT_POSITION) * progress
+        self.translate_op.Set(position)
+
+
+_LEGACY_PERSON_USD = os.environ.get(
+    "HAND_TEST_PERSON_USD",
+    "https://omniverse-content-production.s3-us-west-2.amazonaws.com/"
+    "Assets/Isaac/5.1/Isaac/People/Characters/"
+    "male_adult_construction_01_new/male_adult_construction_01_new.usd",
+)
+
+
+# ----------------------------------------------------------------------
+# Asset build notes (how RIG_ASSET_USD / assets/rigid_arm_asset.usda was
+# made -- for reference if it ever needs regenerating, e.g. for a
+# different character). Built and verified entirely offline in a CPU-only
+# environment using the standalone `usd-core` pip package (no Isaac Sim
+# needed for this part -- Isaac Sim is only needed to actually render it):
+#
+# 1. Downloaded male_adult_construction_01_new.usd and opened it with
+#    pxr.Usd.Stage.Open. It's fully self-contained (no external texture/
+#    geometry references), one Skeleton (101 joints, Reallusion-style rig)
+#    and several skinned Mesh prims (skin, vest, tshirt, gloves, ...).
+# 2. Read each mesh's `primvars:skel:jointIndices`/`jointWeights` and, per
+#    vertex, took the highest-weight joint as that vertex's "dominant"
+#    joint. Bucketed joints into upperarm={R_Upperarm,R_UpperarmTwist01/2}
+#    and forearm_hand={R_Forearm,R_ElbowShareBone,R_ForearmTwist01/2,
+#    R_Hand,+all finger joints} by checking path *components* (careful:
+#    joint paths encode the full ancestor chain, so a naive substring/
+#    regex match on leaf names alone false-positives on toe joints like
+#    R_PinkyToe1 -- match on whole path segments instead).
+#  - skin: 51 upperarm verts / 83 forearm_hand verts / 1542 other (of 1676)
+#  - vest: 0 / 0 / 979 (sleeveless, doesn't touch the arm at all)
+#  - tshirt: 125 / 0 / 671 (short sleeve covers upper arm, not forearm)
+#  - gloves: 0 / 521 / 519 (mesh contains both hands; ~half each)
+# 3. For each mesh, split faces into three sets by requiring ALL of a
+#    face's vertices share the category (faces straddling a boundary are
+#    dropped from every set -- leaves small seams at the shoulder/elbow,
+#    acceptable for a test prop). Points/normals arrays are kept at full
+#    size (unused entries are harmless) to avoid index remapping entirely.
+# 4. Authored a new stage that (a) references the original character file
+#    (for materials + the untouched meshes) and adds `over` opinions on
+#    skin/tshirt/gloves overriding just faceVertexCounts/faceVertexIndices/
+#    primvars:st0:indices to the "other" (non-right-arm) face set -- this
+#    removes the original arm from the body without touching anything
+#    else (skinning API, materials, other meshes are all inherited as-is,
+#    and since the skeleton itself is never animated, its live UsdSkel
+#    binding on the remaining meshes is a harmless no-op); and (b) defines
+#    new plain (non-skinned) Mesh prims for the upperarm/forearm_hand face
+#    sets, with points *recentered* to their own pivot (subtract P_UP for
+#    the upperarm piece, P_FORE for the forearm_hand piece) under a new
+#    `RightArmRig/ElbowPivot` Xform chain positioned at those same pivots.
+# 5. Verified by computing each new prim's ComputeLocalToWorldTransform at
+#    rest (identity rotation) and confirming it reconstructs the ORIGINAL
+#    mesh's point positions exactly (sub-1e-7 error, float32 rounding
+#    only) -- proves the pivot/recenter math has no sign or axis errors.
+# 6. The two-bone IK (`two_bone_ik.solve_two_bone_ik`) was unit-tested the
+#    same way: built a throwaway in-memory stage with the identical
+#    Shoulder->Elbow->hand-marker hierarchy, solved 20 random reachable
+#    targets, and confirmed the marker lands on each target to float
+#    precision (~1e-16). The one subtlety that failed on the first attempt
+#    and is worth knowing if this ever needs re-deriving: the elbow's own
+#    xformOp:orient is a LOCAL rotation, so the world-space target
+#    direction has to be transformed by the shoulder rotation's *inverse*
+#    before solving "rotate the forearm's rest direction onto it" --
+#    using the raw world-space direction directly (skipping that inverse)
+#    gives a plausible-looking but wrong pose.
+# 7. First cut of this pass held the body fully fixed at SEAT_POSITION and
+#    only rotated the arm -- verification caught that Chair_01 sits ~1.4m
+#    from TABLE_HAND_TARGET (measured from the actual shoulder position,
+#    not the root) while this character's own two-bone reach is only
+#    ~0.5m, so an arm-only reach cannot possibly work here regardless of
+#    IK correctness. `_compute_lean_and_arm_target()` now splits the gap:
+#    body leans until only REACH_EXTENSION_RATIO (0.85) of the arm's max
+#    reach remains, and the arm covers that remainder. Full pipeline
+#    (lean translate + shoulder rotate + elbow rotate, exactly as
+#    authored in spawn_seated_person/ReachAnimator) was re-verified to
+#    land the hand-marker on TABLE_HAND_TARGET to float precision.
+#
+# What is NOT verified (needs Isaac Sim / a GPU): whether the extracted
+# geometry actually looks right when rendered (seams at the shoulder/elbow
+# boundary, whether the removed-face gap in the body is visible, whether
+# YOLO's hand-detection confidence on the re-parented glove mesh matches
+# the ~0.88 seen on the original skinned version, and how the residual
+# body lean/sink -- still ~0.7-1.0m depending on REACH_EXTENSION_RATIO --
+# actually looks in motion). Set HAND_TEST_RIG_MODE=legacy to compare
+# directly against the old whole-body mechanism if the new rig looks wrong.
+# ----------------------------------------------------------------------

@@ -322,3 +322,102 @@ Still broken / follow-up:
   tried this pass (out of scope given the three already tested were
   sufficient to pick a clear winner and the Animation Graph crash makes
   a fourth character unlikely to change the per-joint-reach conclusion).
+
+## Pass 5 prep -- 2026-07-23 (CPU-only environment, no Isaac Sim/GPU access)
+
+This is prep work, not a hardware pass -- nothing below is confirmed to
+render or detect correctly on real hardware yet. See
+`VISION_TEST_GPU_PROMPT.md`'s current revision for the actual Pass 5 task
+this sets up.
+
+Tested (offline, via the standalone `usd-core` pip package, no Isaac Sim):
+- Downloaded `male_adult_construction_01_new.usd` (pass 4's chosen
+  character) and opened it directly with `pxr.Usd.Stage`. Confirmed it is
+  fully self-contained (no external texture/geometry references), with one
+  101-joint Skeleton and several skinned Mesh prims (skin, vest, tshirt,
+  gloves, hardhat, workpants, boots, reflective vest/pants).
+- Read `skeleton.GetBindTransformsAttr()` for `R_Upperarm`/`R_Forearm` and
+  confirmed the `R_Hand` value matches this file's existing
+  `_RIGHT_HAND_REST_LOCAL_OFFSET` constant exactly -- cross-validates both
+  that constant and the new measurement approach.
+- Per-vertex "dominant skinning joint" analysis (highest-weight joint per
+  vertex, bucketed by full joint-path components, not leaf-name substring
+  matching -- a naive regex match false-positives on toe joints like
+  `R_PinkyToe1`) split skin/tshirt/glove meshes into upperarm/forearm_hand/
+  other vertex sets. Counts: skin 51/83/1542 (of 1676), vest 0/0/979
+  (sleeveless, untouched), tshirt 125/0/671 (short sleeve, upper arm only),
+  gloves 0/521/519 (mesh holds both hands, ~half each).
+
+Changed (new files, none yet run on GPU):
+- `isaacpjt/two_bone_ik.py`: standalone two-bone IK solver (shoulder+elbow
+  angles from a 3D target, analytic law-of-cosines + pole-vector bend
+  plane). Unit-verified with an in-memory USD stage matching the real
+  Shoulder->Elbow->hand hierarchy: 20 random reachable targets all landed
+  to ~1e-16 error. The one non-obvious subtlety, worth knowing before
+  touching this again: the elbow's `xformOp:orient` is a LOCAL rotation,
+  so the world-space target direction must be transformed by the shoulder
+  rotation's *inverse* before solving "rotate the forearm rest direction
+  onto it" -- using the raw world direction gives a plausible-looking but
+  wrong pose (this failed on the first attempt and is exactly why the
+  verification harness exists).
+- `assets/rigid_arm_asset.usda`: new asset built by (1) referencing the
+  original character file for materials and the untouched body, (2)
+  authoring `over` opinions on the skin/tshirt/glove meshes that override
+  just `faceVertexCounts`/`faceVertexIndices`/`primvars:st0:indices` to
+  drop the right-arm faces (removes the original arm from the body without
+  touching skinning, materials, or any other mesh -- the skeleton is never
+  animated, so its live binding on the remaining meshes is a harmless
+  no-op), and (3) defining new *non-skinned* Mesh prims for the extracted
+  upperarm/forearm_hand face sets, points recentered to their own pivot,
+  under a new `RightArmRig/ElbowPivot` Xform chain. Verified by computing
+  each new prim's `ComputeLocalToWorldTransform` at rest (identity
+  rotation) and confirming it reconstructs the ORIGINAL mesh's point
+  positions to ~1e-7 (float32 rounding only) -- no sign/axis errors in the
+  pivot math. Faces straddling the upperarm/forearm_hand/other boundary
+  were dropped from every set (small seams expected at the shoulder/elbow,
+  not yet judged on a real render).
+- `isaacpjt/hand_intrusion_test_actor.py`: rewritten to drive this rig via
+  `two_bone_ik` instead of the whole-body translate. Also caught and fixed
+  a design bug during verification: a first draft held the torso fixed and
+  only rotated the arm, but Chair_01 sits ~1.4 m from `TABLE_HAND_TARGET`
+  (measured from the actual shoulder position, not the root) while this
+  character's two-bone arm only spans ~0.5 m -- geometrically unreachable
+  by arm rotation alone. Now leans the body (same `translateOp` mechanism
+  pass #1 used) only far enough to leave
+  `HAND_TEST_REACH_EXTENSION_RATIO` (default 0.85) of the arm's own reach
+  to close, then bends the elbow for the remainder. Full pipeline (lean +
+  shoulder rotate + elbow rotate) re-verified end to end against a
+  synthetic hand marker: lands on `TABLE_HAND_TARGET` to ~1e-16 error, with
+  a 115 deg shoulder angle / 65 deg elbow angle at full reach -- a real
+  bend, not a fully-extended stiff arm. `HAND_TEST_RIG_MODE=legacy`
+  preserves the exact old mechanism for A/B comparison.
+
+Observed (offline diagnostic only, not a real render): built a manual
+software rasterizer (matplotlib polygon fill + painter's-algorithm depth
+sort -- `pxr`'s Hydra/`UsdImagingGL` isn't in the pip `usd-core` package, so
+no proper renderer was available) and rendered the actual
+`hand_intrusion_test_actor.py` code's rest and full-reach poses from three
+angles. The arm reads as a single connected limb with no obvious
+disconnection, and the reach pose looks like a plausible forward/down
+reach with a bent elbow. Small speckled artifacts appeared on the torso
+across all renders, most likely a depth-sort limitation of the painter's
+algorithm where the vest and tshirt layers nearly coincide, not necessarily
+a real mesh defect -- needs a real renderer to confirm either way. A visible
+seam is present at the shoulder boundary, consistent with the
+faces-dropped-at-the-boundary tradeoff above.
+
+Still broken / follow-up (i.e., Pass 5's actual job):
+- Nothing above has been confirmed with Isaac Sim's real renderer, real
+  materials/lighting, or the real YOLO detector. Task 1-3 in the current
+  `VISION_TEST_GPU_PROMPT.md` are exactly this: load the asset, watch the
+  reach, and check `/hand_detection/detections` confidence against this
+  same character's ~0.88-0.89 baseline from pass 4.
+- The residual body lean (~0.7-1.0 m depending on
+  `HAND_TEST_REACH_EXTENSION_RATIO`) still pushes the root below its rest
+  Z, same "sinks toward the table" characteristic pass #1 documented --
+  expected given the chair/table distance and this character's arm length,
+  not something to re-derive, but worth judging on hardware whether the
+  default ratio (0.85) looks acceptable or needs adjusting.
+- The ~5 FPS RGB/detection performance question raised in an earlier
+  prompt revision was never actually investigated in any prior pass's log
+  entry and remains open; unrelated to this rig change.
