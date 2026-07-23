@@ -70,6 +70,7 @@ _extension_manager.set_extension_enabled_immediate("isaacsim.sensors.physx", Tru
 for _ in range(10):
     simulation_app.update()
 
+import json
 import rclpy
 from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
 from nav_msgs.msg import Odometry
@@ -2644,8 +2645,11 @@ def main():
                     obstacle_person_controller.update()
                 except Exception:
                     pass
-            sim_time = timeline.get_current_time()
-            bridge.tick(float(sim_time))
+            try:
+                sim_time = timeline.get_current_time()
+                bridge.tick(float(sim_time))
+            except Exception as exc:
+                print(f"[err] tick error: {exc}", flush=True)
     finally:
         executor.shutdown()
         bridge.destroy_node()
