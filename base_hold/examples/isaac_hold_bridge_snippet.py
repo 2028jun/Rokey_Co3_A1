@@ -1,101 +1,92 @@
 #!/usr/bin/env python3
-"""Minimal Isaac bridge: /base/hold_state -> FixedJoint parking brake.
+"""Isaac bridge: /base/hold_state -> wheel joint position hold (NO FixedJoint).
 
-Paste / adapt into an Isaac demo loop (e.g. mobile_manipulator_demo.py).
-Requires:
-  - ROS hold_node running (publishes /base/hold_state)
-  - This process shares ROS_DOMAIN_ID with hold_node
-  - pxr UsdPhysics available (Isaac python)
+Paste BaseHoldBridge into your Isaac demo loop. Requires:
+  - ros2 run base_hold hold_node
+  - same ROS_DOMAIN_ID
+  - articulation + dof_names + wheel joint name list
 
-Not a full demo — copy the BaseHoldBridge class into your Isaac script.
+Safe vs previous parking FixedJoint (base pinned to world) which could crash Isaac.
 """
 
 from __future__ import annotations
-
-# --- copy from here ---------------------------------------------------------
 
 import threading
 
 from std_msgs.msg import Bool
 
-# Inside Isaac, prefer:
-#   from base_hold.isaac_parking_brake import engage, release, is_engaged
-# Or vendor the helpers next to your demo.
+# Prefer after colcon install / PYTHONPATH to workspace:
+#   from base_hold.isaac_wheel_hold import IsaacWheelHold
 
 
 class BaseHoldBridge:
-    """Subscribe to latched /base/hold_state and toggle FixedJoint brake."""
+    """Subscribe to /base/hold_state and toggle IsaacWheelHold."""
 
     def __init__(
         self,
         node,
         stage,
-        articulation_path: str,
+        articulation,
+        dof_names,
+        wheel_joint_names,
         *,
-        get_world_pose,
         state_topic: str = "/base/hold_state",
+        release_damping: float = 140.0,
+        release_max_force: float = 350.0,
     ):
-        """
-        get_world_pose: callable () -> (xyz: tuple[float,float,float],
-                                        quat_wxyz: tuple[float,float,float,float])
-        """
-        from base_hold import isaac_parking_brake as brake
+        from base_hold.isaac_wheel_hold import IsaacWheelHold
 
-        self._brake = brake
-        self._stage = stage
-        self._articulation_path = articulation_path
-        self._get_world_pose = get_world_pose
+        self._hold = IsaacWheelHold(
+            stage,
+            wheel_joint_names,
+            release_damping=release_damping,
+            release_max_force=release_max_force,
+        )
+        self._articulation = articulation
+        self._dof_names = list(dof_names)
         self._lock = threading.Lock()
-        self._want_hold = False
-        self._applied = False
-
+        self._want = False
         node.create_subscription(Bool, state_topic, self._on_state, 10)
 
     def _on_state(self, msg: Bool) -> None:
         with self._lock:
-            self._want_hold = bool(msg.data)
+            self._want = bool(msg.data)
+
+    @property
+    def held(self) -> bool:
+        return self._hold.held
 
     def spin_once(self) -> None:
-        """Call every sim step after physics update / pose is valid."""
+        """Call every sim step (after articulation is valid)."""
         with self._lock:
-            want = self._want_hold
-        engaged = self._brake.is_engaged(self._stage)
-        if want and not engaged:
-            xyz, quat = self._get_world_pose()
-            path = self._brake.engage(
-                self._stage,
-                self._articulation_path,
-                xyz,
-                world_quat_wxyz=quat,
+            want = self._want
+        if want and not self._hold.held:
+            self._hold.engage(
+                articulation=self._articulation, dof_names=self._dof_names
             )
-            print(f"[base_hold] parking brake ON {path} @ {xyz}", flush=True)
-            self._applied = True
-        elif not want and engaged:
-            self._brake.release(self._stage)
-            print("[base_hold] parking brake OFF", flush=True)
-            self._applied = False
+            print("[base_hold] wheel position HOLD on", flush=True)
+        elif not want and self._hold.held:
+            self._hold.release()
+            print("[base_hold] wheel position HOLD off (nav)", flush=True)
+        elif self._hold.held:
+            self._hold.tick()
 
 
 # --- usage sketch -----------------------------------------------------------
 #
-# bridge = BaseHoldBridge(
-#     ros_node,
-#     stage,
-#     articulation_path="/World/.../robot"),
-#     get_world_pose=lambda: (
-#         tuple(articulation.get_world_pose()[0]),
-#         # convert articulation quat to (w,x,y,z)
-#         quat_wxyz,
-#     ),
-# )
+# WHEEL_JOINTS = ["left_wheel_joint", "right_wheel_joint"]  # or 4 mecanum
+# bridge = BaseHoldBridge(ros_node, stage, articulation, dof_names, WHEEL_JOINTS)
 # while simulation_app.is_running():
-#     ...
 #     world.step(render=True)
+#     if bridge.held:          # when held, do not apply cmd_vel wheel velocities
+#         pass
+#     else:
+#         apply_cmd_vel(...)
 #     bridge.spin_once()
 #
-# Mission after dock:
+# After dock:
 #   ros2 service call /base/hold std_srvs/srv/SetBool "{data: true}"
-#   # run arm
+#   # move arm — wheels resist reaction torque via PD position hold
 #   ros2 service call /base/hold std_srvs/srv/SetBool "{data: false}"
 
 if __name__ == "__main__":

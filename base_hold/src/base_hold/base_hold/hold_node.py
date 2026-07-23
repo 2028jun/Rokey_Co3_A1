@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Base hold node: gate /cmd_vel and publish latched hold state.
+"""Base hold node: gate /cmd_vel while Isaac applies wheel position hold.
 
 Modes
 -----
 BASE_MOVING (hold=false): pass /cmd_vel_in -> /cmd_vel
 ARM_HOLD    (hold=true):  ignore input, republish Twist() at hold_publish_hz
 
-This is the software "servo hold" layer. Isaac FixedJoint parking brake is a
-separate adapter that listens to /base/hold_state (see isaac_parking_brake.py).
+This ROS node alone does NOT resist arm reaction torque — Isaac must also run
+``IsaacWheelHold`` (see isaac_wheel_hold.py / examples) which switches wheel
+joints to high-stiffness position hold. No world FixedJoint (Isaac-crash prone).
 """
 
 from __future__ import annotations
@@ -64,7 +65,6 @@ class BaseHoldNode(Node):
 
         self._lock = threading.Lock()
         self._held = start_held
-        self._last_cmd = Twist()
 
         self._cmd_pub = self.create_publisher(Twist, output_topic, _volatile(20))
         self._state_pub = self.create_publisher(Bool, hold_state_topic, _latched_bool())
@@ -79,7 +79,8 @@ class BaseHoldNode(Node):
             self._publish_zero()
         self.get_logger().info(
             f"base_hold ready: {input_topic} -> {output_topic}, "
-            f"service={hold_service}, held={self._held}"
+            f"service={hold_service}, held={self._held} "
+            f"(pair with IsaacWheelHold for real lock)"
         )
 
     def _publish_state(self) -> None:
@@ -94,8 +95,6 @@ class BaseHoldNode(Node):
     def _on_cmd(self, msg: Twist) -> None:
         with self._lock:
             held = self._held
-            if not held:
-                self._last_cmd = msg
         if held:
             return
         self._cmd_pub.publish(msg)
@@ -117,10 +116,12 @@ class BaseHoldNode(Node):
         if want:
             self._publish_zero()
             response.success = True
-            response.message = "ARM_HOLD engaged (cmd_vel gated to zero)"
+            response.message = (
+                "ARM_HOLD: cmd_vel gated; ensure IsaacWheelHold.engage() is active"
+            )
         else:
             response.success = True
-            response.message = "BASE_MOVING (cmd_vel pass-through)"
+            response.message = "BASE_MOVING: cmd_vel pass-through"
         if prev != want:
             self.get_logger().info(response.message)
         return response
