@@ -120,7 +120,7 @@ BASE_LINK_NAME = "ridgeback_base_link"
 RAW_ODOM_TOPIC = "/two_wheel/odom_raw"
 RAW_SCAN_TOPIC = "/two_wheel/scan_raw"
 TELEPORT_TOPIC = "/two_wheel/teleport"
-CMD_TIMEOUT_SEC = 0.35
+CMD_TIMEOUT_SEC = 0.75
 
 LIDAR_MIN_RANGE = 0.20
 LIDAR_MAX_RANGE = 12.0

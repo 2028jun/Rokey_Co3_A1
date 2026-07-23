@@ -12,7 +12,7 @@ import rclpy
 import yaml
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped, Twist
-from nav_msgs.msg import Path as NavPath
+from nav_msgs.msg import Odometry, Path as NavPath
 from nav2_simple_commander.robot_navigator import BasicNavigator
 
 from two_wheel_rails.nav_bootstrap import (
@@ -115,23 +115,52 @@ class SimplifiedPathNavigator:
         self._tf = tf_buffer
         self._tracker = tracker
         self._cfg = load_motion_config()
-        self._cmd_pub = nav.create_publisher(Twist, "/cmd_vel", 10)
+        self._cmd_pub = nav.create_publisher(Twist, "/cmd_vel_nav", 10)
+        self._control_pose: tuple[float, float, float] | None = None
+        self._last_pub_time: float = 0.0
+        self._raw_odom_sub = nav.create_subscription(
+            Odometry,
+            "/two_wheel/odom_raw",
+            self._on_raw_odom,
+            20,
+        )
+
+    def _publish_cmd(self, cmd: Twist) -> None:
+        now = time.monotonic()
+        if self._last_pub_time > 0:
+            dt = now - self._last_pub_time
+            if dt > 0.10:
+                print(f"[warning] cmd publish interval delayed: {dt:.3f}s > 0.10s", flush=True)
+        self._last_pub_time = now
+        self._cmd_pub.publish(cmd)
+
+    def _on_raw_odom(self, msg: Odometry) -> None:
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+        )
+        self._control_pose = (float(p.x), float(p.y), float(yaw))
 
     def _stop(self) -> None:
         stop = Twist()
         for _ in range(8):
-            self._cmd_pub.publish(stop)
+            self._publish_cmd(stop)
             rclpy.spin_once(self._nav, timeout_sec=0.03)
 
-    def _pose(self) -> tuple[float, float, float] | None:
+    def _map_pose(self) -> tuple[float, float, float] | None:
         xy = resolve_map_xy(self._nav, self._tf, self._tracker)
         yaw = resolve_map_yaw(self._nav, self._tf, self._tracker)
         if xy is None or yaw is None:
             return None
         return xy[0], xy[1], yaw
 
+    def _motion_pose(self) -> tuple[float, float, float] | None:
+        return self._control_pose
+
     def _compute_path(self, goal: PoseStamped) -> list[Point]:
-        pose = self._pose()
+        pose = self._map_pose()
         if pose is None:
             raise RuntimeError("map pose를 확인할 수 없습니다")
         start = make_pose(self._nav, pose[0], pose[1], pose[2])
@@ -152,9 +181,13 @@ class SimplifiedPathNavigator:
     def _rotate_to(self, target_yaw: float, label: str) -> bool:
         started = time.monotonic()
         last_log = started
+        # Non-blocking cached map yaw for logging without triggering TF lookup delay
+        cached_map_pose = self._map_pose()
+        map_yaw_deg = math.degrees(cached_map_pose[2]) if cached_map_pose is not None else 0.0
+
         while time.monotonic() - started < 30.0:
             rclpy.spin_once(self._nav, timeout_sec=0.03)
-            pose = self._pose()
+            pose = self._motion_pose()
             if pose is None:
                 continue
             error = normalize_angle(target_yaw - pose[2])
@@ -167,18 +200,34 @@ class SimplifiedPathNavigator:
                 min(self._cfg.max_angular_speed_rps, self._cfg.rotate_gain * error),
             )
             cmd.linear.x = 0.0
-            self._cmd_pub.publish(cmd)
+            self._publish_cmd(cmd)
             now = time.monotonic()
             if now - last_log >= self._cfg.log_period_sec:
-                print(f"[{label}] rotate yaw_err={math.degrees(error):.1f}deg", flush=True)
+                print(
+                    f"[{label}] rotate ctrl_err={math.degrees(error):.1f}deg "
+                    f"(ctrl_yaw={math.degrees(pose[2]):.1f}deg, map_yaw={map_yaw_deg:.1f}deg)",
+                    flush=True,
+                )
                 last_log = now
         self._stop()
         return False
 
     def _drive_segment(self, start: Point, end: Point, label: str) -> bool:
-        heading = math.atan2(end[1] - start[1], end[0] - start[0])
+        map_heading = math.atan2(end[1] - start[1], end[0] - start[0])
         length = math.hypot(end[0] - start[0], end[1] - start[1])
-        if not self._rotate_to(heading, f"{label}:align"):
+
+        # Compute initial offset between raw odom yaw and map yaw (1-time non-blocking pre-check)
+        map_p = self._map_pose()
+        raw_p = self._motion_pose()
+        if map_p is not None and raw_p is not None:
+            yaw_offset = normalize_angle(raw_p[2] - map_p[2])
+            map_yaw_deg = math.degrees(map_p[2])
+        else:
+            yaw_offset = 0.0
+            map_yaw_deg = 0.0
+        control_target_yaw = normalize_angle(map_heading + yaw_offset)
+
+        if not self._rotate_to(control_target_yaw, f"{label}:align"):
             return False
 
         started = time.monotonic()
@@ -186,7 +235,7 @@ class SimplifiedPathNavigator:
         timeout = self._cfg.drive_timeout_base_sec + length * self._cfg.drive_timeout_per_meter_sec
         while time.monotonic() - started < timeout:
             rclpy.spin_once(self._nav, timeout_sec=0.03)
-            pose = self._pose()
+            pose = self._motion_pose()
             if pose is None:
                 continue
             x, y, yaw = pose
@@ -195,10 +244,10 @@ class SimplifiedPathNavigator:
                 self._stop()
                 return True
 
-            heading_error = normalize_angle(heading - yaw)
+            heading_error = normalize_angle(control_target_yaw - yaw)
             if abs(heading_error) >= self._cfg.rotate_reenter_rad:
                 self._stop()
-                if not self._rotate_to(heading, f"{label}:realign"):
+                if not self._rotate_to(control_target_yaw, f"{label}:realign"):
                     return False
                 continue
 
@@ -214,13 +263,14 @@ class SimplifiedPathNavigator:
                 self._cfg.min_linear_speed_mps,
                 min(self._cfg.max_linear_speed_mps, 0.55 * distance),
             )
-            self._cmd_pub.publish(cmd)
+            self._publish_cmd(cmd)
 
             now = time.monotonic()
             if now - last_log >= self._cfg.log_period_sec:
                 print(
                     f"[{label}] drive dist={distance:.2f}m cte={cte:.2f}m "
-                    f"yaw_err={math.degrees(heading_error):.1f}deg",
+                    f"ctrl_err={math.degrees(heading_error):.1f}deg "
+                    f"(ctrl_yaw={math.degrees(yaw):.1f}deg, map_yaw={map_yaw_deg:.1f}deg)",
                     flush=True,
                 )
                 last_log = now
@@ -242,11 +292,18 @@ class SimplifiedPathNavigator:
                     break
             if not failed:
                 q = goal.pose.orientation
-                target_yaw = math.atan2(
+                map_target_yaw = math.atan2(
                     2.0 * (q.w * q.z + q.x * q.y),
                     1.0 - 2.0 * (q.y * q.y + q.z * q.z),
                 )
-                return self._rotate_to(target_yaw, f"{label}:dock_yaw")
+                map_p = self._map_pose()
+                raw_p = self._motion_pose()
+                if map_p is not None and raw_p is not None:
+                    yaw_offset = normalize_angle(raw_p[2] - map_p[2])
+                else:
+                    yaw_offset = 0.0
+                control_target_yaw = normalize_angle(map_target_yaw + yaw_offset)
+                return self._rotate_to(control_target_yaw, f"{label}:dock_yaw")
 
             if attempt < self._cfg.replan_attempts:
                 print(f"[{label}] replanning attempt {attempt + 1}", flush=True)
