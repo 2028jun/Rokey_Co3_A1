@@ -256,11 +256,13 @@ class HMIBridgeNode(Node):
     def obstacle_event_callback(self, msg: String):
         try:
             data = json.loads(msg.data)
-            active = bool(data.get("active", False))
+            active = bool(data.get("active", data.get("detected", False)))
+            x_val = data.get("x")
+            y_val = data.get("y")
             self.obstacle_info = {
                 "active": active,
-                "x": float(data.get("x", 0.0)),
-                "y": float(data.get("y", 2.8)),
+                "x": float(x_val) if (x_val is not None and active) else 0.0,
+                "y": float(y_val) if (y_val is not None and active) else 2.8,
                 "stop": active,
             }
             if active:
