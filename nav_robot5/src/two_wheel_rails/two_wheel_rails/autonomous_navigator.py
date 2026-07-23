@@ -54,8 +54,8 @@ class MotionConfig:
     dock_step_distance_m: float = 0.08
     dock_max_linear_speed_mps: float = 0.10
     dock_min_linear_speed_mps: float = 0.02
-    dock_xy_tolerance_m: float = 0.03
-    dock_yaw_tolerance_rad: float = math.radians(1.0)
+    dock_xy_tolerance_m: float = 0.04
+    dock_yaw_tolerance_rad: float = math.radians(2.0)
     dock_realign_threshold_rad: float = math.radians(6.0)
     dock_yaw_gain: float = 1.0
     dock_max_angular_speed_rps: float = 0.04
@@ -816,7 +816,7 @@ class SimplifiedPathNavigator:
 
                 yaw_offset = normalize_angle(raw_p_curr[2] - map_p_curr[2])
                 dx_end = e[0] - map_p_curr[0]
-                dy_end = e[1] - map_p_curr[0]
+                dy_end = e[1] - map_p_curr[1]
 
                 c_rot = math.cos(yaw_offset)
                 s_rot = math.sin(yaw_offset)
@@ -829,22 +829,46 @@ class SimplifiedPathNavigator:
                 dx = control_end[0] - control_start[0]
                 dy = control_end[1] - control_start[1]
 
+                segment_length = math.hypot(dx, dy)
+
+                if segment_length < 0.02:
+                    print(
+                        f"[{label}:seg{index}] segment skipped: length={segment_length:.3f}m",
+                        flush=True,
+                    )
+                    continue
+
+                stage_yaw = math.atan2(dy, dx)
+
                 if abs(dx) >= abs(dy):
                     stage = AxisStage(
                         kind="axis_x",
                         value=control_end[0],
-                        yaw=normalize_angle((0.0 if dx >= 0.0 else math.pi) + yaw_offset),
-                        speed=self._cfg.max_linear_speed_mps if dx >= 0.0 else -self._cfg.max_linear_speed_mps,
+                        yaw=stage_yaw,
+                        speed=self._cfg.max_linear_speed_mps,
                         is_last=is_last,
                     )
                 else:
                     stage = AxisStage(
                         kind="axis_y",
                         value=control_end[1],
-                        yaw=normalize_angle((math.pi / 2.0 if dy >= 0.0 else -math.pi / 2.0) + yaw_offset),
-                        speed=self._cfg.max_linear_speed_mps if dy >= 0.0 else -self._cfg.max_linear_speed_mps,
+                        yaw=stage_yaw,
+                        speed=self._cfg.max_linear_speed_mps,
                         is_last=is_last,
                     )
+
+                print(
+                    f"[{label}:seg{index}] axis stage: "
+                    f"map_end=({e[0]:.3f},{e[1]:.3f}) "
+                    f"map_pose=({map_p_curr[0]:.3f},{map_p_curr[1]:.3f}) "
+                    f"raw_pose=({raw_p_curr[0]:.3f},{raw_p_curr[1]:.3f}) "
+                    f"ctrl_end=({control_end[0]:.3f},{control_end[1]:.3f}) "
+                    f"kind={stage.kind} "
+                    f"value={stage.value:.3f} "
+                    f"yaw={math.degrees(stage.yaw):.1f}deg "
+                    f"length={segment_length:.3f}m",
+                    flush=True,
+                )
 
                 if not self._drive_axis_stage(stage, f"{label}:seg{index}"):
                     print(f"[{label}] segment {index} failed; replanning (attempt {attempt + 1})...", flush=True)
@@ -917,13 +941,16 @@ class SimplifiedPathNavigator:
             yaw_error = normalize_angle(ctrl_goal_yaw - yaw)
             dist_to_dock = math.hypot(dx, dy)
 
-            position_ok = (dist_to_dock <= 0.04)
-            yaw_ok = (abs(yaw_error) <= math.radians(2.0))
+            position_ok = (dist_to_dock <= self._cfg.dock_xy_tolerance_m)
+            yaw_ok = (abs(yaw_error) <= self._cfg.dock_yaw_tolerance_rad)
+
+            cmd = Twist()
 
             if position_ok and yaw_ok:
-                self._stop()
+                self._publish_cmd(cmd)
                 dock_settle_count += 1
                 if dock_settle_count >= 30:
+                    self._stop()
                     print(
                         f"[{label}] docking complete: dist={dist_to_dock:.3f}m "
                         f"forward={forward_error:.3f}m lateral={lateral_error:.3f}m "
@@ -934,7 +961,6 @@ class SimplifiedPathNavigator:
             else:
                 dock_settle_count = 0
 
-                cmd = Twist()
                 linear_cmd = max(-0.04, min(0.08, 0.45 * forward_error))
                 if abs(linear_cmd) < 0.015 and abs(forward_error) > 0.004:
                     linear_cmd = math.copysign(0.015, forward_error)

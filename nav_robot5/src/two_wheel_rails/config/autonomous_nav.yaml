@@ -15,8 +15,8 @@ dock_approach_distance_m: 0.60
 dock_step_distance_m: 0.08
 dock_max_linear_speed_mps: 0.10
 dock_min_linear_speed_mps: 0.02
-dock_xy_tolerance_m: 0.03
-dock_yaw_tolerance_rad: 0.0174532925      # 1 deg
+dock_xy_tolerance_m: 0.04
+dock_yaw_tolerance_rad: 0.034906585       # 2 deg
 dock_realign_threshold_rad: 0.1047197551   # 6 deg
 dock_yaw_gain: 1.0
 dock_max_angular_speed_rps: 0.04
