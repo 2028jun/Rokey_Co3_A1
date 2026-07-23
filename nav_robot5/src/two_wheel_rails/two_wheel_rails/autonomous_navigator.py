@@ -1,4 +1,4 @@
-"""Nav2 free-path planning replaced with Orthogonal L-Path, Orthogonal A*, and Control-Frame 0.40m Sub-Step Drive & Micro-Docking."""
+"""Nav2 free-path planning replaced with Orthogonal L-Path, Orthogonal A*, Control-Frame 0.40m Sub-Step Drive with Closed-Loop Straight-Line Yaw Feedback & Micro-Docking."""
 
 from __future__ import annotations
 
@@ -48,6 +48,9 @@ class MotionConfig:
     dock_xy_tolerance_m: float = 0.03
     dock_yaw_tolerance_rad: float = math.radians(1.0)
     dock_realign_threshold_rad: float = math.radians(6.0)
+    dock_yaw_gain: float = 1.0
+    dock_max_angular_speed_rps: float = 0.04
+    dock_yaw_deadband_rad: float = math.radians(0.2)
 
     rotate_done_rad: float = math.radians(4.0)
     rotate_reenter_rad: float = math.radians(5.0)
@@ -58,6 +61,10 @@ class MotionConfig:
     min_linear_speed_mps: float = 0.07
     max_angular_speed_rps: float = 0.50
     rotate_gain: float = 1.25
+    straight_yaw_gain: float = 1.2
+    straight_max_angular_speed_rps: float = 0.08
+    straight_yaw_deadband_rad: float = math.radians(0.3)
+
     drive_timeout_base_sec: float = 15.0
     drive_timeout_per_meter_sec: float = 12.0
     replan_cte_m: float = 0.15
@@ -70,6 +77,21 @@ def load_motion_config() -> MotionConfig:
     with path.open(encoding="utf-8") as stream:
         raw = yaml.safe_load(stream) or {}
     return MotionConfig(**{k: v for k, v in raw.items() if k in MotionConfig.__dataclass_fields__})
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def _yaw_feedback(
+    error: float,
+    gain: float,
+    max_angular_speed: float,
+    deadband: float,
+) -> float:
+    if abs(error) <= deadband:
+        return 0.0
+    return _clamp(gain * error, -max_angular_speed, max_angular_speed)
 
 
 def _point_line_distance(point: Point, start: Point, end: Point) -> float:
@@ -198,7 +220,7 @@ def corner_rotation_is_clear(
 
 
 class SimplifiedPathNavigator:
-    """Orthogonal L-path & A* navigator with strict costmap, control-frame transformation, 0.4m sub-step drive & micro-docking."""
+    """Orthogonal L-path & A* navigator with strict costmap, control-frame transformation, 0.4m sub-step drive with closed-loop straight-line yaw feedback & micro-docking."""
 
     def __init__(self, nav: BasicNavigator, tf_buffer, tracker: AmclPoseTracker) -> None:
         self._nav = nav
@@ -662,11 +684,23 @@ class SimplifiedPathNavigator:
                     print(f"[{label}] endpoint plane crossed (along={along:.2f}m/{total_length:.2f}m, lateral_cte={lateral_cte:.3f}m)", flush=True)
                     return True
 
+                heading_error = normalize_angle(sub_target_yaw - yaw)
+                if abs(heading_error) >= self._cfg.rotate_reenter_rad:
+                    self._stop()
+                    if not self._rotate_to(sub_target_yaw, f"{label}:step{k+1}_realign"):
+                        return False
+                    continue
+
                 cmd = Twist()
-                cmd.angular.z = 0.0
                 cmd.linear.x = max(
                     self._cfg.min_linear_speed_mps,
                     min(self._cfg.max_linear_speed_mps, 0.55 * distance_to_sub_end),
+                )
+                cmd.angular.z = _yaw_feedback(
+                    error=heading_error,
+                    gain=self._cfg.straight_yaw_gain,
+                    max_angular_speed=self._cfg.straight_max_angular_speed_rps,
+                    deadband=self._cfg.straight_yaw_deadband_rad,
                 )
                 self._publish_cmd(cmd)
 
@@ -674,7 +708,7 @@ class SimplifiedPathNavigator:
                 if now - last_log >= self._cfg.log_period_sec:
                     print(
                         f"[{label}:step{k+1}] drive dist={distance_to_sub_end:.2f}m lateral_cte={lateral_cte:.2f}m "
-                        f"ctrl_err={math.degrees(normalize_angle(sub_target_yaw - yaw)):.1f}deg",
+                        f"ctrl_err={math.degrees(heading_error):.1f}deg yaw_cmd={cmd.angular.z:.3f}rad/s",
                         flush=True,
                     )
                     last_log = now
@@ -784,7 +818,6 @@ class SimplifiedPathNavigator:
                     return False
                 continue
 
-            # Determine step size: 0.08m when dist > 0.20m; 0.03m when dist <= 0.20m
             step_dist = 0.03 if dist_to_dock <= 0.20 else 0.08
             step_start = (x, y)
             step_target_dist = min(step_dist, dist_to_dock)
@@ -813,10 +846,15 @@ class SimplifiedPathNavigator:
                     break
 
                 cmd = Twist()
-                cmd.angular.z = 0.0
                 cmd.linear.x = max(
                     self._cfg.dock_min_linear_speed_mps,
                     min(self._cfg.dock_max_linear_speed_mps, 0.4 * (step_target_dist - moved)),
+                )
+                cmd.angular.z = _yaw_feedback(
+                    error=cur_yaw_err,
+                    gain=self._cfg.dock_yaw_gain,
+                    max_angular_speed=self._cfg.dock_max_angular_speed_rps,
+                    deadband=self._cfg.dock_yaw_deadband_rad,
                 )
                 self._publish_cmd(cmd)
 

@@ -12,12 +12,15 @@ rotation_clearance_radius_m: 0.45
 
 # Docking
 dock_approach_distance_m: 0.60
-dock_step_distance_m: 0.15
+dock_step_distance_m: 0.08
 dock_max_linear_speed_mps: 0.10
 dock_min_linear_speed_mps: 0.02
 dock_xy_tolerance_m: 0.03
 dock_yaw_tolerance_rad: 0.0174532925      # 1 deg
 dock_realign_threshold_rad: 0.1047197551   # 6 deg
+dock_yaw_gain: 1.0
+dock_max_angular_speed_rps: 0.04
+dock_yaw_deadband_rad: 0.0034906585       # 0.2 deg
 
 # Motion Control
 rotate_done_rad: 0.0698131701       # 4 deg
@@ -29,6 +32,9 @@ max_linear_speed_mps: 0.22
 min_linear_speed_mps: 0.07
 max_angular_speed_rps: 0.50
 rotate_gain: 1.25
+straight_yaw_gain: 1.2
+straight_max_angular_speed_rps: 0.08
+straight_yaw_deadband_rad: 0.0052359878   # 0.3 deg
 drive_timeout_base_sec: 15.0
 drive_timeout_per_meter_sec: 12.0
 replan_cte_m: 0.15
