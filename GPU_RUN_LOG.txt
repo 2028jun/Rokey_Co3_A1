@@ -422,7 +422,7 @@ Still broken / follow-up (i.e., Pass 5's actual job):
   prompt revision was never actually investigated in any prior pass's log
   entry and remains open; unrelated to this rig change.
 
-## Pass 5 -- 2026-07-23 (commit <fill in after committing>)
+## Pass 5 -- 2026-07-23 (commit e5fd0f4)
 
 Tested:
 - Task 1: loaded `assets/rigid_arm_asset.usda` in isolation (referenced onto
