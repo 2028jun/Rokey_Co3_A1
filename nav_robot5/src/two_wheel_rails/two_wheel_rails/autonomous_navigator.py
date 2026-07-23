@@ -1,4 +1,4 @@
-"""Nav2 free-path planning replaced with Orthogonal L-Path, Orthogonal A*, Control-Frame 0.40m Sub-Step Drive with Closed-Loop Straight-Line Yaw Feedback & Micro-Docking."""
+"""Nav2 free-path planning replaced with Orthogonal L-Path, Orthogonal A*, Continuous Drive with Closed-Loop Signed CTE Yaw Correction & Precision Settling Rotation."""
 
 from __future__ import annotations
 
@@ -50,16 +50,21 @@ class MotionConfig:
     dock_realign_threshold_rad: float = math.radians(6.0)
     dock_yaw_gain: float = 1.0
     dock_max_angular_speed_rps: float = 0.04
+    dock_min_angular_speed_rps: float = 0.04
+    dock_rotate_min_angular_speed_rps: float = 0.08
     dock_yaw_deadband_rad: float = math.radians(0.2)
 
-    rotate_done_rad: float = math.radians(4.0)
+    rotate_done_rad: float = math.radians(2.0)
     rotate_reenter_rad: float = math.radians(5.0)
-    final_yaw_tolerance_rad: float = math.radians(4.0)
-    waypoint_tolerance_m: float = 0.16
-    endpoint_crossing_lateral_tolerance_m: float = 0.20
+    final_yaw_tolerance_rad: float = math.radians(2.0)
+    corner_waypoint_tolerance_m: float = 0.05
+    final_approach_waypoint_tolerance_m: float = 0.10
+    endpoint_crossing_lateral_tolerance_m: float = 0.06
     max_linear_speed_mps: float = 0.22
     min_linear_speed_mps: float = 0.07
     max_angular_speed_rps: float = 0.50
+    rotate_min_angular_speed_rps: float = 0.18
+    min_angular_speed_rps: float = 0.06
     rotate_gain: float = 1.25
     straight_yaw_gain: float = 1.2
     straight_max_angular_speed_rps: float = 0.08
@@ -92,6 +97,18 @@ def _yaw_feedback(
     if abs(error) <= deadband:
         return 0.0
     return _clamp(gain * error, -max_angular_speed, max_angular_speed)
+
+
+def _rotation_command(
+    error: float,
+    gain: float,
+    max_speed: float,
+    min_speed: float,
+) -> float:
+    command = max(-max_speed, min(max_speed, gain * error))
+    if abs(command) < min_speed:
+        command = math.copysign(min_speed, error)
+    return command
 
 
 def _point_line_distance(point: Point, start: Point, end: Point) -> float:
@@ -220,7 +237,7 @@ def corner_rotation_is_clear(
 
 
 class SimplifiedPathNavigator:
-    """Orthogonal L-path & A* navigator with strict costmap, control-frame transformation, 0.4m sub-step drive with closed-loop straight-line yaw feedback & micro-docking."""
+    """Orthogonal L-path & A* navigator with strict costmap, control-frame transformation, continuous drive with closed-loop signed CTE yaw correction & micro-docking."""
 
     def __init__(self, nav: BasicNavigator, tf_buffer, tracker: AmclPoseTracker) -> None:
         self._nav = nav
@@ -558,37 +575,71 @@ class SimplifiedPathNavigator:
 
     def _rotate_to(self, target_yaw: float, label: str, tolerance_rad: float | None = None) -> bool:
         tolerance = self._cfg.rotate_done_rad if tolerance_rad is None else tolerance_rad
+        min_w = self._cfg.dock_rotate_min_angular_speed_rps if (tolerance_rad is not None) else self._cfg.rotate_min_angular_speed_rps
+        max_w = self._cfg.max_angular_speed_rps
+
         started = time.monotonic()
         last_log = started
+        stall_check_time = started
+        stall_check_yaw = None
+
+        settle_count = 0
 
         while time.monotonic() - started < 30.0:
             rclpy.spin_once(self._nav, timeout_sec=0.03)
             pose = self._motion_pose()
             if pose is None:
                 continue
+
+            if stall_check_yaw is None:
+                stall_check_yaw = pose[2]
+
             error = normalize_angle(target_yaw - pose[2])
-            if abs(error) <= tolerance:
-                self._stop()
-                return True
-            cmd = Twist()
-            cmd.angular.z = max(
-                -self._cfg.max_angular_speed_rps,
-                min(self._cfg.max_angular_speed_rps, self._cfg.rotate_gain * error),
-            )
-            cmd.linear.x = 0.0
-            self._publish_cmd(cmd)
+
             now = time.monotonic()
+            if now - stall_check_time >= 1.0:
+                yaw_delta = abs(normalize_angle(pose[2] - stall_check_yaw))
+                if yaw_delta < math.radians(0.2) and abs(error) > tolerance:
+                    print(
+                        f"[{label}] rotation stalled: error={math.degrees(error):.1f}deg "
+                        f"yaw_delta={math.degrees(yaw_delta):.2f}deg; forcing minimum angular velocity",
+                        flush=True,
+                    )
+                stall_check_yaw = pose[2]
+                stall_check_time = now
+
+            if abs(error) <= tolerance:
+                stop_cmd = Twist()
+                self._publish_cmd(stop_cmd)
+                settle_count += 1
+                if settle_count >= 5:
+                    self._stop()
+                    self._spin_sleep(0.15)
+                    return True
+            else:
+                settle_count = 0
+                cmd = Twist()
+                cmd.angular.z = _rotation_command(
+                    error=error,
+                    gain=self._cfg.rotate_gain,
+                    max_speed=max_w,
+                    min_speed=min_w,
+                )
+                cmd.linear.x = 0.0
+                self._publish_cmd(cmd)
+
             if now - last_log >= self._cfg.log_period_sec:
                 print(
                     f"[{label}] rotate ctrl_err={math.degrees(error):.1f}deg (tol={math.degrees(tolerance):.1f}deg) "
-                    f"(ctrl_yaw={math.degrees(pose[2]):.1f}deg)",
+                    f"(ctrl_yaw={math.degrees(pose[2]):.1f}deg, settle={settle_count})",
                     flush=True,
                 )
                 last_log = now
+
         self._stop()
         return False
 
-    def _drive_segment(self, map_start: Point, map_end: Point, label: str) -> bool:
+    def _drive_segment(self, map_start: Point, map_end: Point, label: str, is_last_segment: bool = False) -> bool:
         map_p = self._map_pose()
         raw_p = self._motion_pose()
 
@@ -628,95 +679,79 @@ class SimplifiedPathNavigator:
             flush=True,
         )
 
-        max_sub_step_m = 0.40
-        num_sub_steps = max(1, math.ceil(total_length / max_sub_step_m))
+        axis_yaw = math.atan2(control_end[1] - control_start[1], control_end[0] - control_start[0])
 
-        for k in range(num_sub_steps):
-            sub_start_r = k / num_sub_steps
-            sub_end_r = (k + 1) / num_sub_steps
+        if not self._rotate_to(axis_yaw, f"{label}:align"):
+            return False
 
-            sub_start = (
-                control_start[0] + sub_start_r * (control_end[0] - control_start[0]),
-                control_start[1] + sub_start_r * (control_end[1] - control_start[1]),
-            )
-            sub_end = (
-                control_start[0] + sub_end_r * (control_end[0] - control_start[0]),
-                control_start[1] + sub_end_r * (control_end[1] - control_start[1]),
-            )
-            sub_length = math.hypot(sub_end[0] - sub_start[0], sub_end[1] - sub_start[1])
+        started = time.monotonic()
+        last_log = started
+        timeout = self._cfg.drive_timeout_base_sec + total_length * self._cfg.drive_timeout_per_meter_sec
+        waypoint_tol = self._cfg.final_approach_waypoint_tolerance_m if is_last_segment else self._cfg.corner_waypoint_tolerance_m
 
-            cur_p = self._motion_pose()
-            if cur_p is None:
+        while time.monotonic() - started < timeout:
+            rclpy.spin_once(self._nav, timeout_sec=0.03)
+            pose = self._motion_pose()
+            if pose is None:
+                continue
+            x, y, yaw = pose
+
+            distance_to_seg_end = math.hypot(control_end[0] - x, control_end[1] - y)
+            along, lateral_cte = _segment_progress((x, y), control_start, control_end)
+
+            if lateral_cte > self._cfg.replan_cte_m:
+                self._stop()
+                print(f"[{label}] lateral CTE {lateral_cte:.2f}m > limit {self._cfg.replan_cte_m:.2f}m -> segment failed", flush=True)
                 return False
-            sub_target_yaw = math.atan2(sub_end[1] - cur_p[1], sub_end[0] - cur_p[0])
 
-            if not self._rotate_to(sub_target_yaw, f"{label}:step{k+1}_align"):
-                return False
+            if distance_to_seg_end <= waypoint_tol and (is_last_segment or lateral_cte <= self._cfg.endpoint_crossing_lateral_tolerance_m):
+                self._stop()
+                print(f"[{label}] waypoint reached (dist={distance_to_seg_end:.3f}m <= {waypoint_tol:.2f}m, along={along:.2f}m/{total_length:.2f}m)", flush=True)
+                return True
 
-            sub_started = time.monotonic()
-            last_log = sub_started
-            timeout = self._cfg.drive_timeout_base_sec + sub_length * self._cfg.drive_timeout_per_meter_sec
-            brake_margin = 0.02  # 0.02m braking margin
+            if along >= total_length and lateral_cte <= self._cfg.endpoint_crossing_lateral_tolerance_m:
+                self._stop()
+                print(f"[{label}] endpoint plane crossed (along={along:.2f}m/{total_length:.2f}m, lateral_cte={lateral_cte:.3f}m)", flush=True)
+                return True
 
-            while time.monotonic() - sub_started < timeout:
-                rclpy.spin_once(self._nav, timeout_sec=0.03)
-                pose = self._motion_pose()
-                if pose is None:
-                    continue
-                x, y, yaw = pose
+            # Signed CTE calculation & max 2.5 deg return angle correction
+            dx_c = x - control_start[0]
+            dy_c = y - control_start[1]
+            signed_cte = -dx_c * math.sin(axis_yaw) + dy_c * math.cos(axis_yaw)
+            cte_correction = max(math.radians(-2.5), min(math.radians(2.5), -0.8 * signed_cte))
+            corrected_target_yaw = normalize_angle(axis_yaw + cte_correction)
 
-                distance_to_sub_end = math.hypot(sub_end[0] - x, sub_end[1] - y)
-                distance_to_seg_end = math.hypot(control_end[0] - x, control_end[1] - y)
-                along, lateral_cte = _segment_progress((x, y), control_start, control_end)
-
-                if lateral_cte > self._cfg.replan_cte_m:
-                    self._stop()
-                    print(f"[{label}:step{k+1}] lateral CTE {lateral_cte:.2f}m > limit {self._cfg.replan_cte_m:.2f}m -> segment failed", flush=True)
+            heading_error = normalize_angle(corrected_target_yaw - yaw)
+            if abs(heading_error) >= self._cfg.rotate_reenter_rad:
+                self._stop()
+                if not self._rotate_to(axis_yaw, f"{label}:realign"):
                     return False
+                continue
 
-                if distance_to_sub_end <= (self._cfg.waypoint_tolerance_m + brake_margin) or distance_to_seg_end <= self._cfg.waypoint_tolerance_m:
-                    self._stop()
-                    print(f"[{label}:step{k+1}] sub-step reached (dist={distance_to_sub_end:.3f}m, along={along:.2f}m/{total_length:.2f}m)", flush=True)
-                    break
+            cmd = Twist()
+            cmd.linear.x = max(
+                self._cfg.min_linear_speed_mps,
+                min(self._cfg.max_linear_speed_mps, 0.55 * distance_to_seg_end),
+            )
+            cmd.angular.z = _yaw_feedback(
+                error=heading_error,
+                gain=self._cfg.straight_yaw_gain,
+                max_angular_speed=self._cfg.straight_max_angular_speed_rps,
+                deadband=self._cfg.straight_yaw_deadband_rad,
+            )
+            self._publish_cmd(cmd)
 
-                if along >= total_length and lateral_cte <= self._cfg.endpoint_crossing_lateral_tolerance_m:
-                    self._stop()
-                    print(f"[{label}] endpoint plane crossed (along={along:.2f}m/{total_length:.2f}m, lateral_cte={lateral_cte:.3f}m)", flush=True)
-                    return True
-
-                heading_error = normalize_angle(sub_target_yaw - yaw)
-                if abs(heading_error) >= self._cfg.rotate_reenter_rad:
-                    self._stop()
-                    if not self._rotate_to(sub_target_yaw, f"{label}:step{k+1}_realign"):
-                        return False
-                    continue
-
-                cmd = Twist()
-                cmd.linear.x = max(
-                    self._cfg.min_linear_speed_mps,
-                    min(self._cfg.max_linear_speed_mps, 0.55 * distance_to_sub_end),
+            now = time.monotonic()
+            if now - last_log >= self._cfg.log_period_sec:
+                print(
+                    f"[{label}] drive dist={distance_to_seg_end:.2f}m lateral_cte={lateral_cte:.2f}m (signed={signed_cte:.2f}m) "
+                    f"ctrl_err={math.degrees(heading_error):.1f}deg yaw_cmd={cmd.angular.z:.3f}rad/s",
+                    flush=True,
                 )
-                cmd.angular.z = _yaw_feedback(
-                    error=heading_error,
-                    gain=self._cfg.straight_yaw_gain,
-                    max_angular_speed=self._cfg.straight_max_angular_speed_rps,
-                    deadband=self._cfg.straight_yaw_deadband_rad,
-                )
-                self._publish_cmd(cmd)
+                last_log = now
 
-                now = time.monotonic()
-                if now - last_log >= self._cfg.log_period_sec:
-                    print(
-                        f"[{label}:step{k+1}] drive dist={distance_to_sub_end:.2f}m lateral_cte={lateral_cte:.2f}m "
-                        f"ctrl_err={math.degrees(heading_error):.1f}deg yaw_cmd={cmd.angular.z:.3f}rad/s",
-                        flush=True,
-                    )
-                    last_log = now
-
-            self._stop()
-            self._spin_sleep(0.05)
-
-        return True
+        self._stop()
+        return False
 
     def navigate_to(self, goal: PoseStamped, *, label: str = "goal") -> bool:
         if not self._wait_for_navigation_inputs(timeout_sec=8.0):
@@ -755,8 +790,10 @@ class SimplifiedPathNavigator:
                 return False
 
             failed = False
+            total_segs = len(points) - 1
             for index, (s, e) in enumerate(zip(points, points[1:]), start=1):
-                if not self._drive_segment(s, e, f"{label}:seg{index}"):
+                is_last = (index == total_segs)
+                if not self._drive_segment(s, e, f"{label}:seg{index}", is_last_segment=is_last):
                     print(f"[{label}] segment {index} failed; replanning (attempt {attempt + 1})...", flush=True)
                     failed = True
                     break
