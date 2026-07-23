@@ -79,6 +79,7 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rosgraph_msgs.msg import Clock
 from builtin_interfaces.msg import Time as TimeMsg
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Int32
 from std_srvs.srv import SetBool
 
@@ -1093,6 +1094,9 @@ class NavBridge(Node):
         self._completed_delivery_table = None
         self._delivered_trip_counts = {}
         self._hand_test_controller = None
+        self._obstacle_stop = False
+        self._obstacle_stop_started = None
+        self._clearance_start = None
 
         qos = QoSProfile(
             depth=10,
@@ -1104,6 +1108,8 @@ class NavBridge(Node):
         self.create_subscription(
             PoseStamped, "/nav_robot/teleport", self._on_teleport, qos
         )
+        self.create_subscription(LaserScan, "/scan", self._on_scan, qos)
+        self.create_subscription(LaserScan, "/nav_robot/scan", self._on_scan, qos)
         self.odom_pub = self.create_publisher(Odometry, "/nav_robot/odom", qos)
         self.tf_broadcaster = TransformBroadcaster(self)
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
@@ -1415,6 +1421,84 @@ class NavBridge(Node):
             self._target_wz = 0.0
             self._cmd_vx = 0.0
             self._cmd_wz = 0.0
+
+    def _on_scan(self, msg: LaserScan):
+        with self._lock:
+            mission = self._direct_nav
+            if mission is None:
+                return
+
+            if mission["mode"] == "legacy_table":
+                stage = mission.get("stage")
+                if stage not in ("move_to_pre_dock", "final_approach"):
+                    return
+            else:
+                stages = mission.get("stages", [])
+                index = mission.get("index", 0)
+                if index >= len(stages):
+                    return
+                kind = stages[index].get("kind")
+                if kind not in ("axis_x", "axis_y"):
+                    return
+
+            stop_distance = 0.8
+            resume_distance = 1.0
+            front_angle = math.radians(20.0)
+
+            valid_ranges = []
+            for idx, distance in enumerate(msg.ranges):
+                angle = msg.angle_min + idx * msg.angle_increment
+                if abs(angle) > front_angle:
+                    continue
+                if not math.isfinite(distance):
+                    continue
+                if msg.range_min <= distance <= msg.range_max:
+                    valid_ranges.append(distance)
+
+            if not valid_ranges:
+                return
+
+            close_points = [d for d in valid_ranges if d <= stop_distance]
+            nearest = min(valid_ranges)
+            now = time.monotonic()
+
+            if not self._obstacle_stop and len(close_points) >= 3:
+                self._start_obstacle_stop(nearest)
+            elif self._obstacle_stop:
+                if nearest >= resume_distance:
+                    if self._clearance_start is None:
+                        self._clearance_start = now
+                    elif now - self._clearance_start >= 0.5:
+                        self._finish_obstacle_stop(nearest)
+                else:
+                    self._clearance_start = None
+
+    def _start_obstacle_stop(self, distance: float):
+        if self._obstacle_stop:
+            return
+        self._obstacle_stop = True
+        self._obstacle_stop_started = time.monotonic()
+        self._clearance_start = None
+        self._target_vx = 0.0
+        self._target_wz = 0.0
+        self._cmd_vx = 0.0
+        self._cmd_wz = 0.0
+        self.get_logger().warning(
+            f"전방 장애물(사람) 감지: {distance:.2f}m <= 0.8m, 주행 정지"
+        )
+
+    def _finish_obstacle_stop(self, distance: float):
+        if not self._obstacle_stop:
+            return
+        paused_for = time.monotonic() - (self._obstacle_stop_started or time.monotonic())
+        if self._direct_nav is not None and "stage_start" in self._direct_nav:
+            self._direct_nav["stage_start"] += paused_for
+        self._obstacle_stop = False
+        self._obstacle_stop_started = None
+        self._clearance_start = None
+        self.get_logger().info(
+            f"전방 장애물(사람) 해제: {distance:.2f}m >= 1.0m, 0.5s 안전 지연 완료, 주행 재개"
+        )
         self.get_logger().info(
             f"teleport queued -> ({x:.2f},{y:.2f}) yaw={yaw:.2f}"
         )
@@ -1519,6 +1603,9 @@ class NavBridge(Node):
             "stage_start": time.monotonic(),
             "last_log": 0.0,
         }
+        self._obstacle_stop = False
+        self._obstacle_stop_started = None
+        self._clearance_start = None
         self._cmd_vx = 0.0
         self._cmd_wz = 0.0
         self.get_logger().info(
@@ -1532,6 +1619,9 @@ class NavBridge(Node):
             return
         target = mission["target"]
         self._direct_nav = None
+        self._obstacle_stop = False
+        self._obstacle_stop_started = None
+        self._clearance_start = None
         self._cmd_vx = self._cmd_wz = 0.0
         self._target_vx = self._target_wz = 0.0
         if success:
@@ -1549,7 +1639,7 @@ class NavBridge(Node):
         mission = self._direct_nav
         if mission is None:
             return None
-        if self._navigation_paused:
+        if self._navigation_paused or self._obstacle_stop:
             return 0.0, 0.0
         if mission["mode"] == "legacy_table":
             return self._update_legacy_table_navigation(mission, x, y, yaw)
