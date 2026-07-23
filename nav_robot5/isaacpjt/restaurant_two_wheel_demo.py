@@ -103,13 +103,14 @@ WHEEL_JOINTS = [
 ARM_JOINTS = [f"joint_{index}" for index in range(1, 7)]
 STOW_CONFIGURATION = [0.0, 0.0, 1.57, 0.0, 1.57, 0.0]
 
+# Exact Original Control Constants from nav_restaurant_demo.py
 WHEEL_RADIUS = 0.10
 DIFFERENTIAL_HALF_TRACK = 0.315
-MAX_WHEEL_SPEED = 16.0
+MAX_WHEEL_SPEED = 8.0
 LINEAR_ACCEL_LIMIT = 0.80
 LINEAR_DECEL_LIMIT = 1.00
-ANGULAR_ACCEL_LIMIT = 2.0
-ANGULAR_DECEL_LIMIT = 2.5
+ANGULAR_ACCEL_LIMIT = 3.0
+ANGULAR_DECEL_LIMIT = 3.5
 WHEEL_DRIVE_DAMPING = 140.0
 WHEEL_DRIVE_MAX_FORCE = 350.0
 TIRE_STATIC_FRICTION = 0.50
@@ -429,12 +430,12 @@ class DiffNavBridge(Node):
         except Exception as exc:
             self.get_logger().error(f"failed to parse mission command JSON: {exc}")
 
-    # Ported Helper: Angle Error
+    # Exact Line-by-Line Original Helper: Angle Error from nav_restaurant_demo.py
     @staticmethod
     def _angle_error(target: float, actual: float) -> float:
         return math.atan2(math.sin(target - actual), math.cos(target - actual))
 
-    # Ported Helper: Slew Limit
+    # Exact Line-by-Line Original Helper: Slew Limit from nav_restaurant_demo.py
     @staticmethod
     def _slew(current: float, target: float, acceleration: float, deceleration: float, dt: float) -> float:
         limit = acceleration if abs(target) > abs(current) else deceleration
@@ -444,7 +445,7 @@ class DiffNavBridge(Node):
             return target
         return current + math.copysign(max_delta, delta)
 
-    # Differential IK
+    # Exact Line-by-Line Original Helper: Differential IK from nav_restaurant_demo.py
     def _differential_ik(self, vx: float, wz: float) -> np.ndarray:
         turn = DIFFERENTIAL_HALF_TRACK * wz
         wheels = np.asarray(
@@ -511,7 +512,7 @@ class DiffNavBridge(Node):
         else:
             self.get_logger().error(f"direct navigation failed mission={mission_id}: {reason}")
 
-    # Ported Method: Update Direct Navigation (Axis & Pivot Stages)
+    # Exact Line-by-Line Original Method: _update_direct_navigation from nav_restaurant_demo.py
     def _update_direct_navigation(self, x: float, y: float, yaw: float) -> tuple[float, float] | None:
         mission = self._direct_nav
         if mission is None:
@@ -592,7 +593,7 @@ class DiffNavBridge(Node):
 
         return (vx * self._obstacle_scale, wz)
 
-    # Ported Method: Update Legacy Table Navigation (Pre-dock, Final Docking, Recovery & Settle)
+    # Exact Line-by-Line Original Method: _update_legacy_table_navigation from nav_restaurant_demo.py
     def _update_legacy_table_navigation(self, mission: dict, x: float, y: float, yaw: float) -> tuple[float, float]:
         goal_x, goal_y, goal_yaw = mission["goal"]
         pre_x = goal_x - 0.65 * math.cos(goal_yaw)
@@ -873,7 +874,7 @@ class DiffNavBridge(Node):
         scan.ranges = ranges
         self.scan_pub.publish(scan)
 
-    # Main Physics Tick Method
+    # Main Physics Tick Method (Exact Order Matching nav_restaurant_demo.py)
     def tick(self, sim_time_sec: float):
         self._apply_pending_teleport()
 
@@ -902,6 +903,7 @@ class DiffNavBridge(Node):
         else:
             target_vx, target_wz = 0.0, 0.0
 
+        # Exact Slew Sequence from nav_restaurant_demo.py
         self._cmd_vx = self._slew(
             self._cmd_vx, target_vx, LINEAR_ACCEL_LIMIT, LINEAR_DECEL_LIMIT, dt
         )
