@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
-from pxr import Gf, UsdGeom, UsdPhysics
+from pxr import Gf, Usd, UsdGeom, UsdPhysics
 
 PERSON_USD = os.environ.get(
     "CORRIDOR_PERSON_USD",
@@ -59,20 +59,29 @@ class CorridorPersonSpawnController:
                 precision=UsdGeom.XformOp.PrecisionDouble
             ).Set(CORRIDOR_PERSON_YAW)
 
-            # Add invisible capsule collider so PhysX / RTX LiDAR rays hit the obstacle
+            # Apply PhysX Collision API to all human meshes
+            for p in Usd.PrimRange(prim):
+                if p.IsA(UsdGeom.Mesh):
+                    UsdPhysics.CollisionAPI.Apply(p)
+                    try:
+                        UsdPhysics.MeshCollisionAPI.Apply(p)
+                    except Exception:
+                        pass
+
+            # Create guide capsule collider (purpose="guide" makes it invisible in rendering but active in PhysX)
             collider_path = f"{CORRIDOR_PERSON_PRIM}/CollisionBody"
             capsule = UsdGeom.Capsule.Define(self.stage, collider_path)
             capsule.CreateHeightAttr(1.7)
-            capsule.CreateRadiusAttr(0.3)
+            capsule.CreateRadiusAttr(0.35)
             capsule.CreateAxisAttr("Z")
             UsdGeom.Xformable(capsule).AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.85))
             UsdPhysics.CollisionAPI.Apply(capsule.GetPrim())
-            UsdGeom.Imageable(capsule.GetPrim()).MakeInvisible()
+            capsule.CreatePurposeAttr("guide")
 
         UsdGeom.Imageable(prim).MakeVisible()
         self.active = True
         print(
-            f"[obstacle_test] corridor person spawned with LiDAR collider at {tuple(CORRIDOR_PERSON_POSITION)}",
+            f"[obstacle_test] corridor person spawned with active PhysX collider at {tuple(CORRIDOR_PERSON_POSITION)}",
             flush=True,
         )
 

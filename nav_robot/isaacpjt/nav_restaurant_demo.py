@@ -1474,7 +1474,8 @@ class NavBridge(Node):
             valid_ranges = []
             for idx, distance in enumerate(msg.ranges):
                 angle = msg.angle_min + idx * msg.angle_increment
-                if abs(angle) > front_angle:
+                norm_angle = math.atan2(math.sin(angle), math.cos(angle))
+                if abs(norm_angle) > front_angle:
                     continue
                 if not math.isfinite(distance):
                     continue
