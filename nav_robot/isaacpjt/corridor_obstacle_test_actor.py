@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
-from pxr import Gf, UsdGeom
+from pxr import Gf, UsdGeom, UsdPhysics
 
 PERSON_USD = os.environ.get(
     "CORRIDOR_PERSON_USD",
@@ -58,10 +58,21 @@ class CorridorPersonSpawnController:
             xformable.AddRotateZOp(
                 precision=UsdGeom.XformOp.PrecisionDouble
             ).Set(CORRIDOR_PERSON_YAW)
+
+            # Add invisible capsule collider so PhysX / RTX LiDAR rays hit the obstacle
+            collider_path = f"{CORRIDOR_PERSON_PRIM}/CollisionBody"
+            capsule = UsdGeom.Capsule.Define(self.stage, collider_path)
+            capsule.CreateHeightAttr(1.7)
+            capsule.CreateRadiusAttr(0.3)
+            capsule.CreateAxisAttr("Z")
+            UsdGeom.Xformable(capsule).AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.85))
+            UsdPhysics.CollisionAPI.Apply(capsule.GetPrim())
+            UsdGeom.Imageable(capsule.GetPrim()).MakeInvisible()
+
         UsdGeom.Imageable(prim).MakeVisible()
         self.active = True
         print(
-            f"[obstacle_test] corridor person spawned at {tuple(CORRIDOR_PERSON_POSITION)}",
+            f"[obstacle_test] corridor person spawned with LiDAR collider at {tuple(CORRIDOR_PERSON_POSITION)}",
             flush=True,
         )
 
