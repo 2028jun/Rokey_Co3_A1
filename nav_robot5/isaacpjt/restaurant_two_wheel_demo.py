@@ -69,7 +69,7 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String as StringMsg
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rosgraph_msgs.msg import Clock
 from builtin_interfaces.msg import Time as RosTime
 
@@ -341,6 +341,8 @@ class PhysicsStageExecutor:
         self.recovery_start_pose = None
         self.recovery_start_time = 0.0
         self.zero_ticks_count = 0
+        self.previous_axis_error = None
+        self.stage_timeout_limit = None
 
     def handle_command(self, payload: dict):
         kind = payload.get("kind")
@@ -359,6 +361,8 @@ class PhysicsStageExecutor:
             "sequence": sequence,
             "kind": kind,
             "target_value": float(payload.get("target_value", 0.0)),
+            "target_x": float(payload.get("target_x", payload.get("target_value", 0.0))),
+            "target_y": float(payload.get("target_y", payload.get("target_value", 0.0))),
             "target_yaw": float(payload.get("target_yaw", 0.0)),
             "max_speed": float(payload.get("max_speed", 0.22)),
             "position_tolerance": float(payload.get("position_tolerance", 0.05)),
@@ -369,13 +373,23 @@ class PhysicsStageExecutor:
         self.recovery_count = 0
         self.recovery_sub_state = None
         self.zero_ticks_count = 0
+        self.previous_axis_error = None
+        self.stage_timeout_limit = None
 
         self.node.publish_stage_status(mission_id, sequence, "accepted", 0.0)
-        print(
-            f"[stage_executor] {kind} accepted: mission={mission_id} seq={sequence} "
-            f"target_val={self.active_stage['target_value']:.3f} target_yaw={math.degrees(self.active_stage['target_yaw']):.1f}deg",
-            flush=True,
-        )
+        if kind == "dock":
+            print(
+                f"[stage_executor] dock accepted: mission={mission_id} seq={sequence} "
+                f"target=({self.active_stage['target_x']:.3f},{self.active_stage['target_y']:.3f}) "
+                f"yaw={math.degrees(self.active_stage['target_yaw']):.1f}deg",
+                flush=True,
+            )
+        else:
+            print(
+                f"[stage_executor] {kind} accepted: mission={mission_id} seq={sequence} "
+                f"target_val={self.active_stage['target_value']:.3f} target_yaw={math.degrees(self.active_stage['target_yaw']):.1f}deg",
+                flush=True,
+            )
 
     def tick(self, x: float, y: float, yaw: float) -> tuple[float, float]:
         if self.active_stage is None or self.stage_state != "running":
@@ -393,15 +407,18 @@ class PhysicsStageExecutor:
         now = time.monotonic()
         elapsed = now - self.start_time
 
-        # Timeout Checks
-        timeout_limit = 60.0
-        if kind in ("axis_x", "axis_y"):
-            timeout_limit = 15.0 + 12.0 * abs(target_val - (x if kind == "axis_x" else y))
-        elif kind == "pivot":
-            timeout_limit = 20.0
+        # Calculate timeout limit once upon first tick
+        if self.stage_timeout_limit is None:
+            if kind in ("axis_x", "axis_y"):
+                initial_dist = abs(target_val - (x if kind == "axis_x" else y))
+                self.stage_timeout_limit = 15.0 + 12.0 * initial_dist
+            elif kind == "pivot":
+                self.stage_timeout_limit = 20.0
+            else:
+                self.stage_timeout_limit = 60.0
 
-        if elapsed > timeout_limit:
-            print(f"[stage_executor] {kind} timeout after {elapsed:.1f}s", flush=True)
+        if elapsed > self.stage_timeout_limit:
+            print(f"[stage_executor] {kind} timeout after {elapsed:.1f}s > {self.stage_timeout_limit:.1f}s", flush=True)
             self.stage_state = "failed"
             self.node.publish_stage_status(mission_id, sequence, "failed", 0.0, reason="timeout")
             self.active_stage = None
@@ -414,19 +431,25 @@ class PhysicsStageExecutor:
             error = target_val - axis
             yaw_err = normalize_angle(target_yaw - yaw)
 
-            if abs(error) <= pos_tol:
+            crossed = (
+                self.previous_axis_error is not None
+                and (error * self.previous_axis_error <= 0.0)
+            )
+
+            if abs(error) <= pos_tol or crossed:
                 if self.zero_ticks_count < 2:
                     self.zero_ticks_count += 1
+                    self.previous_axis_error = error
                     return 0.0, 0.0
                 self.stage_state = "completed"
-                print(f"[stage_executor] {kind} completed: error={error:.3f}m (tol={pos_tol:.3f}m)", flush=True)
+                print(f"[stage_executor] {kind} completed: error={error:.3f}m crossed={crossed}", flush=True)
                 self.node.publish_stage_status(mission_id, sequence, "completed", abs(error))
                 self.active_stage = None
                 return 0.0, 0.0
 
-            direction = 1.0 if error >= 0.0 else -1.0
+            self.previous_axis_error = error
             requested = min(abs(max_speed), max(0.045, abs(error) * 0.8))
-            vx = math.copysign(requested, direction)
+            vx = requested  # Always forward velocity since robot is pre-aligned
             wz = max(-0.28, min(0.28, 1.6 * yaw_err))
 
         elif kind == "pivot":
@@ -449,9 +472,8 @@ class PhysicsStageExecutor:
             wz = raw_wz
 
         elif kind == "dock":
-            # Docking & Recovery State Machine
-            ctrl_dock_x = target_val
-            ctrl_dock_y = target_val  # Target encoded
+            ctrl_dock_x = stage["target_x"]
+            ctrl_dock_y = stage["target_y"]
             ctrl_goal_yaw = target_yaw
 
             dx = ctrl_dock_x - x
@@ -567,6 +589,7 @@ class DiffNavBridge(Node):
         self._last_cmd_time = time.monotonic()
         self._last_cmd_log_time = 0.0
         self._last_scan_time = -LIDAR_PERIOD_SEC
+        self._last_tick_time = time.monotonic()
         self._lock = threading.Lock()
         self._pending_teleport = None
 
@@ -574,6 +597,15 @@ class DiffNavBridge(Node):
         self._odom_origin_x = float(position[0])
         self._odom_origin_y = float(position[1])
         self._odom_origin_yaw = quaternion_to_yaw(orientation)
+
+        stage_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(
+            StringMsg, STAGE_CMD_TOPIC, self._on_stage_command, stage_qos
+        )
 
         qos = QoSProfile(
             depth=10,
@@ -583,14 +615,11 @@ class DiffNavBridge(Node):
         self.create_subscription(
             PoseStamped, TELEPORT_TOPIC, self._on_teleport, qos
         )
-        self.create_subscription(
-            StringMsg, STAGE_CMD_TOPIC, self._on_stage_command, qos
-        )
 
         self.odom_pub = self.create_publisher(Odometry, RAW_ODOM_TOPIC, qos)
         self.scan_pub = self.create_publisher(LaserScan, RAW_SCAN_TOPIC, 10)
         self.clock_pub = self.create_publisher(Clock, "/clock", qos)
-        self.stage_status_pub = self.create_publisher(StringMsg, STAGE_STATUS_TOPIC, qos)
+        self.stage_status_pub = self.create_publisher(StringMsg, STAGE_STATUS_TOPIC, stage_qos)
 
         self.stage_executor = PhysicsStageExecutor(self)
 
@@ -728,7 +757,8 @@ class DiffNavBridge(Node):
         yaw = quaternion_to_yaw(orientation)
 
         now = time.monotonic()
-        dt = 1.0 / 120.0
+        dt = max(1e-4, min(0.05, now - self._last_tick_time))
+        self._last_tick_time = now
 
         # Run Physics Stage Executor directly in Isaac Physics Tick
         with self._lock:

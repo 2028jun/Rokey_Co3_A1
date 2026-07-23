@@ -17,7 +17,7 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as NavPath
 from std_msgs.msg import String as StringMsg
 from nav2_simple_commander.robot_navigator import BasicNavigator
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from two_wheel_rails.nav_bootstrap import (
     AmclPoseTracker,
@@ -198,18 +198,18 @@ class SimplifiedPathNavigator:
             20,
         )
 
-        qos = QoSProfile(
+        stage_qos = QoSProfile(
             depth=10,
             reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            durability=DurabilityPolicy.VOLATILE,
         )
 
-        self._pub_stage_cmd = nav.create_publisher(StringMsg, "/two_wheel/stage_command", qos)
+        self._pub_stage_cmd = nav.create_publisher(StringMsg, "/two_wheel/stage_command", stage_qos)
         self._sub_stage_status = nav.create_subscription(
             StringMsg,
             "/two_wheel/stage_status",
             self._on_stage_status,
-            qos,
+            stage_qos,
         )
 
         self._last_status: dict | None = None
@@ -272,14 +272,17 @@ class SimplifiedPathNavigator:
                 state = status.get("state")
                 if state == "completed":
                     print(
-                        f"[stage] completed: mission={mission_id} seq={sequence} label={label} "
+                        f"[stage] status completed: mission={mission_id} seq={sequence} label={label} "
                         f"error={status.get('error', 0.0)}",
                         flush=True,
                     )
                     return True, "completed"
+                elif state == "accepted":
+                    if time.monotonic() - last_log >= 2.0:
+                        print(f"[stage] status accepted: mission={mission_id} seq={sequence}", flush=True)
                 elif state in ("failed", "cancelled"):
                     print(
-                        f"[stage] failed/cancelled: mission={mission_id} seq={sequence} label={label} "
+                        f"[stage] status failed/cancelled: mission={mission_id} seq={sequence} label={label} "
                         f"state={state}",
                         flush=True,
                     )
@@ -292,7 +295,7 @@ class SimplifiedPathNavigator:
                 last_log = now
 
         print(f"[stage] timeout waiting for {label} (mission={mission_id} seq={sequence})", flush=True)
-        # Send cancel on timeout
+
         cancel_payload = {"mission_id": mission_id, "sequence": 99, "kind": "cancel"}
         self._send_stage_command(cancel_payload)
         return False, "timeout"
@@ -734,12 +737,17 @@ class SimplifiedPathNavigator:
             "mission_id": mission_id,
             "sequence": seq_dock,
             "kind": "dock",
-            "target_value": ctrl_dock_x,  # Isaac executor handles (x,y)
+            "target_x": ctrl_dock_x,
+            "target_y": ctrl_dock_y,
             "target_yaw": ctrl_goal_yaw,
             "max_speed": self._cfg.dock_max_linear_speed_mps,
             "position_tolerance": self._cfg.dock_xy_tolerance_m,
         }
-        print(f"[stage] sent mission={mission_id} seq={seq_dock} kind=dock target_dock=({ctrl_dock_x:.3f},{ctrl_dock_y:.3f})", flush=True)
+        print(
+            f"[stage] sent mission={mission_id} seq={seq_dock} kind=dock "
+            f"target_dock=({ctrl_dock_x:.3f},{ctrl_dock_y:.3f})",
+            flush=True,
+        )
         self._send_stage_command(dock_payload)
 
         ok, reason = self._wait_for_stage_completion(mission_id, seq_dock, 60.0, "micro_docking")
