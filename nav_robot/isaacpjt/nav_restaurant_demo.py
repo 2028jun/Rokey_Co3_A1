@@ -1563,10 +1563,8 @@ class NavBridge(Node):
                 return
 
             if mission["mode"] == "legacy_table":
-                stage = mission.get("stage")
-                if stage not in ("move_to_pre_dock", "final_approach"):
-                    self._obstacle_scale = 1.0
-                    return
+                self._obstacle_scale = 1.0
+                return
             else:
                 stages = mission.get("stages", [])
                 index = mission.get("index", 0)
@@ -1574,7 +1572,7 @@ class NavBridge(Node):
                     self._obstacle_scale = 1.0
                     return
                 kind = stages[index].get("kind")
-                if kind not in ("axis_x", "axis_y"):
+                if kind != "axis_y":
                     self._obstacle_scale = 1.0
                     return
 
