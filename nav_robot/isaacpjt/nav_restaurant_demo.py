@@ -80,7 +80,7 @@ from rosgraph_msgs.msg import Clock
 from builtin_interfaces.msg import Time as TimeMsg
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Int32
+from std_msgs.msg import Int32, String
 from std_srvs.srv import SetBool
 
 # The colcon workspace builds this custom interface for system Python 3.10,
@@ -1630,7 +1630,12 @@ class NavBridge(Node):
                 else:
                     self._clearance_start = None
 
-            if nearest < slow_distance or self._obstacle_stop:
+            is_decel_or_stop = (nearest < slow_distance) or self._obstacle_stop
+            if is_decel_or_stop != getattr(self, "_last_decel_event_state", False):
+                self._last_decel_event_state = is_decel_or_stop
+                self._publish_obstacle_event(is_decel_or_stop)
+
+            if is_decel_or_stop:
                 if now - getattr(self, "_last_obstacle_log", 0.0) >= 0.5:
                     self._last_obstacle_log = now
                     self.get_logger().info(
