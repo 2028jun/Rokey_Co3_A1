@@ -1,4 +1,4 @@
-"""Nav2 free-path planning replaced with Orthogonal L-Path, Orthogonal A*, and Integrated Project Axis Controller & Forward/Lateral Docking Controller."""
+"""Nav2 free-path planning replaced with Orthogonal L-Path, Orthogonal A*, Integrated Project Axis Controller & Forward/Lateral Docking Controller with Predicted Braking, Orthogonal Yaw Pinning, and Lateral Recovery."""
 
 from __future__ import annotations
 
@@ -66,10 +66,15 @@ class MotionConfig:
     rotate_done_rad: float = math.radians(2.0)
     rotate_reenter_rad: float = math.radians(5.0)
     final_yaw_tolerance_rad: float = math.radians(2.0)
-    axis_tolerance_m: float = 0.05
-    final_approach_axis_tolerance_m: float = 0.05
+    axis_tolerance_m: float = 0.03
+    final_approach_axis_tolerance_m: float = 0.03
+    axis_braking_decel_mps2: float = 0.30
     axis_speed_gain: float = 0.8
-    axis_min_linear_speed_mps: float = 0.045
+    axis_min_linear_speed_mps: float = 0.015
+    axis_crawl_distance_m: float = 0.12
+    axis_slowdown_distance_m: float = 0.30
+    axis_crawl_max_speed_mps: float = 0.025
+    axis_slow_max_speed_mps: float = 0.08
     axis_yaw_gain: float = 1.6
     axis_max_yaw_correction_rps: float = 0.28
     max_linear_speed_mps: float = 0.22
@@ -706,13 +711,18 @@ class SimplifiedPathNavigator:
                 else self._cfg.axis_tolerance_m
             )
 
-            # 1) Reached axis tolerance (5cm)
-            if abs(axis_error) <= tolerance:
+            current_vx = abs(self._control_twist[0]) if self._control_twist is not None else 0.0
+            stopping_distance = (current_vx * current_vx) / (2.0 * self._cfg.axis_braking_decel_mps2)
+
+            # 1) Reached axis tolerance with predicted braking distance
+            if abs(axis_error) <= (stopping_distance + tolerance):
                 self._stop()
                 self._spin_sleep(0.10)
-                self._wait_until_stopped(timeout_sec=2.0, label=f"{label}:axis_reach_stop")
+                if not self._wait_until_stopped(timeout_sec=2.0, label=f"{label}:predicted_stop"):
+                    return False
                 print(
-                    f"[{label}] axis reached: kind={stage.kind} error={axis_error:.3f}m tol={tolerance:.3f}m",
+                    f"[{label}] predicted stop: axis_error={axis_error:.3f}m "
+                    f"vx={current_vx:.3f}m/s stopping_distance={stopping_distance:.3f}m tol={tolerance:.3f}m",
                     flush=True,
                 )
                 return True
@@ -725,7 +735,8 @@ class SimplifiedPathNavigator:
             if crossed:
                 self._stop()
                 self._spin_sleep(0.10)
-                self._wait_until_stopped(timeout_sec=2.0, label=f"{label}:axis_cross_stop")
+                if not self._wait_until_stopped(timeout_sec=2.0, label=f"{label}:axis_cross_stop"):
+                    return False
                 print(
                     f"[{label}] axis target crossed: prev={previous_axis_error:.3f}m current={axis_error:.3f}m",
                     flush=True,
@@ -734,13 +745,20 @@ class SimplifiedPathNavigator:
 
             previous_axis_error = axis_error
 
-            requested = min(
-                abs(stage.speed),
-                max(
+            # 3-Tier Corner Slowdown logic based on axis error
+            abs_error = abs(axis_error)
+            if abs_error <= self._cfg.axis_crawl_distance_m:
+                requested = max(
                     self._cfg.axis_min_linear_speed_mps,
-                    abs(axis_error) * self._cfg.axis_speed_gain,
-                ),
-            )
+                    min(self._cfg.axis_crawl_max_speed_mps, 0.4 * abs_error),
+                )
+            elif abs_error <= self._cfg.axis_slowdown_distance_m:
+                requested = max(
+                    self._cfg.axis_crawl_max_speed_mps,
+                    min(self._cfg.axis_slow_max_speed_mps, 0.6 * abs_error),
+                )
+            else:
+                requested = min(abs(stage.speed), 0.8 * abs_error)
 
             cmd = Twist()
             cmd.linear.x = math.copysign(requested, stage.speed)
@@ -758,7 +776,8 @@ class SimplifiedPathNavigator:
             if now - last_log >= self._cfg.log_period_sec:
                 print(
                     f"[{label}] axis drive kind={stage.kind} axis_error={axis_error:.3f}m "
-                    f"yaw_error={math.degrees(yaw_error):.1f}deg vx={cmd.linear.x:.3f} wz={cmd.angular.z:.3f}",
+                    f"yaw_error={math.degrees(yaw_error):.1f}deg vx={cmd.linear.x:.3f} wz={cmd.angular.z:.3f} "
+                    f"stop_dist={stopping_distance:.3f}m",
                     flush=True,
                 )
                 last_log = now
@@ -766,6 +785,75 @@ class SimplifiedPathNavigator:
         self._stop()
         print(f"[{label}] axis stage timeout", flush=True)
         return False
+
+    def _recover_docking(
+        self,
+        ctrl_dock_x: float,
+        ctrl_dock_y: float,
+        ctrl_goal_yaw: float,
+        label: str,
+    ) -> bool:
+        print(f"[{label}:dock] lateral recovery sequence started...", flush=True)
+
+        # Step 1: Align to goal yaw
+        if not self._rotate_to(ctrl_goal_yaw, f"{label}:dock_recover_align", self._cfg.dock_yaw_tolerance_rad):
+            return False
+        self._wait_until_stopped(timeout_sec=2.0, label=f"{label}:dock_recover_align_stop")
+
+        # Step 2: Backward drive ~0.50m
+        back_start = self._motion_pose()
+        if back_start is not None:
+            started = time.monotonic()
+            while time.monotonic() - started < 8.0:
+                rclpy.spin_once(self._nav, timeout_sec=0.03)
+                p = self._motion_pose()
+                if p is None:
+                    continue
+                moved = math.hypot(p[0] - back_start[0], p[1] - back_start[1])
+                if moved >= 0.50:
+                    self._stop()
+                    break
+                cmd = Twist()
+                cmd.linear.x = -0.06
+                cmd.angular.z = 0.0
+                self._publish_cmd(cmd)
+            self._stop()
+            self._wait_until_stopped(timeout_sec=2.0, label=f"{label}:dock_recover_back_stop")
+
+        # Step 3: Align heading towards dock target
+        p_now = self._motion_pose()
+        if p_now is not None:
+            target_entry_yaw = math.atan2(ctrl_dock_y - p_now[1], ctrl_dock_x - p_now[0])
+            if not self._rotate_to(target_entry_yaw, f"{label}:dock_recover_target_align", self._cfg.dock_yaw_tolerance_rad):
+                return False
+            self._wait_until_stopped(timeout_sec=2.0, label=f"{label}:dock_recover_target_stop")
+
+        # Step 4: Re-approach up to 0.08 m/s
+        p_now = self._motion_pose()
+        if p_now is not None:
+            started = time.monotonic()
+            while time.monotonic() - started < 10.0:
+                rclpy.spin_once(self._nav, timeout_sec=0.03)
+                p = self._motion_pose()
+                if p is None:
+                    continue
+                rem = math.hypot(ctrl_dock_x - p[0], ctrl_dock_y - p[1])
+                if rem <= 0.15:
+                    self._stop()
+                    break
+                cmd = Twist()
+                cmd.linear.x = min(0.08, 0.4 * rem)
+                cmd.angular.z = 0.0
+                self._publish_cmd(cmd)
+            self._stop()
+            self._wait_until_stopped(timeout_sec=2.0, label=f"{label}:dock_recover_approach_stop")
+
+        # Step 5: Final align to goal yaw
+        if not self._rotate_to(ctrl_goal_yaw, f"{label}:dock_recover_final_align", self._cfg.dock_yaw_tolerance_rad):
+            return False
+        self._wait_until_stopped(timeout_sec=2.0, label=f"{label}:dock_recover_final_stop")
+        print(f"[{label}:dock] recovery sequence complete; resuming micro-docking stage", flush=True)
+        return True
 
     def navigate_to(self, goal: PoseStamped, *, label: str = "goal") -> bool:
         if not self._wait_for_navigation_inputs(timeout_sec=8.0):
@@ -838,7 +926,15 @@ class SimplifiedPathNavigator:
                     )
                     continue
 
-                stage_yaw = math.atan2(dy, dx)
+                map_dx = e[0] - s[0]
+                map_dy = e[1] - s[1]
+
+                if abs(map_dx) >= abs(map_dy):
+                    map_axis_yaw = 0.0 if map_dx >= 0.0 else math.pi
+                else:
+                    map_axis_yaw = math.pi / 2.0 if map_dy >= 0.0 else -math.pi / 2.0
+
+                stage_yaw = normalize_angle(map_axis_yaw + yaw_offset)
 
                 if abs(dx) >= abs(dy):
                     stage = AxisStage(
@@ -920,12 +1016,13 @@ class SimplifiedPathNavigator:
             ctrl_dock_x = raw_p_after[0] + (c_rot * dx_map - s_rot * dy_map)
             ctrl_dock_y = raw_p_after[1] + (s_rot * dx_map + c_rot * dy_map)
 
-        # Micro-Docking Controller (Integrated Project Forward / Lateral / Yaw Feedback)
+        # Micro-Docking Controller with Lateral Recovery
         dock_start_time = time.monotonic()
         dock_last_log = dock_start_time
         dock_settle_count = 0
+        recovery_count = 0
 
-        while time.monotonic() - dock_start_time < 45.0:
+        while time.monotonic() - dock_start_time < 60.0:
             rclpy.spin_once(self._nav, timeout_sec=0.03)
             pose = self._motion_pose()
             if pose is None:
@@ -940,6 +1037,21 @@ class SimplifiedPathNavigator:
             lateral_error = -math.sin(ctrl_goal_yaw) * dx + math.cos(ctrl_goal_yaw) * dy
             yaw_error = normalize_angle(ctrl_goal_yaw - yaw)
             dist_to_dock = math.hypot(dx, dy)
+
+            # Check Lateral Recovery Trigger
+            if abs(lateral_error) > 0.05 and abs(forward_error) < 0.10:
+                if recovery_count < 3:
+                    recovery_count += 1
+                    print(
+                        f"[{label}:dock] lateral recovery triggered: forward={forward_error:.3f}m lateral={lateral_error:.3f}m "
+                        f"attempt={recovery_count}/3",
+                        flush=True,
+                    )
+                    if not self._recover_docking(ctrl_dock_x, ctrl_dock_y, ctrl_goal_yaw, label):
+                        return False
+                    continue
+                else:
+                    print(f"[{label}:dock] recovery limit (3) exceeded", flush=True)
 
             position_ok = (dist_to_dock <= self._cfg.dock_xy_tolerance_m)
             yaw_ok = (abs(yaw_error) <= self._cfg.dock_yaw_tolerance_rad)
@@ -964,15 +1076,16 @@ class SimplifiedPathNavigator:
                 linear_cmd = max(-0.04, min(0.08, 0.45 * forward_error))
                 if abs(linear_cmd) < 0.015 and abs(forward_error) > 0.004:
                     linear_cmd = math.copysign(0.015, forward_error)
-                cmd.linear.x = linear_cmd
 
-                cmd.angular.z = max(
-                    -0.20,
-                    min(
-                        0.20,
-                        1.8 * yaw_error + 1.4 * lateral_error,
-                    ),
-                )
+                raw_wz = _clamp(1.8 * yaw_error + 1.4 * lateral_error, -0.20, 0.20)
+                needs_correction = (abs(yaw_error) > math.radians(0.8) or abs(lateral_error) > 0.02)
+
+                if needs_correction and abs(raw_wz) < 0.04:
+                    direction_source = raw_wz if abs(raw_wz) > 1e-6 else yaw_error
+                    raw_wz = math.copysign(0.04, direction_source)
+
+                cmd.linear.x = linear_cmd
+                cmd.angular.z = raw_wz
                 self._publish_cmd(cmd)
 
             now = time.monotonic()
@@ -980,7 +1093,8 @@ class SimplifiedPathNavigator:
                 print(
                     f"[{label}:dock] remaining={dist_to_dock:.3f}m fwd={forward_error:.3f}m "
                     f"lat={lateral_error:.3f}m yaw_err={math.degrees(yaw_error):.2f}deg "
-                    f"vx={cmd.linear.x:.3f}m/s wz={cmd.angular.z:.3f}rad/s settle={dock_settle_count}/30",
+                    f"vx={cmd.linear.x:.3f}m/s wz={cmd.angular.z:.3f}rad/s settle={dock_settle_count}/30 "
+                    f"recovery={recovery_count}/3",
                     flush=True,
                 )
                 dock_last_log = now
