@@ -848,7 +848,7 @@ Still broken / follow-up:
   need final capture after the arm endpoint and opposite-arm pose are fixed.
 - This is a useful GPU-tested intermediate revision, not acceptance-complete.
 
-## Pass 8 -- 2026-07-23 (GPU hardware, commit pending)
+## Pass 8 -- 2026-07-23 (GPU hardware, commit 4a7d6d1)
 
 Tested:
 - Read AGENTS.md, all of GPU_RUN_LOG.txt (passes 1-7), and
