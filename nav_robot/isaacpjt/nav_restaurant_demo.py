@@ -1097,6 +1097,7 @@ class NavBridge(Node):
         self._obstacle_stop = False
         self._obstacle_stop_started = None
         self._clearance_start = None
+        self._obstacle_scale = 1.0
 
         qos = QoSProfile(
             depth=10,
@@ -1446,23 +1447,28 @@ class NavBridge(Node):
         with self._lock:
             mission = self._direct_nav
             if mission is None:
+                self._obstacle_scale = 1.0
                 return
 
             if mission["mode"] == "legacy_table":
                 stage = mission.get("stage")
                 if stage not in ("move_to_pre_dock", "final_approach"):
+                    self._obstacle_scale = 1.0
                     return
             else:
                 stages = mission.get("stages", [])
                 index = mission.get("index", 0)
                 if index >= len(stages):
+                    self._obstacle_scale = 1.0
                     return
                 kind = stages[index].get("kind")
                 if kind not in ("axis_x", "axis_y"):
+                    self._obstacle_scale = 1.0
                     return
 
-            stop_distance = 0.8
-            resume_distance = 1.0
+            slow_distance = 1.8
+            stop_distance = 0.5
+            resume_distance = 1.2
             front_angle = math.radians(20.0)
 
             valid_ranges = []
@@ -1476,15 +1482,24 @@ class NavBridge(Node):
                     valid_ranges.append(distance)
 
             if not valid_ranges:
-                return
+                nearest = float("inf")
+                close_points = []
+            else:
+                nearest = min(valid_ranges)
+                close_points = [d for d in valid_ranges if d <= stop_distance]
 
-            close_points = [d for d in valid_ranges if d <= stop_distance]
-            nearest = min(valid_ranges)
             now = time.monotonic()
 
-            if not self._obstacle_stop and len(close_points) >= 3:
-                self._start_obstacle_stop(nearest)
-            elif self._obstacle_stop:
+            if not self._obstacle_stop:
+                if len(close_points) >= 3 and nearest <= stop_distance:
+                    self._start_obstacle_stop(nearest)
+                elif nearest < slow_distance:
+                    scale = (nearest - stop_distance) / (slow_distance - stop_distance)
+                    self._obstacle_scale = float(np.clip(scale, 0.15, 1.0))
+                else:
+                    self._obstacle_scale = 1.0
+            else:
+                self._obstacle_scale = 0.0
                 if nearest >= resume_distance:
                     if self._clearance_start is None:
                         self._clearance_start = now
@@ -1499,12 +1514,13 @@ class NavBridge(Node):
         self._obstacle_stop = True
         self._obstacle_stop_started = time.monotonic()
         self._clearance_start = None
+        self._obstacle_scale = 0.0
         self._target_vx = 0.0
         self._target_wz = 0.0
         self._cmd_vx = 0.0
         self._cmd_wz = 0.0
         self.get_logger().warning(
-            f"전방 장애물(사람) 감지: {distance:.2f}m <= 0.8m, 주행 정지"
+            f"전방 장애물(사람) 최근접 감지: {distance:.2f}m <= 0.5m, 주행 정지"
         )
 
     def _finish_obstacle_stop(self, distance: float):
@@ -1516,11 +1532,9 @@ class NavBridge(Node):
         self._obstacle_stop = False
         self._obstacle_stop_started = None
         self._clearance_start = None
+        self._obstacle_scale = 1.0
         self.get_logger().info(
-            f"전방 장애물(사람) 해제: {distance:.2f}m >= 1.0m, 0.5s 안전 지연 완료, 주행 재개"
-        )
-        self.get_logger().info(
-            f"teleport queued -> ({x:.2f},{y:.2f}) yaw={yaw:.2f}"
+            f"전방 장애물(사람) 해제: distance={distance:.2f}m >= 1.2m, 0.5s 안전 지연 완료, 주행 재개"
         )
 
     def _apply_pending_teleport(self):
@@ -1732,7 +1746,7 @@ class NavBridge(Node):
             next_kind = mission["stages"][mission["index"]]["kind"]
             self.get_logger().info(f"direct stage complete; next={next_kind}")
             return (0.0, 0.0)
-        return (vx, wz)
+        return (vx * self._obstacle_scale, wz)
 
     def _update_legacy_table_navigation(self, mission, x, y, yaw):
         """Original mobile_manipulator_demo TableNavigationServer controller."""
