@@ -1,4 +1,4 @@
-"""Nav2 free-path planning replaced with Orthogonal L-Path, Orthogonal A*, and Stage Command Orchestrator to Isaac Sim Physics Executor."""
+"""Nav2 free-path planning replaced with Orthogonal L-Path, Orthogonal A*, and Mission Command Orchestrator to Isaac Sim Direct Route State Machine."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import rclpy
 import yaml
@@ -17,7 +16,7 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path as NavPath
 from std_msgs.msg import String as StringMsg
 from nav2_simple_commander.robot_navigator import BasicNavigator
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
 from two_wheel_rails.nav_bootstrap import (
     AmclPoseTracker,
@@ -34,16 +33,6 @@ GridCell = tuple[int, int]
 DIRECTIONS = [(1, 0), (0, 1), (-1, 0), (0, -1)]
 
 
-@dataclass
-class AxisStage:
-    kind: str           # "axis_x" or "axis_y"
-    value: float        # Target raw-control axis coordinate
-    yaw: float          # Heading for this stage (Control Frame)
-    speed: float
-    is_last: bool
-    axis_sign: float = 1.0
-
-
 @dataclass(frozen=True)
 class MotionConfig:
     sample_spacing_m: float = 0.05
@@ -53,24 +42,8 @@ class MotionConfig:
     corner_replan_attempts: int = 3
     rotation_clearance_radius_m: float = 0.45
 
-    dock_approach_distance_m: float = 0.60
-    dock_step_distance_m: float = 0.08
-    dock_max_linear_speed_mps: float = 0.10
-    dock_min_linear_speed_mps: float = 0.02
-    dock_xy_tolerance_m: float = 0.04
-    dock_yaw_tolerance_rad: float = math.radians(2.0)
-    dock_realign_threshold_rad: float = math.radians(6.0)
-
-    rotate_done_rad: float = math.radians(2.0)
-    rotate_reenter_rad: float = math.radians(5.0)
-    final_yaw_tolerance_rad: float = math.radians(2.0)
-    axis_tolerance_m: float = 0.03
-    final_approach_axis_tolerance_m: float = 0.03
-    max_linear_speed_mps: float = 0.22
-    max_angular_speed_rps: float = 0.50
-    replan_cte_m: float = 0.15
+    dock_approach_distance_m: float = 0.65
     replan_attempts: int = 2
-    log_period_sec: float = 1.0
 
 
 def load_motion_config() -> MotionConfig:
@@ -111,7 +84,7 @@ def get_costmap_cost(costmap: OccupancyGrid | None, x: float, y: float) -> int |
         return None
     idx = row * info.width + col
     val = costmap.data[idx]
-    if val == -1:  # unknown
+    if val == -1:
         return 255
     return val
 
@@ -173,7 +146,7 @@ def corner_rotation_is_clear(
 
 
 class SimplifiedPathNavigator:
-    """Orthogonal L-path & A* navigator with Stage Command Orchestrator to Isaac Sim Physics Executor."""
+    """Orthogonal L-path & A* navigator with Mission Command Orchestrator to Isaac Sim Direct Route State Machine."""
 
     def __init__(self, nav: BasicNavigator, tf_buffer, tracker: AmclPoseTracker) -> None:
         self._nav = nav
@@ -204,16 +177,15 @@ class SimplifiedPathNavigator:
             durability=DurabilityPolicy.VOLATILE,
         )
 
-        self._pub_stage_cmd = nav.create_publisher(StringMsg, "/two_wheel/stage_command", stage_qos)
-        self._sub_stage_status = nav.create_subscription(
+        self._pub_mission_cmd = nav.create_publisher(StringMsg, "/two_wheel/mission_command", stage_qos)
+        self._sub_mission_status = nav.create_subscription(
             StringMsg,
-            "/two_wheel/stage_status",
-            self._on_stage_status,
+            "/two_wheel/mission_status",
+            self._on_mission_status,
             stage_qos,
         )
 
         self._last_status: dict | None = None
-        self._sequence_counter = 0
 
         path_qos = QoSProfile(
             depth=1,
@@ -242,22 +214,21 @@ class SimplifiedPathNavigator:
             float(msg.twist.twist.angular.z),
         )
 
-    def _on_stage_status(self, msg: StringMsg) -> None:
+    def _on_mission_status(self, msg: StringMsg) -> None:
         try:
             payload = json.loads(msg.data)
             self._last_status = payload
         except Exception as exc:
             print(f"[navigator] status parse error: {exc}", flush=True)
 
-    def _send_stage_command(self, payload: dict) -> None:
+    def _send_mission_command(self, payload: dict) -> None:
         msg = StringMsg()
         msg.data = json.dumps(payload)
-        self._pub_stage_cmd.publish(msg)
+        self._pub_mission_cmd.publish(msg)
 
-    def _wait_for_stage_completion(
+    def _wait_for_mission_completion(
         self,
         mission_id: str,
-        sequence: int,
         timeout_sec: float,
         label: str,
     ) -> tuple[bool, str]:
@@ -268,22 +239,22 @@ class SimplifiedPathNavigator:
             rclpy.spin_once(self._nav, timeout_sec=0.03)
 
             status = self._last_status
-            if status and status.get("mission_id") == mission_id and status.get("sequence") == sequence:
+            if status and status.get("mission_id") == mission_id:
                 state = status.get("state")
+                phase = status.get("phase", "unknown")
                 if state == "completed":
                     print(
-                        f"[stage] status completed: mission={mission_id} seq={sequence} label={label} "
-                        f"error={status.get('error', 0.0)}",
+                        f"[mission] completed: mission={mission_id} label={label}",
                         flush=True,
                     )
                     return True, "completed"
                 elif state == "accepted":
                     if time.monotonic() - last_log >= 2.0:
-                        print(f"[stage] status accepted: mission={mission_id} seq={sequence}", flush=True)
+                        print(f"[mission] status accepted: mission={mission_id}", flush=True)
                 elif state in ("failed", "cancelled"):
                     print(
-                        f"[stage] status failed/cancelled: mission={mission_id} seq={sequence} label={label} "
-                        f"state={state}",
+                        f"[mission] status failed/cancelled: mission={mission_id} label={label} "
+                        f"state={state} phase={phase}",
                         flush=True,
                     )
                     return False, state
@@ -291,13 +262,14 @@ class SimplifiedPathNavigator:
             now = time.monotonic()
             if now - last_log >= 2.0:
                 cur_st = status.get("state") if status else "none"
-                print(f"[stage] waiting {label}: mission={mission_id} seq={sequence} status={cur_st}", flush=True)
+                cur_ph = status.get("phase") if status else "none"
+                print(f"[mission] waiting {label}: mission={mission_id} state={cur_st} phase={cur_ph}", flush=True)
                 last_log = now
 
-        print(f"[stage] timeout waiting for {label} (mission={mission_id} seq={sequence})", flush=True)
+        print(f"[mission] timeout waiting for {label} (mission={mission_id})", flush=True)
 
-        cancel_payload = {"mission_id": mission_id, "sequence": 99, "kind": "cancel"}
-        self._send_stage_command(cancel_payload)
+        cancel_payload = {"mission_id": mission_id, "kind": "cancel"}
+        self._send_mission_command(cancel_payload)
         return False, "timeout"
 
     def _spin_sleep(self, duration_sec: float) -> None:
@@ -593,8 +565,9 @@ class SimplifiedPathNavigator:
 
         for attempt in range(self._cfg.replan_attempts + 1):
             map_p = self._map_pose()
-            if map_p is None:
-                print(f"[{label}] planning failed: cannot resolve map pose", flush=True)
+            raw_p = self._motion_pose()
+            if map_p is None or raw_p is None:
+                print(f"[{label}] planning failed: cannot resolve map/motion pose", flush=True)
                 return False
 
             start_pt = (map_p[0], map_p[1])
@@ -607,153 +580,51 @@ class SimplifiedPathNavigator:
                     continue
                 return False
 
-            failed = False
-            total_segs = len(points) - 1
+            yaw_offset = normalize_angle(raw_p[2] - map_p[2])
+            c_rot = math.cos(yaw_offset)
+            s_rot = math.sin(yaw_offset)
 
-            for index, (s, e) in enumerate(zip(points, points[1:]), start=1):
-                is_last = (index == total_segs)
+            # Transform Map Points to Control Frame Points for Isaac Execution
+            ctrl_points = []
+            for p in points:
+                dx_map = p[0] - map_p[0]
+                dy_map = p[1] - map_p[1]
+                ctrl_x = raw_p[0] + c_rot * dx_map - s_rot * dy_map
+                ctrl_y = raw_p[1] + s_rot * dx_map + c_rot * dy_map
+                ctrl_points.append({"x": round(ctrl_x, 4), "y": round(ctrl_y, 4)})
 
-                # Read fresh pose before generating next stage
-                map_p_curr = self._map_pose()
-                raw_p_curr = self._motion_pose()
-                if map_p_curr is None or raw_p_curr is None:
-                    failed = True
-                    break
+            dx_dock = gx - map_p[0]
+            dy_dock = gy - map_p[1]
+            ctrl_dock_x = raw_p[0] + c_rot * dx_dock - s_rot * dy_dock
+            ctrl_dock_y = raw_p[1] + s_rot * dx_dock + c_rot * dy_dock
+            ctrl_dock_yaw = normalize_angle(goal_yaw + yaw_offset)
 
-                yaw_offset = normalize_angle(raw_p_curr[2] - map_p_curr[2])
-                dx_end = e[0] - map_p_curr[0]
-                dy_end = e[1] - map_p_curr[1]
+            mission_payload = {
+                "mission_id": mission_id,
+                "kind": "execute_route",
+                "points": ctrl_points,
+                "dock": {
+                    "x": round(ctrl_dock_x, 4),
+                    "y": round(ctrl_dock_y, 4),
+                    "yaw": round(ctrl_dock_yaw, 4),
+                },
+            }
 
-                c_rot = math.cos(yaw_offset)
-                s_rot = math.sin(yaw_offset)
+            print(
+                f"[mission] sent mission={mission_id} points={len(ctrl_points)} "
+                f"dock=({ctrl_dock_x:.3f},{ctrl_dock_y:.3f})",
+                flush=True,
+            )
+            self._send_mission_command(mission_payload)
 
-                control_start = (raw_p_curr[0], raw_p_curr[1])
-                control_end = (
-                    raw_p_curr[0] + c_rot * dx_end - s_rot * dy_end,
-                    raw_p_curr[1] + s_rot * dx_end + c_rot * dy_end,
-                )
-                dx = control_end[0] - control_start[0]
-                dy = control_end[1] - control_start[1]
-                segment_length = math.hypot(dx, dy)
+            ok, reason = self._wait_for_mission_completion(mission_id, 180.0, label)
+            if ok:
+                print(f"[{label}] entire autonomous mission completed successfully!", flush=True)
+                return True
 
-                if segment_length < 0.02:
-                    print(f"[{label}:seg{index}] segment skipped: length={segment_length:.3f}m", flush=True)
-                    continue
+            print(f"[{label}] mission failed or timed out ({reason}); attempt={attempt}", flush=True)
+            if attempt < self._cfg.replan_attempts:
+                self._spin_sleep(1.0)
+                continue
 
-                if abs(dx) >= abs(dy):
-                    kind = "axis_x"
-                else:
-                    kind = "axis_y"
-
-                map_dx = e[0] - s[0]
-                map_dy = e[1] - s[1]
-
-                if abs(map_dx) >= abs(map_dy):
-                    map_axis_yaw = 0.0 if map_dx >= 0.0 else math.pi
-                else:
-                    map_axis_yaw = math.pi / 2.0 if map_dy >= 0.0 else -math.pi / 2.0
-
-                stage_yaw = normalize_angle(map_axis_yaw + yaw_offset)
-                target_val = control_end[0] if kind == "axis_x" else control_end[1]
-
-                # Step 1: Send Pivot Stage first to align heading
-                self._sequence_counter += 1
-                seq_pivot = self._sequence_counter
-                pivot_payload = {
-                    "mission_id": mission_id,
-                    "sequence": seq_pivot,
-                    "kind": "pivot",
-                    "target_value": 0.0,
-                    "target_yaw": stage_yaw,
-                    "max_speed": self._cfg.max_angular_speed_rps,
-                    "position_tolerance": self._cfg.rotate_done_rad,
-                }
-                print(f"[stage] sent mission={mission_id} seq={seq_pivot} kind=pivot yaw={math.degrees(stage_yaw):.1f}deg", flush=True)
-                self._send_stage_command(pivot_payload)
-
-                ok, reason = self._wait_for_stage_completion(mission_id, seq_pivot, 20.0, f"pivot_seg{index}")
-                if not ok:
-                    print(f"[{label}] pivot stage {seq_pivot} failed ({reason}); replanning...", flush=True)
-                    failed = True
-                    break
-
-                # Step 2: Send Axis Drive Stage
-                self._sequence_counter += 1
-                seq_axis = self._sequence_counter
-                axis_payload = {
-                    "mission_id": mission_id,
-                    "sequence": seq_axis,
-                    "kind": kind,
-                    "target_value": target_val,
-                    "target_yaw": stage_yaw,
-                    "max_speed": self._cfg.max_linear_speed_mps,
-                    "position_tolerance": self._cfg.axis_tolerance_m,
-                }
-                print(
-                    f"[stage] sent mission={mission_id} seq={seq_axis} kind={kind} "
-                    f"target_val={target_val:.3f} length={segment_length:.3f}m",
-                    flush=True,
-                )
-                self._send_stage_command(axis_payload)
-
-                timeout_axis = 15.0 + 12.0 * segment_length
-                ok, reason = self._wait_for_stage_completion(mission_id, seq_axis, timeout_axis, f"axis_seg{index}")
-                if not ok:
-                    print(f"[{label}] axis stage {seq_axis} failed ({reason}); replanning...", flush=True)
-                    failed = True
-                    break
-
-            if failed:
-                if attempt < self._cfg.replan_attempts:
-                    self._spin_sleep(0.5)
-                    continue
-                return False
-
-            break
-
-        print(f"[{label}] approach point reached; starting Isaac physics docking stage", flush=True)
-
-        # Final Docking Stage Orchestration
-        raw_p = self._motion_pose()
-        map_p = self._map_pose()
-        if map_p is None or raw_p is None:
-            print(f"[{label}] docking failed: missing pose", flush=True)
-            return False
-
-        yaw_offset = normalize_angle(raw_p[2] - map_p[2])
-        ctrl_goal_yaw = normalize_angle(goal_yaw + yaw_offset)
-
-        dx_map = gx - map_p[0]
-        dy_map = gy - map_p[1]
-        c_rot = math.cos(yaw_offset)
-        s_rot = math.sin(yaw_offset)
-
-        ctrl_dock_x = raw_p[0] + (c_rot * dx_map - s_rot * dy_map)
-        ctrl_dock_y = raw_p[1] + (s_rot * dx_map + c_rot * dy_map)
-
-        self._sequence_counter += 1
-        seq_dock = self._sequence_counter
-        dock_payload = {
-            "mission_id": mission_id,
-            "sequence": seq_dock,
-            "kind": "dock",
-            "target_x": ctrl_dock_x,
-            "target_y": ctrl_dock_y,
-            "target_yaw": ctrl_goal_yaw,
-            "max_speed": self._cfg.dock_max_linear_speed_mps,
-            "position_tolerance": self._cfg.dock_xy_tolerance_m,
-        }
-        print(
-            f"[stage] sent mission={mission_id} seq={seq_dock} kind=dock "
-            f"target_dock=({ctrl_dock_x:.3f},{ctrl_dock_y:.3f})",
-            flush=True,
-        )
-        self._send_stage_command(dock_payload)
-
-        ok, reason = self._wait_for_stage_completion(mission_id, seq_dock, 60.0, "micro_docking")
-        if ok:
-            print(f"[{label}] entire autonomous mission completed successfully!", flush=True)
-            return True
-
-        print(f"[{label}] docking stage failed or timed out ({reason})", flush=True)
         return False

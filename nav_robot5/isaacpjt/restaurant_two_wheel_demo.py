@@ -1,7 +1,8 @@
-"""Isaac Sim 5.1 restaurant + two-wheel Ridgeback bridge & Physics Stage Executor for nav_robot5.
+"""Isaac Sim 5.1 restaurant + two-wheel Ridgeback bridge & Direct Route Physics State Machine for nav_robot5.
 
-Publishes raw scan/odometry, monotonic /clock, receives /two_wheel/stage_command,
-runs physics-tick level axis/pivot/docking/recovery stage execution, and applies wheel actions.
+# Direct route, axis, pivot, docking, and recovery controller
+# ported without behavioral simplification from:
+# nav_robot/isaacpjt/nav_restaurant_demo.py
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
 import sys
 import threading
 import time
@@ -122,9 +124,8 @@ BASE_LINK_NAME = "ridgeback_base_link"
 RAW_ODOM_TOPIC = "/two_wheel/odom_raw"
 RAW_SCAN_TOPIC = "/two_wheel/scan_raw"
 TELEPORT_TOPIC = "/two_wheel/teleport"
-STAGE_CMD_TOPIC = "/two_wheel/stage_command"
-STAGE_STATUS_TOPIC = "/two_wheel/stage_status"
-CMD_TIMEOUT_SEC = 0.75
+MISSION_CMD_TOPIC = "/two_wheel/mission_command"
+MISSION_STATUS_TOPIC = "/two_wheel/mission_status"
 
 LIDAR_MIN_RANGE = 0.20
 LIDAR_MAX_RANGE = 12.0
@@ -327,254 +328,36 @@ def initialize_robot(articulation_path: str):
     return articulation, dof_names
 
 
-class PhysicsStageExecutor:
-    """Integrated Isaac Physics Tick Stage Controller for Axis, Pivot, Micro-Docking & Recovery."""
+# Direct route, axis, pivot, docking, and recovery controller
+# ported without behavioral simplification from:
+# nav_robot/isaacpjt/nav_restaurant_demo.py
 
-    def __init__(self, node: DiffNavBridge):
-        self.node = node
-        self.active_stage = None
-        self.stage_state = "idle"  # idle, running, completed, failed, cancelled
-        self.start_time = 0.0
-        self.dock_settle_count = 0
-        self.recovery_count = 0
-        self.recovery_sub_state = None
-        self.recovery_start_pose = None
-        self.recovery_start_time = 0.0
-        self.zero_ticks_count = 0
-        self.previous_axis_error = None
-        self.stage_timeout_limit = None
-        self.axis_completion_latched = False
+def build_stages_from_points(points: list[dict], current_x: float, current_y: float) -> list[dict]:
+    stages = []
+    curr_x, curr_y = current_x, current_y
 
-    def handle_command(self, payload: dict):
-        kind = payload.get("kind")
-        mission_id = payload.get("mission_id", "")
-        sequence = payload.get("sequence", 0)
+    for p in points:
+        target_x = float(p["x"])
+        target_y = float(p["y"])
+        dx = target_x - curr_x
+        dy = target_y - curr_y
+        dist = math.hypot(dx, dy)
 
-        if kind == "cancel":
-            print(f"[stage_executor] cancel command received for mission={mission_id}", flush=True)
-            self.active_stage = None
-            self.stage_state = "cancelled"
-            self.axis_completion_latched = False
-            self.node.publish_stage_status(mission_id, sequence, "cancelled", 0.0)
-            return
+        if dist < 0.02:
+            continue
 
-        self.active_stage = {
-            "mission_id": mission_id,
-            "sequence": sequence,
-            "kind": kind,
-            "target_value": float(payload.get("target_value", 0.0)),
-            "target_x": float(payload.get("target_x", payload.get("target_value", 0.0))),
-            "target_y": float(payload.get("target_y", payload.get("target_value", 0.0))),
-            "target_yaw": float(payload.get("target_yaw", 0.0)),
-            "max_speed": float(payload.get("max_speed", 0.22)),
-            "position_tolerance": float(payload.get("position_tolerance", 0.05)),
-        }
-        self.stage_state = "running"
-        self.start_time = time.monotonic()
-        self.dock_settle_count = 0
-        self.recovery_count = 0
-        self.recovery_sub_state = None
-        self.zero_ticks_count = 0
-        self.previous_axis_error = None
-        self.stage_timeout_limit = None
-        self.axis_completion_latched = False
-
-        self.node.publish_stage_status(mission_id, sequence, "accepted", 0.0)
-        if kind == "dock":
-            print(
-                f"[stage_executor] dock accepted: mission={mission_id} seq={sequence} "
-                f"target=({self.active_stage['target_x']:.3f},{self.active_stage['target_y']:.3f}) "
-                f"yaw={math.degrees(self.active_stage['target_yaw']):.1f}deg",
-                flush=True,
-            )
+        if abs(dx) >= abs(dy):
+            stage_yaw = 0.0 if dx >= 0.0 else math.pi
+            stages.append({"kind": "pivot", "yaw": stage_yaw})
+            stages.append({"kind": "axis_x", "value": target_x, "yaw": stage_yaw, "speed": 0.22 if dx >= 0.0 else -0.22})
         else:
-            print(
-                f"[stage_executor] {kind} accepted: mission={mission_id} seq={sequence} "
-                f"target_val={self.active_stage['target_value']:.3f} target_yaw={math.degrees(self.active_stage['target_yaw']):.1f}deg",
-                flush=True,
-            )
+            stage_yaw = math.pi / 2.0 if dy >= 0.0 else -math.pi / 2.0
+            stages.append({"kind": "pivot", "yaw": stage_yaw})
+            stages.append({"kind": "axis_y", "value": target_y, "yaw": stage_yaw, "speed": 0.22 if dy >= 0.0 else -0.22})
 
-    def tick(self, x: float, y: float, yaw: float) -> tuple[float, float]:
-        if self.active_stage is None or self.stage_state != "running":
-            return 0.0, 0.0
+        curr_x, curr_y = target_x, target_y
 
-        stage = self.active_stage
-        kind = stage["kind"]
-        mission_id = stage["mission_id"]
-        sequence = stage["sequence"]
-        target_val = stage["target_value"]
-        target_yaw = stage["target_yaw"]
-        max_speed = stage["max_speed"]
-        pos_tol = stage["position_tolerance"]
-
-        now = time.monotonic()
-        elapsed = now - self.start_time
-
-        if self.stage_timeout_limit is None:
-            if kind in ("axis_x", "axis_y"):
-                initial_dist = abs(target_val - (x if kind == "axis_x" else y))
-                self.stage_timeout_limit = 15.0 + 12.0 * initial_dist
-            elif kind == "pivot":
-                self.stage_timeout_limit = 20.0
-            else:
-                self.stage_timeout_limit = 60.0
-
-        if elapsed > self.stage_timeout_limit:
-            print(f"[stage_executor] {kind} timeout after {elapsed:.1f}s > {self.stage_timeout_limit:.1f}s", flush=True)
-            self.stage_state = "failed"
-            self.node.publish_stage_status(mission_id, sequence, "failed", 0.0, reason="timeout")
-            self.active_stage = None
-            return 0.0, 0.0
-
-        vx, wz = 0.0, 0.0
-
-        if kind in ("axis_x", "axis_y"):
-            axis = x if kind == "axis_x" else y
-            error = target_val - axis
-            yaw_err = normalize_angle(target_yaw - yaw)
-
-            crossed = (
-                self.previous_axis_error is not None
-                and (error * self.previous_axis_error <= 0.0)
-            )
-
-            if abs(error) <= pos_tol or crossed:
-                self.axis_completion_latched = True
-
-            if self.axis_completion_latched:
-                if self.zero_ticks_count < 2:
-                    self.zero_ticks_count += 1
-                    return 0.0, 0.0
-                self.stage_state = "completed"
-                print(f"[stage_executor] {kind} completed: error={error:.3f}m crossed={crossed}", flush=True)
-                self.node.publish_stage_status(mission_id, sequence, "completed", abs(error))
-                self.active_stage = None
-                return 0.0, 0.0
-
-            self.previous_axis_error = error
-            requested = min(abs(max_speed), max(0.045, abs(error) * 0.8))
-            vx = requested
-            wz = max(-0.28, min(0.28, 1.6 * yaw_err))
-
-        elif kind == "pivot":
-            yaw_err = normalize_angle(target_yaw - yaw)
-
-            if abs(yaw_err) <= math.radians(2.0):
-                if self.zero_ticks_count < 2:
-                    self.zero_ticks_count += 1
-                    return 0.0, 0.0
-                self.stage_state = "completed"
-                print(f"[stage_executor] pivot completed: yaw_err={math.degrees(yaw_err):.2f}deg", flush=True)
-                self.node.publish_stage_status(mission_id, sequence, "completed", abs(yaw_err))
-                self.active_stage = None
-                return 0.0, 0.0
-
-            vx = 0.0
-            raw_wz = max(-0.65, min(0.65, 1.8 * yaw_err))
-            if abs(raw_wz) < 0.18:
-                raw_wz = math.copysign(0.18, yaw_err)
-            wz = raw_wz
-
-        elif kind == "dock":
-            ctrl_dock_x = stage["target_x"]
-            ctrl_dock_y = stage["target_y"]
-            ctrl_goal_yaw = target_yaw
-
-            dx = ctrl_dock_x - x
-            dy = ctrl_dock_y - y
-
-            forward_error = math.cos(ctrl_goal_yaw) * dx + math.sin(ctrl_goal_yaw) * dy
-            lateral_error = -math.sin(ctrl_goal_yaw) * dx + math.cos(ctrl_goal_yaw) * dy
-            yaw_err = normalize_angle(ctrl_goal_yaw - yaw)
-            dist_to_dock = math.hypot(dx, dy)
-
-            # Lateral Recovery Trigger
-            if self.recovery_sub_state is None and abs(lateral_error) > 0.05 and abs(forward_error) < 0.10:
-                if self.recovery_count < 3:
-                    self.recovery_count += 1
-                    self.recovery_sub_state = "recovery_backout"
-                    self.recovery_start_pose = (x, y, yaw)
-                    self.recovery_start_time = now
-                    print(f"[stage_executor] docking recovery_backout attempt={self.recovery_count}/3", flush=True)
-                else:
-                    print(f"[stage_executor] docking recovery limit exceeded", flush=True)
-
-            if self.recovery_sub_state == "recovery_backout":
-                vx = -0.06
-                wz = 0.0
-                if self.recovery_start_pose is not None:
-                    moved = math.hypot(x - self.recovery_start_pose[0], y - self.recovery_start_pose[1])
-                    if moved >= 0.50 or (now - self.recovery_start_time) > 8.0:
-                        self.recovery_sub_state = "recovery_align"
-                        self.recovery_start_time = now
-                        print(f"[stage_executor] docking recovery_align", flush=True)
-                return vx, wz
-
-            elif self.recovery_sub_state == "recovery_align":
-                target_entry_yaw = math.atan2(ctrl_dock_y - y, ctrl_dock_x - x)
-                e_yaw = normalize_angle(target_entry_yaw - yaw)
-                if abs(e_yaw) <= math.radians(2.0) or (now - self.recovery_start_time) > 6.0:
-                    self.recovery_sub_state = "recovery_reapproach"
-                    self.recovery_start_time = now
-                    print(f"[stage_executor] docking recovery_reapproach", flush=True)
-                    return 0.0, 0.0
-                vx = 0.0
-                raw_wz = max(-0.5, min(0.5, 1.8 * e_yaw))
-                wz = math.copysign(0.18, e_yaw) if abs(raw_wz) < 0.18 else raw_wz
-                return vx, wz
-
-            elif self.recovery_sub_state == "recovery_reapproach":
-                rem = math.hypot(ctrl_dock_x - x, ctrl_dock_y - y)
-                if rem <= 0.15 or (now - self.recovery_start_time) > 8.0:
-                    self.recovery_sub_state = "recovery_final_align"
-                    self.recovery_start_time = now
-                    print(f"[stage_executor] docking recovery_final_align", flush=True)
-                    return 0.0, 0.0
-                vx = min(0.08, 0.4 * rem)
-                wz = 0.0
-                return vx, wz
-
-            elif self.recovery_sub_state == "recovery_final_align":
-                e_yaw = normalize_angle(ctrl_goal_yaw - yaw)
-                if abs(e_yaw) <= math.radians(2.0) or (now - self.recovery_start_time) > 6.0:
-                    self.recovery_sub_state = None
-                    print(f"[stage_executor] docking recovery complete; resuming docking loop", flush=True)
-                    return 0.0, 0.0
-                vx = 0.0
-                raw_wz = max(-0.5, min(0.5, 1.8 * e_yaw))
-                wz = math.copysign(0.18, e_yaw) if abs(raw_wz) < 0.18 else raw_wz
-                return vx, wz
-
-            # Normal Docking Forward/Lateral/Yaw Control
-            position_ok = (dist_to_dock <= 0.04)
-            yaw_ok = (abs(yaw_err) <= math.radians(2.0))
-
-            if position_ok and yaw_ok:
-                self.dock_settle_count += 1
-                if self.dock_settle_count >= 30:
-                    self.stage_state = "completed"
-                    print(f"[stage_executor] docking completed: dist={dist_to_dock:.3f}m yaw_err={math.degrees(yaw_err):.2f}deg", flush=True)
-                    self.node.publish_stage_status(mission_id, sequence, "completed", dist_to_dock)
-                    self.active_stage = None
-                    return 0.0, 0.0
-                return 0.0, 0.0
-            else:
-                self.dock_settle_count = 0
-
-                linear_cmd = max(-0.04, min(0.08, 0.45 * forward_error))
-                if abs(linear_cmd) < 0.015 and abs(forward_error) > 0.004:
-                    linear_cmd = math.copysign(0.015, forward_error)
-
-                raw_wz = max(-0.20, min(0.20, 1.8 * yaw_err + 1.4 * lateral_error))
-                needs_corr = (abs(yaw_err) > math.radians(0.8) or abs(lateral_error) > 0.02)
-                if needs_corr and abs(raw_wz) < 0.04:
-                    direction_source = raw_wz if abs(raw_wz) > 1e-6 else yaw_error
-                    raw_wz = math.copysign(0.04, direction_source)
-
-                vx = linear_cmd
-                wz = raw_wz
-
-        return vx, wz
+    return stages
 
 
 class DiffNavBridge(Node):
@@ -597,6 +380,18 @@ class DiffNavBridge(Node):
         self._lock = threading.Lock()
         self._pending_teleport = None
 
+        # Thread-safe Queue for ROS -> Physics Thread messages
+        self._cmd_queue = queue.Queue()
+
+        # Thread-safe storage for Status Snapshot (Physics -> ROS Thread)
+        self._status_snapshot: dict | None = None
+
+        # Navigation State Machine Variables (Ported from nav_restaurant_demo.py)
+        self._direct_nav: dict | None = None
+        self._navigation_paused = False
+        self._obstacle_stop = False
+        self._obstacle_scale = 1.0
+
         position, orientation = self.articulation.get_world_pose()
         self._odom_origin_x = float(position[0])
         self._odom_origin_y = float(position[1])
@@ -607,8 +402,9 @@ class DiffNavBridge(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
         )
+
         self.create_subscription(
-            StringMsg, STAGE_CMD_TOPIC, self._on_stage_command, stage_qos
+            StringMsg, MISSION_CMD_TOPIC, self._on_mission_command, stage_qos
         )
 
         qos = QoSProfile(
@@ -623,39 +419,380 @@ class DiffNavBridge(Node):
         self.odom_pub = self.create_publisher(Odometry, RAW_ODOM_TOPIC, qos)
         self.scan_pub = self.create_publisher(LaserScan, RAW_SCAN_TOPIC, 10)
         self.clock_pub = self.create_publisher(Clock, "/clock", qos)
-        self.stage_status_pub = self.create_publisher(StringMsg, STAGE_STATUS_TOPIC, stage_qos)
+        self.mission_status_pub = self.create_publisher(StringMsg, MISSION_STATUS_TOPIC, stage_qos)
 
-        self.stage_executor = PhysicsStageExecutor(self)
-
-    def _on_stage_command(self, msg: StringMsg):
+    # ROS Callback: Thread-safe Push ONLY (NO articulation calls!)
+    def _on_mission_command(self, msg: StringMsg):
         try:
             payload = json.loads(msg.data)
-            with self._lock:
-                self.stage_executor.handle_command(payload)
+            self._cmd_queue.put(payload)
         except Exception as exc:
-            print(f"[bridge] failed to parse stage command JSON: {exc}", flush=True)
+            self.get_logger().error(f"failed to parse mission command JSON: {exc}")
 
-    def publish_stage_status(self, mission_id: str, sequence: int, state: str, error: float, reason: str | None = None):
-        position, orientation = self.articulation.get_world_pose()
-        x = float(position[0])
-        y = float(position[1])
-        yaw = quaternion_to_yaw(orientation)
+    # Ported Helper: Angle Error
+    @staticmethod
+    def _angle_error(target: float, actual: float) -> float:
+        return math.atan2(math.sin(target - actual), math.cos(target - actual))
 
-        data = {
+    # Ported Helper: Slew Limit
+    @staticmethod
+    def _slew(current: float, target: float, acceleration: float, deceleration: float, dt: float) -> float:
+        limit = acceleration if abs(target) > abs(current) else deceleration
+        delta = target - current
+        max_delta = limit * dt
+        if abs(delta) <= max_delta:
+            return target
+        return current + math.copysign(max_delta, delta)
+
+    # Differential IK
+    def _differential_ik(self, vx: float, wz: float) -> np.ndarray:
+        turn = DIFFERENTIAL_HALF_TRACK * wz
+        wheels = np.asarray(
+            [
+                (vx - turn) / WHEEL_RADIUS,
+                (vx + turn) / WHEEL_RADIUS,
+            ],
+            dtype=float,
+        )
+        return np.clip(wheels, -MAX_WHEEL_SPEED, MAX_WHEEL_SPEED)
+
+    # Ported Method: Start Direct Navigation Mission
+    def _start_direct_navigation(self, payload: dict, x: float, y: float, yaw: float):
+        kind = payload.get("kind", "execute_route")
+        mission_id = payload.get("mission_id", "")
+
+        if kind == "cancel":
+            self.get_logger().info(f"mission cancel received for mission={mission_id}")
+            self._direct_nav = None
+            self._cmd_vx = 0.0
+            self._cmd_wz = 0.0
+            self._update_status_snapshot(mission_id, "cancelled", "cancel", x, y, yaw)
+            return
+
+        points = payload.get("points", [])
+        dock_info = payload.get("dock", {})
+        stages = build_stages_from_points(points, x, y)
+
+        self._direct_nav = {
+            "mode": "route_and_dock",
             "mission_id": mission_id,
-            "sequence": sequence,
+            "stages": stages,
+            "index": 0,
+            "stage_start": time.monotonic(),
+            "last_log": 0.0,
+            "dock": (
+                float(dock_info.get("x", x)),
+                float(dock_info.get("y", y)),
+                float(dock_info.get("yaw", yaw)),
+            ),
+        }
+        self._obstacle_stop = False
+        self._cmd_vx = 0.0
+        self._cmd_wz = 0.0
+        self._update_status_snapshot(mission_id, "accepted", "start", x, y, yaw)
+        self.get_logger().info(
+            f"direct route started mission={mission_id} stages={len(stages)} pose=({x:.2f},{y:.2f},{math.degrees(yaw):.1f}deg)"
+        )
+
+    # Ported Method: Finish Direct Navigation Mission
+    def _finish_direct_navigation(self, success: bool, reason: str = "", x: float = 0.0, y: float = 0.0, yaw: float = 0.0):
+        mission = self._direct_nav
+        if mission is None:
+            return
+        mission_id = mission.get("mission_id", "")
+        self._direct_nav = None
+        self._obstacle_stop = False
+        self._cmd_vx = 0.0
+        self._cmd_wz = 0.0
+        state = "completed" if success else "failed"
+        self._update_status_snapshot(mission_id, state, reason, x, y, yaw)
+        if success:
+            self.get_logger().info(f"direct navigation complete mission={mission_id}")
+        else:
+            self.get_logger().error(f"direct navigation failed mission={mission_id}: {reason}")
+
+    # Ported Method: Update Direct Navigation (Axis & Pivot Stages)
+    def _update_direct_navigation(self, x: float, y: float, yaw: float) -> tuple[float, float] | None:
+        mission = self._direct_nav
+        if mission is None:
+            return None
+        if self._navigation_paused or self._obstacle_stop:
+            return 0.0, 0.0
+
+        if mission["mode"] == "legacy_table":
+            return self._update_legacy_table_navigation(mission, x, y, yaw)
+
+        stages = mission["stages"]
+        if mission["index"] >= len(stages):
+            # Route stages complete -> Transition to legacy table docking!
+            goal = mission["dock"]
+            mission_id = mission["mission_id"]
+            now = time.monotonic()
+            mission.clear()
+            mission.update(
+                mode="legacy_table",
+                mission_id=mission_id,
+                goal=goal,
+                stage="move_to_pre_dock",
+                path_aligned=False,
+                stage_start=now,
+                last_log=0.0,
+                settle_count=0,
+                recovery_count=0,
+            )
+            self.get_logger().info(f"route stages complete; starting original pre-dock controller for goal=({goal[0]:.2f},{goal[1]:.2f})")
+            return 0.0, 0.0
+
+        stage = stages[mission["index"]]
+        elapsed = time.monotonic() - mission["stage_start"]
+        kind = stage["kind"]
+        vx = wz = 0.0
+        done = False
+
+        if kind == "pivot":
+            error = self._angle_error(stage["yaw"], yaw)
+            done = abs(error) < math.radians(2.5)
+            if not done:
+                wz = float(np.clip(1.8 * error, -0.65, 0.65))
+                if abs(wz) < 0.18:
+                    wz = math.copysign(0.18, error)
+            timeout = 25.0
+            detail = f"yaw_error={math.degrees(error):.1f}deg"
+        else:
+            axis = x if kind == "axis_x" else y
+            error = stage["value"] - axis
+            done = abs(error) <= 0.05
+            desired_yaw = stage["yaw"]
+            yaw_error = self._angle_error(desired_yaw, yaw)
+            if not done:
+                requested = min(abs(stage["speed"]), max(0.045, abs(error) * 0.8))
+                vx = math.copysign(requested, stage["speed"])
+                wz = float(np.clip(1.6 * yaw_error, -0.28, 0.28))
+            timeout = 90.0
+            detail = f"axis_error={error:.3f}m yaw_error={math.degrees(yaw_error):.1f}deg"
+
+        now = time.monotonic()
+        if now - mission["last_log"] >= 1.0:
+            mission["last_log"] = now
+            self.get_logger().info(
+                f"direct stage={mission['index']} {kind} pose=({x:.2f},{y:.2f},{math.degrees(yaw):.1f}deg) {detail}"
+            )
+            self._update_status_snapshot(mission["mission_id"], "running", kind, x, y, yaw)
+
+        if elapsed > timeout:
+            self._finish_direct_navigation(False, f"{kind} timeout; {detail}", x, y, yaw)
+            return 0.0, 0.0
+
+        if done:
+            mission["index"] += 1
+            mission["stage_start"] = now
+            mission["last_log"] = 0.0
+            self.get_logger().info(f"direct stage complete; index={mission['index']}")
+            return 0.0, 0.0
+
+        return (vx * self._obstacle_scale, wz)
+
+    # Ported Method: Update Legacy Table Navigation (Pre-dock, Final Docking, Recovery & Settle)
+    def _update_legacy_table_navigation(self, mission: dict, x: float, y: float, yaw: float) -> tuple[float, float]:
+        goal_x, goal_y, goal_yaw = mission["goal"]
+        pre_x = goal_x - 0.65 * math.cos(goal_yaw)
+        pre_y = goal_y - 0.65 * math.sin(goal_yaw)
+        stage = mission["stage"]
+        vx = wz = 0.0
+
+        if stage == "move_to_pre_dock":
+            dx, dy = pre_x - x, pre_y - y
+            distance = math.hypot(dx, dy)
+            heading_error = self._angle_error(math.atan2(dy, dx), yaw)
+            if mission["path_aligned"]:
+                if abs(heading_error) > math.radians(12.0):
+                    mission["path_aligned"] = False
+            elif abs(heading_error) < math.radians(3.0):
+                mission["path_aligned"] = True
+
+            if not mission["path_aligned"]:
+                phase = "rotate_to_path"
+                wz = float(np.clip(1.8 * heading_error, -0.65, 0.65))
+            else:
+                phase = "drive_to_pre_dock"
+                vx = min(0.35, max(0.08, 0.8 * distance))
+                wz = float(np.clip(1.2 * heading_error, -0.65, 0.65))
+
+            if distance <= 0.08:
+                mission["stage"] = "align_at_pre_dock"
+                mission["path_aligned"] = False
+                mission["stage_start"] = time.monotonic()
+                phase, vx, wz = "pre_dock_reached", 0.0, 0.0
+
+            detail = f"pre=({pre_x:.2f},{pre_y:.2f}) distance={distance:.3f}m heading_error={math.degrees(heading_error):.1f}deg"
+            timeout = 120.0
+
+        elif stage == "align_at_pre_dock":
+            distance = math.hypot(pre_x - x, pre_y - y)
+            yaw_error = self._angle_error(goal_yaw, yaw)
+            phase = "align_at_pre_dock"
+            if abs(yaw_error) > math.radians(2.0):
+                wz = float(np.clip(1.8 * yaw_error, -0.65, 0.65))
+                if abs(wz) < 0.18:
+                    wz = math.copysign(0.18, yaw_error)
+            else:
+                mission["stage"] = "final_approach"
+                mission["stage_start"] = time.monotonic()
+                phase, wz = "start_final_approach", 0.0
+            detail = f"distance={distance:.3f}m yaw_error={math.degrees(yaw_error):.1f}deg"
+            timeout = 30.0
+
+        elif stage == "recovery_backout":
+            dx, dy = goal_x - x, goal_y - y
+            forward_error = math.cos(goal_yaw) * dx + math.sin(goal_yaw) * dy
+            yaw_error = self._angle_error(goal_yaw, yaw)
+            if abs(yaw_error) > math.radians(2.0):
+                phase = "recovery_align_before_backout"
+                wz = float(np.clip(1.8 * yaw_error, -0.45, 0.45))
+                if abs(wz) < 0.18:
+                    wz = math.copysign(0.18, yaw_error)
+            elif forward_error < 0.55:
+                phase = "recovery_backout"
+                vx = -0.08
+                wz = float(np.clip(1.8 * yaw_error, -0.20, 0.20))
+            else:
+                mission["stage"] = "recovery_align"
+                mission["stage_start"] = time.monotonic()
+                phase, vx, wz = "recovery_backout_complete", 0.0, 0.0
+            distance = math.hypot(dx, dy)
+            detail = f"backout_forward={forward_error:.3f}m yaw_error={math.degrees(yaw_error):.1f}deg"
+            timeout = 15.0
+
+        elif stage == "recovery_align":
+            dx, dy = goal_x - x, goal_y - y
+            distance = math.hypot(dx, dy)
+            approach_yaw = math.atan2(dy, dx)
+            heading_error = self._angle_error(approach_yaw, yaw)
+            phase = "recovery_align_to_goal"
+            if abs(heading_error) > math.radians(2.0):
+                wz = float(np.clip(1.8 * heading_error, -0.45, 0.45))
+                if abs(wz) < 0.18:
+                    wz = math.copysign(0.18, heading_error)
+            else:
+                mission["recovery_approach_yaw"] = approach_yaw
+                mission["stage"] = "recovery_reapproach"
+                mission["stage_start"] = time.monotonic()
+                phase, wz = "recovery_reapproach_start", 0.0
+            detail = f"distance={distance:.3f}m approach_yaw={math.degrees(approach_yaw):.1f}deg heading_error={math.degrees(heading_error):.1f}deg"
+            timeout = 15.0
+
+        elif stage == "recovery_reapproach":
+            dx, dy = goal_x - x, goal_y - y
+            distance = math.hypot(dx, dy)
+            approach_yaw = mission["recovery_approach_yaw"]
+            heading_error = self._angle_error(approach_yaw, yaw)
+            phase = "recovery_reapproach"
+            if distance > 0.08:
+                if abs(heading_error) < math.radians(12.0):
+                    vx = min(0.08, max(0.018, 0.45 * distance))
+                wz = float(np.clip(1.8 * heading_error, -0.25, 0.25))
+            else:
+                mission["stage"] = "recovery_final_align"
+                mission["stage_start"] = time.monotonic()
+                mission["settle_count"] = 0
+                phase, vx, wz = "recovery_position_reached", 0.0, 0.0
+            detail = f"distance={distance:.3f}m heading_error={math.degrees(heading_error):.1f}deg"
+            timeout = 25.0
+
+        elif stage == "recovery_final_align":
+            dx, dy = goal_x - x, goal_y - y
+            distance = math.hypot(dx, dy)
+            yaw_error = self._angle_error(goal_yaw, yaw)
+            phase = "recovery_final_align"
+            if abs(yaw_error) > math.radians(2.0):
+                wz = float(np.clip(1.8 * yaw_error, -0.35, 0.35))
+                if abs(wz) < 0.18:
+                    wz = math.copysign(0.18, yaw_error)
+            else:
+                mission["stage"] = "final_approach"
+                mission["stage_start"] = time.monotonic()
+                mission["settle_count"] = 0
+                phase, wz = "recovery_final_align_complete", 0.0
+            detail = f"distance={distance:.3f}m yaw_error={math.degrees(yaw_error):.1f}deg"
+            timeout = 15.0
+
+        else:
+            # Final approach (docking)
+            dx, dy = goal_x - x, goal_y - y
+            distance = math.hypot(dx, dy)
+            yaw_error = self._angle_error(goal_yaw, yaw)
+            forward_error = math.cos(goal_yaw) * dx + math.sin(goal_yaw) * dy
+            lateral_error = -math.sin(goal_yaw) * dx + math.cos(goal_yaw) * dy
+            position_ok = distance <= 0.040
+            yaw_ok = abs(yaw_error) <= math.radians(2.0)
+
+            if abs(lateral_error) > 0.05 and abs(forward_error) < 0.10:
+                mission["recovery_count"] = mission.get("recovery_count", 0) + 1
+                if mission["recovery_count"] > 3:
+                    self._finish_direct_navigation(False, f"dock recovery exhausted; lateral={lateral_error:.3f}m", x, y, yaw)
+                    return 0.0, 0.0
+                mission["stage"] = "recovery_backout"
+                mission["stage_start"] = time.monotonic()
+                mission["settle_count"] = 0
+                phase, vx, wz = "start_lateral_recovery", 0.0, 0.0
+                self.get_logger().warning(f"dock lateral error={lateral_error:.3f}m; starting re-entry {mission['recovery_count']}/3")
+            elif not position_ok:
+                phase = "final_forward_approach"
+                if abs(yaw_error) <= math.radians(8.0):
+                    vx = float(np.clip(0.45 * forward_error, -0.04, 0.08))
+                    if abs(vx) < 0.015 and abs(forward_error) > 0.004:
+                        vx = math.copysign(0.015, forward_error)
+                wz = float(np.clip(1.8 * yaw_error + 1.4 * lateral_error, -0.20, 0.20))
+                mission["settle_count"] = 0
+            elif not yaw_ok:
+                phase = "fine_align_at_table"
+                wz = float(np.clip(1.2 * yaw_error, -0.15, 0.15))
+                if abs(wz) < 0.12:
+                    wz = math.copysign(0.12, yaw_error)
+                mission["settle_count"] = 0
+            else:
+                phase = "settle_at_table"
+                mission["settle_count"] = mission.get("settle_count", 0) + 1
+                if mission["settle_count"] >= 30:
+                    self.get_logger().info(f"arrived at table pose=({x:.3f},{y:.3f},{math.degrees(yaw):.1f}deg)")
+                    self._finish_direct_navigation(True, "completed", x, y, yaw)
+                    return 0.0, 0.0
+            detail = f"goal=({goal_x:.2f},{goal_y:.2f}) distance={distance:.3f}m forward={forward_error:.3f}m lateral={lateral_error:.3f}m yaw_error={math.degrees(yaw_error):.1f}deg"
+            timeout = 60.0
+
+        now = time.monotonic()
+        if now - mission["last_log"] >= 1.0:
+            mission["last_log"] = now
+            self.get_logger().info(f"direct phase={phase} pose=({x:.2f},{y:.2f},{math.degrees(yaw):.1f}deg) {detail}")
+            self._update_status_snapshot(mission["mission_id"], "running", phase, x, y, yaw)
+
+        if now - mission["stage_start"] > timeout:
+            self._finish_direct_navigation(False, f"{stage} timeout; {detail}", x, y, yaw)
+            return 0.0, 0.0
+
+        return (vx, wz)
+
+    # Thread-safe Status Snapshot Update
+    def _update_status_snapshot(self, mission_id: str, state: str, phase: str, x: float, y: float, yaw: float):
+        snapshot = {
+            "mission_id": mission_id,
             "state": state,
-            "error": round(error, 4),
+            "phase": phase,
             "x": round(x, 4),
             "y": round(y, 4),
             "yaw": round(yaw, 4),
         }
-        if reason:
-            data["reason"] = reason
+        with self._lock:
+            self._status_snapshot = snapshot
 
-        msg = StringMsg()
-        msg.data = json.dumps(data)
-        self.stage_status_pub.publish(msg)
+    # Publish Status Snapshot (called from ROS spin loop safely)
+    def publish_status_snapshot(self):
+        with self._lock:
+            snapshot = self._status_snapshot
+        if snapshot is not None:
+            msg = StringMsg()
+            msg.data = json.dumps(snapshot)
+            self.mission_status_pub.publish(msg)
 
     def _on_teleport(self, msg: PoseStamped):
         x = float(msg.pose.position.x)
@@ -693,23 +830,6 @@ class DiffNavBridge(Node):
             self._odom_origin_x = x
             self._odom_origin_y = y
             self._odom_origin_yaw = yaw
-
-    def _slew(self, current, target, accel, decel, dt):
-        if target >= current:
-            limit = accel
-        else:
-            limit = decel
-        step = limit * dt
-        if abs(target - current) <= step:
-            return target
-        return current + math.copysign(step, target - current)
-
-    def _differential_ik(self, vx: float, wz: float) -> np.ndarray:
-        turn = DIFFERENTIAL_HALF_TRACK * wz
-        left_vel = (vx - turn) / WHEEL_RADIUS
-        right_vel = (vx + turn) / WHEEL_RADIUS
-        wheels = np.asarray([left_vel, right_vel], dtype=float)
-        return np.clip(wheels, -MAX_WHEEL_SPEED, MAX_WHEEL_SPEED)
 
     def _publish_scan(self, stamp: RosTime, sim_time_sec: float, x: float, y: float, yaw: float):
         if sim_time_sec - self._last_scan_time < LIDAR_PERIOD_SEC:
@@ -753,20 +873,34 @@ class DiffNavBridge(Node):
         scan.ranges = ranges
         self.scan_pub.publish(scan)
 
+    # Main Physics Tick Method
     def tick(self, sim_time_sec: float):
         self._apply_pending_teleport()
+
+        # Read articulation world pose SAFELY inside physics tick thread
         position, orientation = self.articulation.get_world_pose()
         x = float(position[0])
         y = float(position[1])
         yaw = quaternion_to_yaw(orientation)
 
+        # Consume queued ROS command payloads
+        try:
+            while not self._cmd_queue.empty():
+                cmd_payload = self._cmd_queue.get_nowait()
+                self._start_direct_navigation(cmd_payload, x, y, yaw)
+        except queue.Empty:
+            pass
+
         now = time.monotonic()
         dt = max(1e-4, min(0.05, now - self._last_tick_time))
         self._last_tick_time = now
 
-        # Run Physics Stage Executor directly in Isaac Physics Tick
-        with self._lock:
-            target_vx, target_wz = self.stage_executor.tick(x, y, yaw)
+        # Execute Direct Navigation State Machine
+        nav_res = self._update_direct_navigation(x, y, yaw)
+        if nav_res is not None:
+            target_vx, target_wz = nav_res
+        else:
+            target_vx, target_wz = 0.0, 0.0
 
         self._cmd_vx = self._slew(
             self._cmd_vx, target_vx, LINEAR_ACCEL_LIMIT, LINEAR_DECEL_LIMIT, dt
@@ -778,10 +912,7 @@ class DiffNavBridge(Node):
 
         if (abs(vx) > 1e-3 or abs(wz) > 1e-3) and now - self._last_cmd_log_time > 1.0:
             self._last_cmd_log_time = now
-            print(
-                f"[nav_robot5] cmd vx={vx:.3f} wz={wz:.3f}",
-                flush=True,
-            )
+            print(f"[nav_robot5] cmd vx={vx:.3f} wz={wz:.3f}", flush=True)
 
         wheel_velocities = self._differential_ik(vx, wz)
         self.articulation.apply_action(
@@ -811,6 +942,9 @@ class DiffNavBridge(Node):
         odom.twist.twist.linear.x = vx
         odom.twist.twist.angular.z = wz
         self.odom_pub.publish(odom)
+
+        # Publish status snapshot safely
+        self.publish_status_snapshot()
 
 
 def main():
