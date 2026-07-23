@@ -124,6 +124,12 @@ DOCK_YAW_EXIT_TOL = math.radians(3.0)
 DOCK_SETTLE_TICKS = 20
 DOCK_SETTLE_TIMEOUT = 5.0
 
+# Near Goal Docking Tolerances and Timeout
+DOCK_NEAR_DISTANCE = 0.060
+DOCK_NEAR_FORWARD_TOL = 0.060
+DOCK_NEAR_YAW_TOL = math.radians(2.0)
+DOCK_NEAR_TIMEOUT = 30.0
+
 ROBOT_ROOT = "/World/NavRobot"
 ARTICULATION_CANDIDATES = [
     f"{ROBOT_ROOT}/Robot/ridgeback_base_link",
@@ -566,6 +572,8 @@ class DiffNavBridge(Node):
                 recovery_count=0,
                 settling=False,
                 settle_start=0.0,
+                near_goal_active=False,
+                near_goal_start=0.0,
             )
             self.get_logger().info(f"route stages complete; starting original pre-dock controller for goal=({goal[0]:.2f},{goal[1]:.2f})")
             return 0.0, 0.0
@@ -641,7 +649,7 @@ class DiffNavBridge(Node):
 
         return (vx * self._obstacle_scale, wz)
 
-    # Method: _update_legacy_table_navigation with Hysteresis & Settle Latching
+    # Method: _update_legacy_table_navigation with Near Goal Align & Creep Stages
     def _update_legacy_table_navigation(self, mission: dict, x: float, y: float, yaw: float) -> tuple[float, float]:
         goal_x, goal_y, goal_yaw = mission["goal"]
         pre_x = goal_x - 0.65 * math.cos(goal_yaw)
@@ -673,6 +681,7 @@ class DiffNavBridge(Node):
                 mission["stage_start"] = time.monotonic()
                 mission["settling"] = False
                 mission["settle_count"] = 0
+                mission["near_goal_active"] = False
                 phase, vx, wz = "pre_dock_reached", 0.0, 0.0
 
             detail = f"pre=({pre_x:.2f},{pre_y:.2f}) distance={distance:.3f}m heading_error={math.degrees(heading_error):.1f}deg"
@@ -691,6 +700,7 @@ class DiffNavBridge(Node):
                 mission["stage_start"] = time.monotonic()
                 mission["settling"] = False
                 mission["settle_count"] = 0
+                mission["near_goal_active"] = False
                 phase, wz = "start_final_approach", 0.0
             detail = f"distance={distance:.3f}m yaw_error={math.degrees(yaw_error):.1f}deg"
             timeout = 30.0
@@ -713,6 +723,7 @@ class DiffNavBridge(Node):
                 mission["stage_start"] = time.monotonic()
                 mission["settling"] = False
                 mission["settle_count"] = 0
+                mission["near_goal_active"] = False
                 phase, vx, wz = "recovery_backout_complete", 0.0, 0.0
             distance = math.hypot(dx, dy)
             detail = f"backout_forward={forward_error:.3f}m yaw_error={math.degrees(yaw_error):.1f}deg"
@@ -734,6 +745,7 @@ class DiffNavBridge(Node):
                 mission["stage_start"] = time.monotonic()
                 mission["settling"] = False
                 mission["settle_count"] = 0
+                mission["near_goal_active"] = False
                 phase, wz = "recovery_reapproach_start", 0.0
             detail = f"distance={distance:.3f}m approach_yaw={math.degrees(approach_yaw):.1f}deg heading_error={math.degrees(heading_error):.1f}deg"
             timeout = 15.0
@@ -753,6 +765,7 @@ class DiffNavBridge(Node):
                 mission["stage_start"] = time.monotonic()
                 mission["settling"] = False
                 mission["settle_count"] = 0
+                mission["near_goal_active"] = False
                 phase, vx, wz = "recovery_position_reached", 0.0, 0.0
             detail = f"distance={distance:.3f}m heading_error={math.degrees(heading_error):.1f}deg"
             timeout = 25.0
@@ -771,12 +784,13 @@ class DiffNavBridge(Node):
                 mission["stage_start"] = time.monotonic()
                 mission["settling"] = False
                 mission["settle_count"] = 0
+                mission["near_goal_active"] = False
                 phase, wz = "recovery_final_align_complete", 0.0
             detail = f"distance={distance:.3f}m yaw_error={math.degrees(yaw_error):.1f}deg"
             timeout = 15.0
 
         else:
-            # Final approach (docking) with Hysteresis & Settle Latching
+            # Final approach (docking) with Near Goal Align & Creep Stages
             dx, dy = goal_x - x, goal_y - y
             distance = math.hypot(dx, dy)
             yaw_error = self._angle_error(goal_yaw, yaw)
@@ -785,14 +799,45 @@ class DiffNavBridge(Node):
 
             now = time.monotonic()
 
-            # Priority 1: Lateral Recovery Trigger
-            if abs(lateral_error) > 0.05 and abs(forward_error) < 0.10:
+            # Priority 1: Lateral Recovery Trigger or Near Goal Timeout Recovery Trigger
+            if (
+                mission.get("near_goal_active", False)
+                and now - mission.get("near_goal_start", now) > DOCK_NEAR_TIMEOUT
+            ):
+                mission["recovery_count"] = mission.get("recovery_count", 0) + 1
+                if mission["recovery_count"] > 3:
+                    self._finish_direct_navigation(
+                        False,
+                        (
+                            f"near goal docking exhausted; "
+                            f"distance={distance:.3f} "
+                            f"lateral={lateral_error:.3f} "
+                            f"yaw={math.degrees(yaw_error):.1f}deg"
+                        ),
+                        x,
+                        y,
+                        yaw,
+                    )
+                    return 0.0, 0.0
+
+                mission["stage"] = "recovery_backout"
+                mission["stage_start"] = now
+                mission["near_goal_active"] = False
+                mission["settling"] = False
+                mission["settle_count"] = 0
+                phase, vx, wz = "start_near_goal_recovery", 0.0, 0.0
+                self.get_logger().warning(
+                    f"near goal docking timeout ({DOCK_NEAR_TIMEOUT}s); starting recovery {mission['recovery_count']}/3"
+                )
+
+            elif abs(lateral_error) > 0.05 and abs(forward_error) < 0.10:
                 mission["recovery_count"] = mission.get("recovery_count", 0) + 1
                 if mission["recovery_count"] > 3:
                     self._finish_direct_navigation(False, f"dock recovery exhausted; lateral={lateral_error:.3f}m", x, y, yaw)
                     return 0.0, 0.0
                 mission["stage"] = "recovery_backout"
                 mission["stage_start"] = now
+                mission["near_goal_active"] = False
                 mission["settling"] = False
                 mission["settle_count"] = 0
                 phase, vx, wz = "start_lateral_recovery", 0.0, 0.0
@@ -840,23 +885,37 @@ class DiffNavBridge(Node):
                     f"[nav_robot5] dock settle entered: distance={distance:.3f}m yaw_error={math.degrees(yaw_error):.2f}deg"
                 )
 
-            # Priority 4: Forward Approach (Distance > Enter Tolerance)
-            elif not (distance <= DOCK_POSITION_ENTER_TOL):
+            # Priority 4: Near Goal Docking (distance <= 6cm)
+            elif distance <= DOCK_NEAR_DISTANCE:
+                if not mission.get("near_goal_active", False):
+                    mission["near_goal_active"] = True
+                    mission["near_goal_start"] = now
+                    mission["stage_start"] = now
+
+                if abs(yaw_error) > DOCK_YAW_ENTER_TOL:
+                    phase = "near_goal_align"
+                    vx = 0.0  # Rotate in place when yaw error > 2 deg
+                    wz = float(np.clip(1.2 * yaw_error, -0.12, 0.12))
+                    if abs(wz) < 0.06:
+                        wz = math.copysign(0.06, yaw_error)
+                else:
+                    phase = "near_goal_creep"
+                    vx = float(np.clip(0.30 * forward_error, -0.020, 0.025))
+                    if abs(vx) < 0.008 and abs(forward_error) > 0.004:
+                        vx = math.copysign(0.008, forward_error)
+                    wz = float(np.clip(1.0 * yaw_error + 0.8 * lateral_error, -0.08, 0.08))
+
+                mission["settling"] = False
+                mission["settle_count"] = 0
+
+            # Priority 5: General Final Approach (distance > 6cm)
+            else:
                 phase = "final_forward_approach"
                 if abs(yaw_error) <= math.radians(8.0):
                     vx = float(np.clip(0.45 * forward_error, -0.04, 0.08))
                     if abs(vx) < 0.015 and abs(forward_error) > 0.004:
                         vx = math.copysign(0.015, forward_error)
                 wz = float(np.clip(1.8 * yaw_error + 1.4 * lateral_error, -0.20, 0.20))
-                mission["settling"] = False
-                mission["settle_count"] = 0
-
-            # Priority 5: Fine Heading Alignment
-            else:
-                phase = "fine_align_at_table"
-                wz = float(np.clip(1.2 * yaw_error, -0.15, 0.15))
-                if abs(wz) < 0.12:
-                    wz = math.copysign(0.12, yaw_error)
                 mission["settling"] = False
                 mission["settle_count"] = 0
 
@@ -875,12 +934,12 @@ class DiffNavBridge(Node):
                 self.get_logger().info(f"direct phase={phase} pose=({x:.2f},{y:.2f},{math.degrees(yaw):.1f}deg) {detail}")
             self._update_status_snapshot(mission["mission_id"], "running", phase, x, y, yaw)
 
-        # Do NOT timeout overall mission if currently settling cleanly
-        if not mission.get("settling", False) and (now - mission["stage_start"] > timeout):
+        # Do NOT timeout overall mission if currently settling cleanly or active in near_goal_active phase
+        if not mission.get("settling", False) and not mission.get("near_goal_active", False) and (now - mission["stage_start"] > timeout):
             self._finish_direct_navigation(False, f"{stage} timeout; {detail}", x, y, yaw)
             return 0.0, 0.0
 
-        return (vx, wz)
+        return (vx * self._obstacle_scale, wz)
 
     # Thread-safe Status Snapshot Update
     def _update_status_snapshot(self, mission_id: str, state: str, phase: str, x: float, y: float, yaw: float):
