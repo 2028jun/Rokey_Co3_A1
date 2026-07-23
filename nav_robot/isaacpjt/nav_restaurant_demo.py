@@ -1489,6 +1489,7 @@ class NavBridge(Node):
         )
 
         ranges = []
+        obstacle_ranges = []
         for index in range(LIDAR_SAMPLES):
             angle = angle_min + index * angle_increment
             world_angle = yaw + angle
@@ -1504,6 +1505,11 @@ class NavBridge(Node):
                 if hit and hit.get("hit")
                 else ""
             )
+            collision_prim = (
+                str(hit.get("collision", ""))
+                if hit and hit.get("hit")
+                else ""
+            )
 
             if hit and hit.get("hit") and not rigid_body.startswith(robot_prefix):
                 distance = float(hit["distance"])
@@ -1514,6 +1520,21 @@ class NavBridge(Node):
                 distance = math.inf
 
             ranges.append(distance)
+
+            # Filter for dynamic person / obstacle detection: ignore static environment (tables, chairs, walls, kitchen)
+            hit_path = (rigid_body + " " + collision_prim).lower()
+            is_person = (
+                "/World/CorridorObstacleTestPerson" in (rigid_body + collision_prim)
+                or "person" in hit_path
+                or "character" in hit_path
+                or "obstacle" in hit_path
+                or "human" in hit_path
+                or "hand" in hit_path
+            )
+            if is_person:
+                obstacle_ranges.append(distance)
+            else:
+                obstacle_ranges.append(math.inf)
 
         scan = LaserScan()
         if stamp is not None:
@@ -1532,7 +1553,7 @@ class NavBridge(Node):
         self.nav_scan_pub.publish(scan)
 
         self._process_obstacle_ranges(
-            ranges,
+            obstacle_ranges,
             angle_min,
             angle_increment,
             LIDAR_MIN_RANGE,
@@ -1563,8 +1584,10 @@ class NavBridge(Node):
                 return
 
             if mission["mode"] == "legacy_table":
-                self._obstacle_scale = 1.0
-                return
+                stage = mission.get("stage")
+                if stage not in ("move_to_pre_dock", "final_approach"):
+                    self._obstacle_scale = 1.0
+                    return
             else:
                 stages = mission.get("stages", [])
                 index = mission.get("index", 0)
@@ -1572,7 +1595,7 @@ class NavBridge(Node):
                     self._obstacle_scale = 1.0
                     return
                 kind = stages[index].get("kind")
-                if kind != "axis_y":
+                if kind not in ("axis_x", "axis_y"):
                     self._obstacle_scale = 1.0
                     return
 
