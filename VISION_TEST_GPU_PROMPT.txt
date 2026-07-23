@@ -1,252 +1,216 @@
-# Vision-test GPU execution prompt: verify the fully-static seated arm-only reach
+# Vision-test GPU execution prompt: make the human/reach visually credible and fix the observable YOLO workflow
 
-Paste this document into a coding-agent session running on the GPU computer.
-The target environment is Isaac Sim 5.1.0-rc.19, ROS 2 Humble, and an RTX
-5080 with 16 GB VRAM. Work on the `vision-test` branch.
+Paste this document into a coding-agent session on the GPU computer. The target
+is Isaac Sim 5.1.0-rc.19, ROS 2 Humble, RTX 5080 16 GB, branch `vision-test`.
+Use `ROS_DOMAIN_ID=102`, matching `AGENTS.md` and the application default.
 
-Read `GPU_RUN_LOG.txt` before changing anything, especially the "Pass 6 prep"
-entry at the bottom -- it explains exactly what changed since pass 5 and why,
-and what is and is not already verified. Git history preserves every prior
-pass's implementation and this prompt's own prior revisions; this prompt
-contains only the current work. Do not copy old pass narratives back into it.
+Read `GPU_RUN_LOG.txt` completely before changing anything. In particular, Pass
+6 is already finished and committed. Do not repeat its seat-coordinate search,
+static-body proof, or detection measurements. This is the next implementation
+pass, driven by the reviewer's direct visual feedback.
 
-## Repository bootstrap
+## Repository bootstrap and completion contract
 
-Before working, run `git status` and preserve any existing uncommitted GPU-side
-work; never discard it with reset, checkout, or deletion. Fetch `origin`, switch
-to `vision-test`, and update it with `git pull --ff-only origin vision-test`.
-If local work prevents a fast-forward, integrate it safely instead of
-overwriting it. Then read this prompt and `GPU_RUN_LOG.txt` completely and
-execute the work end to end. Do not stop after planning or after one test case.
+Preserve all existing GPU-side work. Run `git status`, fetch `origin`, switch to
+`vision-test`, and update with `git pull --ff-only origin vision-test`. Never
+discard work with reset, checkout, or deletion. If a fast-forward is blocked,
+integrate the local work safely.
 
-When finished, append a "Pass 6" entry to `GPU_RUN_LOG.txt` (below the "Pass 6
-prep" entry already there -- do not overwrite or renumber it), commit the
-tested code and log, push `vision-test`, and report the commit hash, changed
-files, measured results, and remaining limitations.
+Work end to end: inspect, implement, render, run the actual detector, iterate,
+and verify the result visually. Do not stop after planning, after reproducing
+the defects, or after proving the current geometry impossible.
 
-## Objective
+When finished:
 
-Pass 5 replaced the whole-body-slide reach with a two-bone arm rig and
-verified it on hardware, but the arm was reached by *leaning the whole body*
-toward the target every cycle (see pass 5's log entry) -- the reviewer
-watched it in simulation and asked for that removed entirely: **the person
-should stay seated and completely still; only the arm joints (shoulder,
-elbow) should move.** Pass 6 prep (CPU-only, see the log) did exactly that
-in code -- deleted the per-reach body lean, and moved the character's seat
-close enough to the table that a fully static arm-only pose can physically
-reach `TABLE_HAND_TARGET` (this character's own two-bone reach is short, so
-the seat had to move quite a bit closer than before -- see the log's
-"Observed" section for the exact geometric reasoning).
+1. Append one dated next-pass entry to `GPU_RUN_LOG.txt`; do not rewrite prior
+   pass entries.
+2. Update this prompt so it describes only whatever work still remains. Do not
+   leave completed tasks as instructions for the next agent.
+3. Commit and push the tested code and log to `vision-test`.
+4. Report the commit, changed files, exact run commands, visual results, and
+   remaining limitations.
 
-This pass has one job, and it is entirely about the *quality of the motion*,
-not detection:
+## Current reviewer-visible failures
 
-1. Confirm the seat's new position (`HAND_TEST_SEAT_X`/`Y`/`Z`, defaults
-   ~(-3.337,-2.216,-0.20)) doesn't visually clip into the table, another
-   chair, or other scene geometry. This was computed offline without seeing
-   the actual `TableSet_00` mesh and is the single most likely thing to be
-   wrong -- adjust the three env vars until it looks physically sensible;
-   no code change is needed to retune, `_solve_static_arm_target()` re-solves
-   the IK automatically for whatever seat position is set.
-2. Confirm the body is now genuinely static: watch several reach cycles and
-   confirm the torso/head/legs never move even slightly -- only
-   `RightArmRig`'s shoulder rotation and `ElbowPivot`'s elbow rotation
-   should animate. If ANY body translation is visible, that's a real bug
-   (the code shouldn't be touching a translateOp at all in `rigid_arm` mode
-   any more -- grep for `self.translate_op` in `ReachAnimator` if this
-   somehow still happens and report exactly where it's coming from).
-3. Judge whether the reach itself looks natural: does the shoulder/elbow
-   articulation read as a person reaching across a table from a seated
-   position, or does it look stiff, robotic, or like the arm is bending the
-   wrong way? Does the permanent (no longer transient) `-0.20m` root sink
-   read as a low/seated posture or as visibly sinking into the chair/floor?
-4. **Do not spend this pass judging hand-detection quality or confidence.**
-   Pass 5 already confirmed the two-bone rig mechanism itself detects fine
-   and gates `roi_intrusion` cleanly (see that log entry for the numbers);
-   the reviewer will judge detection by watching the simulation directly
-   this time, not from a report. If something about the new seat position
-   obviously breaks detection (e.g. the hand no longer enters the ROI at
-   all), report that as a motion/placement bug, not a detection-tuning
-   task -- do not re-tune YOLO/ROI parameters this pass.
+Treat all four as real acceptance failures:
 
-Keep the current ROS domain configuration and the 1280x960 camera input.
-`/serving_robot/table_arrived` still has no real publisher in this repo --
-that is intentional, it gets connected later during full-system
-integration, and is explicitly out of scope for this branch. Continue
-publishing it manually for testing exactly as every prior pass did (e.g.
-`ros2 topic pub`); do not try to "fix" its absence.
+1. The person is embedded in the table and only flicks the arm.
+2. The person must instead be naturally seated by a chair or plausibly standing
+   beside it.
+3. The rigid arm looks grotesque: circular elbow/shoulder caps are visible,
+   shoulder geometry is broken, and the arm starts/animates in an unnatural
+   spread pose.
+4. A reviewer launching the YOLO workflow directly from terminals does not get
+   a visible simulation/detection window.
 
-## Known results: do not repeat these dead ends
+The result must look credible to a human reviewer, not merely satisfy IK math.
+If the current arm cannot reach from the chair side, change the design: move
+the tabletop intrusion target toward the customer-side edge while keeping it
+inside the ROI, uniformly scale the person/arm, use a better character/rest
+pose, rebuild the arm geometry, or combine those measures. Do not put the
+person back inside the table and do not accept a spread/T-pose arm as “working.”
 
-- Passes 2 and 4: `UsdSkel`/Animation Graph joint animation does not render
-  on this Isaac Sim build (silently for UsdSkel, a segfault for Animation
-  Graph). This is exactly why the reach uses a plain non-skinned `Xform`
-  chain instead -- do not attempt either route again.
-- Pass 3: the RG2 gripper false positive was fixed by tightening the table
-  ROI polygon, not by repainting the gripper. Do not revert the tightened
-  ROI, and do not investigate this again -- it's unrelated to this pass.
-- Pass 5: picked `male_adult_construction_01_new` for its glove's YOLO
-  confidence, verified the rig's shoulder/elbow-cap geometry plugs the
-  rotation-swept gap at the joints (`ShoulderCap`/`ElbowCap` spheres, 0.065
-  radius) with an acceptably small residual false-detection rate. None of
-  that changed this pass -- do not re-tune cap radius or re-run the
-  detection-confidence measurement; that is explicitly out of scope here
-  (see Objective item 4).
-- Pass 5 also found `/serving_robot/table_arrived` has no publisher
-  anywhere in this repo. Confirmed intentional (connected later during
-  integration) -- do not treat this as a bug to fix.
-- Pass 6 prep found, analytically, that NO seat X/Y position can make this
-  standing-pose character's arm reach the table without *some* vertical
-  root sink -- its shoulder sits 1.44m up regardless of seat placement,
-  the target is 0.83m up (a 0.61m gap `rotateZ` can never close), and the
-  arm's own max reach is only 0.496m end to end, less than that vertical
-  gap alone. If the shipped `-0.20m` sink still looks wrong on hardware,
-  the fix is tuning `HAND_TEST_SEAT_Z` (and re-deriving the matching
-  `HAND_TEST_SEAT_X`/`Y` for the horizontal component so the arm still
-  reaches -- see the formula in `_solve_static_arm_target()` and the log's
-  reasoning), not re-deriving the whole approach. If a genuinely
-  zero-sink, fully-natural static reach is required, the real fix is
-  switching to a character asset with an actual seated rest pose (not
-  attempted so far across any pass) -- flag this explicitly if the
-  reviewer decides `-0.20m` isn't acceptable, rather than fighting the
-  current character's geometry further.
+## Already established — do not redo
 
-## Relevant scene and pipeline facts
+- Pass 6 proved the current center target `(-3.2, -2.2, 0.83)`, the standing
+  character's 0.496 m arm, a fully static torso, and a person outside the table
+  cannot coexist. Exhaustive `HAND_TEST_SEAT_X/Y/Z` tuning cannot solve it.
+- The shipped Pass 6 seat `(-3.337, -2.216, -0.20)` is deep inside the real
+  table. It is not a usable baseline and must not remain the default.
+- Pass 6 proved rigid-arm mode has zero root translation during reach. Preserve
+  that property unless the final chosen design needs a small, deliberate,
+  natural fixed pose adjustment. Do not restore Pass 5's per-cycle whole-body
+  lunge.
+- Passes 2 and 4 ruled out late-bound UsdSkel animation and Animation Graph on
+  this build (no rendered motion and native segfault respectively). Do not
+  repeat them.
+- Pass 3 ruled out a PhysX articulation drive on the old People asset because
+  it has no articulation/joints. Do not repeat that inspection on the same
+  asset. A genuinely different asset may be inspected once if it is a serious
+  candidate.
+- Pass 5 verified the detached two-bone Xform mechanism, camera at 1280x960,
+  detector confidence, ROI gating, and manual `table_arrived` publication.
+  This pass is not a confidence/ROI retuning exercise.
+- `/serving_robot/table_arrived` intentionally has no real publisher in this
+  branch. Publish it manually during this isolated test; do not implement the
+  integration publisher here.
 
-- The robot docks at `TableSet_00`; this is the table framed by the fixed
-  table camera and treated as table 1 in this project.
-- `TableSet_00` tabletop world height is `TABLE_TOP_Z = 0.73 m`; the hand
-  target is `TABLE_TOP_Z + HAND_TARGET_Z_OFFSET` (0.83 m, unchanged since
-  pass 4).
-- Main files:
-  - `isaacpjt/mobile_manipulator_demo.py` (spawns the actor, drives the
-    per-frame `ReachAnimator.update()` loop -- unchanged this pass)
-  - `isaacpjt/hand_intrusion_test_actor.py` (changed this pass -- read its
-    module docstring's "IMPORTANT" paragraph and the "Asset build notes"
-    entries 7-8 at the bottom before touching anything)
-  - `isaacpjt/two_bone_ik.py` (unchanged since pass 5)
-  - `assets/rigid_arm_asset.usda` (unchanged since pass 5)
-- `HAND_TEST_RIG_MODE=legacy` still switches all the way back to the
-  original pass #1-4 whole-body-slide mechanism, untouched, for A/B
-  comparison if the new static pose needs debugging against something
-  known-working.
-- New/relevant env vars this pass: `HAND_TEST_SEAT_X`/`HAND_TEST_SEAT_Y`
-  (default -3.337/-2.216, was -2.7/-3.2 through pass 5) and
-  `HAND_TEST_SEAT_Z` (default -0.20, was 0.0 through pass 5 -- pass 5's
-  `-0.427` was a *dynamic* lean value that no longer exists, not a prior
-  default). `HAND_TEST_REACH_EXTENSION_RATIO` from pass 5 was deleted
-  entirely (no replacement -- the seat position now bakes in the same
-  design intent statically).
+## Task 1: redesign placement and reach as one visual system
 
-## Task 1: confirm the seat placement against the real scene
+Start from the real `TableSet_00` and chair transforms, not the current embedded
+seat. Choose a customer position that visibly reads as either:
 
-Before watching a reach cycle, just look at the character sitting still at
-rest. Check from more than one angle (the fixed table camera plus a free
-viewport):
+- seated at one of the existing chairs with feet/body clear of table geometry,
+  or
+- standing naturally next to/behind that chair.
 
-1. Does the seat position clip into the table, another chair, or any other
-   prop? This is the thing most likely to be wrong, since it was computed
-   without seeing the actual geometry.
-2. Does the character still read as "sitting at this table" from a
-   reasonable angle, or does the seat move look obviously wrong (e.g. too
-   close, facing the wrong way, floating)?
-3. If it needs adjusting, tune `HAND_TEST_SEAT_X`/`Y` (and note that
-   `HAND_TEST_SEAT_Z` and the seat's distance from the table are coupled --
-   see the log's geometric reasoning; if you move the seat further from the
-   table, `SEAT_Z` will need to go more negative to keep the target in
-   reach, and vice versa). Watch the startup log line
-   (`shoulder->target distance=... (arm max reach=..., REACHABLE/OUT OF
-   REACH)`) to confirm whatever you land on is still actually reachable.
+Use free-camera views from the front, side, and above plus the fixed table
+camera. The entire body must stay outside the tabletop and its underside
+bracing. It must not float, sink through the floor/chair, intersect another
+chair, or face away from the table.
 
-## Task 2: confirm the body is completely static
+The old target is at the tabletop center. It is acceptable and likely necessary
+to introduce a separate hand-intrusion test target closer to the customer-side
+table edge. It must remain visibly over the tabletop, clear the surface, and
+fall inside the existing ROI. Do not move the ROI merely to legitimize a bad
+pose. Keep the production table/docking geometry unchanged.
 
-Watch at least 3-4 full reach cycles.
+Uniform character scaling is explicitly allowed if it produces credible human
+proportions relative to the chair and table. Scale the whole visual system
+coherently—body, detached arm, pivots, offsets, bone lengths, and IK—not just
+one limb. Reject giant/miniature results that look wrong beside the furniture.
 
-1. Confirm the torso, head, and legs do not move at all -- not even
-   slightly -- throughout the entire cycle. Only the arm should animate.
-2. If the body moves at all, that's a regression from pass 6 prep's intent
-   and needs a real code fix (grep for `translate_op`/`translateOp` in
-   `ReachAnimator` -- it should not exist for `rigid_arm` mode anymore).
+At rest, both arms should read as relaxed beside/on the body or in another
+plausible seated/standing pose. During intrusion, only the intended reaching
+arm should move. No T-pose, permanently spread arm, backwards elbow, shoulder
+rotation through the torso, or hand approaching from underneath the table.
+A small fixed torso orientation/lean is allowed if it is natural and does not
+animate each cycle; the body must not slide toward the target during reach.
 
-## Task 3: judge the reach motion quality
+Do not merely report that the old combination is impossible—the reviewer has
+authorized a design change. Select and implement the least invasive credible
+combination, then iterate against rendered frames.
 
-1. Does the shoulder + elbow articulation look like a plausible seated
-   reach across a table, or does it look mechanical/wrong (e.g. elbow
-   bending backwards, shoulder rotating through the torso, hand approaching
-   from a strange angle)?
-2. Does the hand/glove enter the tabletop ROI without clipping through the
-   table (same 0.83 m target as every prior pass)?
-3. Does the permanent `-0.20m` root sink read as an acceptable low/seated
-   posture, or does the character look like it's sinking into the chair or
-   floor? This is now a constant, always-on characteristic (not a
-   transient lean like pass 5), so judge it as a resting-state property,
-   not just during the reach.
-4. If the elbow bends the wrong way, `POLE_HINT_LOCAL_OFFSET` in
-   `hand_intrusion_test_actor.py` controls that (not currently an
-   env-var override -- add one if it needs iterating on hardware).
+## Task 2: replace the broken-looking arm construction
 
-Do not re-measure YOLO confidence or `roi_intrusion` timing this pass (see
-Objective item 4) -- if detection obviously looks broken because of the new
-seat position (not because of anything pass 5 already covers), report it
-as a placement issue for the reviewer to weigh in on, not something to
-re-tune blind.
+Inspect `assets/rigid_arm_asset.usda` and the extraction/build notes in
+`isaacpjt/hand_intrusion_test_actor.py`. The current primitive `ShoulderCap` and
+`ElbowCap` workaround is not visually acceptable if its spheres can be seen.
 
-## Build and run
+Fix the geometry and rest pose rather than hiding the defect with larger
+spheres. Acceptable approaches include:
 
-From the repository root:
+- rebuilding the cut boundaries with overlapping, tapered upper-arm/forearm
+  geometry whose rotation seams remain inside the sleeve/joint volume;
+- using non-spherical, material/normal/UV-compatible joint transition meshes;
+- moving the pivots/cut planes and adding sleeve geometry so the shoulder stays
+  filled through the required, now-smaller natural motion range;
+- replacing the rigid arm/character asset with a better compatible asset if
+  that is demonstrably cleaner on this Isaac Sim build.
 
-```bash
-colcon build --symlink-install
-source install/setup.bash
-export ROS_DOMAIN_ID=101
-MOBILE_DEMO_HAND_TEST=1 python isaacpjt/mobile_manipulator_demo.py
-```
+The final close-up must have no obvious ball at the elbow or shoulder, no dark
+hole/torn shoulder, no detached pieces, and no severe texture/material break.
+Test rest, mid-reach, and full-reach from close side/front views. Also check the
+operating table-camera distance.
 
-A/B against the prior (leaning) mechanism, or the original whole-body slide:
+Preserve useful environment overrides and legacy fallback, but the default
+path must be the visually acceptable one. Do not solve appearance by disabling
+the person or hiding the arm from the relevant camera.
 
-```bash
-# tune seat placement without touching code
-HAND_TEST_SEAT_X=-3.0 HAND_TEST_SEAT_Y=-2.5 HAND_TEST_SEAT_Z=-0.15 \
-  MOBILE_DEMO_HAND_TEST=1 python isaacpjt/mobile_manipulator_demo.py
+## Task 3: make terminal-launched simulation and YOLO output observable
 
-# full fallback to pass #1-4's mechanism
-HAND_TEST_RIG_MODE=legacy MOBILE_DEMO_HAND_TEST=1 python isaacpjt/mobile_manipulator_demo.py
-```
+Reproduce the reviewer's “no screen appears” report using clean terminals.
+Diagnose before changing defaults. There are multiple distinct gates:
 
-Useful checks (manually publish `table_arrived` as always):
+- Isaac GUI is suppressed by `MOBILE_DEMO_HEADLESS=1`; normal visual testing
+  requires `MOBILE_DEMO_HEADLESS=0` and a valid graphical `DISPLAY`.
+- `hand_detector_node.py` currently declares `show_window=true` and
+  `publish_annotated_image=true`, but `hand_safety/config/hand_safety.yaml`
+  sets both false. Determine which parameter source the documented command
+  actually uses; make code, YAML, and README unambiguous.
+- inference is intentionally disabled until
+  `/serving_robot/table_arrived=true`;
+- an OpenCV HighGUI window requires a graphical session. Provide
+  `rqt_image_view` on `/hand_detection/image` as the reliable ROS-native
+  viewing path.
 
-```bash
-ros2 topic pub /serving_robot/table_arrived std_msgs/msg/Bool "data: true" -1
-ros2 run rqt_image_view rqt_image_view /hand_detection/image
-```
+Produce and verify a copy-paste terminal workflow from the repository root,
+using `ROS_DOMAIN_ID=102` everywhere:
+
+1. build/source and launch Isaac Sim in non-headless mode;
+2. build/source and launch the detector with annotated-image publication
+   explicitly enabled (and `show_window` explicitly enabled only when the
+   session supports it);
+3. manually publish `table_arrived=true`;
+4. open `/hand_detection/image` with `rqt_image_view`;
+5. verify input/output topics, image rate, detector logs, and at least one
+   visible annotated frame.
+
+If direct `cv2.imshow` remains unreliable under the target desktop/Wayland/X11
+session, do not claim it works. Make annotated-image + `rqt_image_view` the
+documented primary workflow and print a clear startup log explaining where to
+view it. Fail or warn clearly when GUI display is requested but unavailable;
+do not leave a silently-running terminal that appears hung.
+
+Update `hand_safety/README.md` and any stale quick-start commands. Explicitly
+document the difference between the Isaac viewport, OpenCV window, and
+`rqt_image_view`, and the need for the manual arrival gate.
+
+## Required verification
+
+Capture or inspect, at minimum:
+
+- rest pose from front, side, overhead, and fixed table camera;
+- mid-reach and full-reach close-ups of shoulder and elbow;
+- at least 4 full cycles showing no animated root/body slide;
+- world/body/table/chair non-intersection in the chosen pose;
+- hand visibly crossing into the existing tabletop ROI without passing through
+  the tabletop;
+- a clean-terminal demonstration in which Isaac GUI is visible and the
+  annotated detector stream is visible through the documented command.
+
+Programmatic transform/IK checks are supporting evidence only. Visual captures
+are required because the reported defects are visual.
 
 ## Acceptance criteria
 
-- The seat visually fits the scene (no clipping into the table/chairs).
-- Across multiple reach cycles, the torso/head/legs show zero movement --
-  only the arm animates.
-- The reach motion reads as a natural seated reach, not stiff/mechanical/
-  wrong-direction, and the hand clears the tabletop at the existing 0.83 m
-  target.
-- The resting `-0.20m` sink (or whatever value was tuned to) is judged
-  acceptable as a permanent seated posture, or a specific alternative value
-  is recommended if not.
-- No detection/confidence re-tuning was done this pass.
+- The person is credibly seated by a chair or standing beside it, entirely out
+  of the table and other furniture.
+- Rest and reach poses look human; the arm is not spread at rest and only the
+  reaching arm articulates during a cycle.
+- The hand enters the tabletop ROI from the customer side and clears the table.
+- The shoulder and elbow have no visible spheres, holes, tearing, or detached
+  geometry in close-up or the operating camera.
+- No per-cycle whole-body translation/lunge is present.
+- A reviewer can follow the documented terminal commands and see both the
+  simulation and annotated YOLO result, with the arrival gate clearly handled.
+- Completed Pass 6 investigations are not repeated, and detection thresholds/
+  ROI are not gratuitously retuned.
 
-## Deliverables
+## Log entry requirements
 
-Append one dated "Pass 6" entry to `GPU_RUN_LOG.txt` (after the existing
-"Pass 6 prep" entry -- do not edit that one except to fix a factual error)
-containing:
-
-- whether the seat position needed adjusting, and the final
-  `HAND_TEST_SEAT_X`/`Y`/`Z` values used;
-- confirmation (or not) that the body is fully static across multiple
-  cycles;
-- a qualitative judgment of the reach motion and the resting sink posture;
-- any code changes made and why; and
-- remaining limitations, including whether a seated-pose character swap
-  should be considered if the current sink still looks wrong.
-
-Keep implementation changes focused and retain useful environment/config
-overrides.
+Record the final person asset/mode, position, yaw, uniform scale, target point,
+bone/pivot changes, and whether seated or standing. Explain why the composition
+looks natural from each required view. Record the arm-geometry fix, exact
+terminal commands, GUI environment, actual resolved ROS parameters, topic
+rates, and annotated-view result. List any remaining visual compromise plainly.
