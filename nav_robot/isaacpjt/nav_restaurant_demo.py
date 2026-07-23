@@ -260,6 +260,13 @@ FRONT_LIDAR_CONFIG = "RPLIDAR_S2E"
 FRONT_LIDAR_FRAME = "base_scan"
 FRONT_LIDAR_TOPIC = "/scan"
 
+LIDAR_MIN_RANGE = 0.20
+LIDAR_MAX_RANGE = 12.0
+LIDAR_SAMPLES = 180
+LIDAR_PERIOD_SEC = 0.10
+LIDAR_SENSOR_FORWARD = 0.48
+LIDAR_SENSOR_HEIGHT = 0.45
+
 _front_lidar_render_product = None
 _front_lidar_writer = None
 _embedded_lidar_render_product = None
@@ -1098,26 +1105,27 @@ class NavBridge(Node):
         self._obstacle_stop_started = None
         self._clearance_start = None
         self._obstacle_scale = 1.0
+        self._last_scan_time = 0.0
 
         qos = QoSProfile(
             depth=10,
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
         )
+        sensor_qos = QoSProfile(
+            depth=5,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self.scan_pub = self.create_publisher(LaserScan, "/scan", sensor_qos)
+        self.nav_scan_pub = self.create_publisher(LaserScan, "/nav_robot/scan", sensor_qos)
         self.create_subscription(Twist, "/nav_robot/cmd_vel", self._on_cmd_vel, qos)
         self.create_subscription(Twist, "cmd_vel", self._on_cmd_vel, qos)
         self.create_subscription(
             PoseStamped, "/nav_robot/teleport", self._on_teleport, qos
         )
-        sensor_qos = QoSProfile(
-            depth=10,
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-        )
         self.create_subscription(LaserScan, "/scan", self._on_scan, sensor_qos)
         self.create_subscription(LaserScan, "/nav_robot/scan", self._on_scan, sensor_qos)
-        self.create_subscription(LaserScan, "/scan", self._on_scan, qos)
-        self.create_subscription(LaserScan, "/nav_robot/scan", self._on_scan, qos)
         self.odom_pub = self.create_publisher(Odometry, "/nav_robot/odom", qos)
         self.tf_broadcaster = TransformBroadcaster(self)
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
@@ -1450,7 +1458,104 @@ class NavBridge(Node):
             self._cmd_vx = 0.0
             self._cmd_wz = 0.0
 
+    def _publish_physx_scan(self, stamp, x: float, y: float, yaw: float):
+        now = time.monotonic()
+        if now - self._last_scan_time < LIDAR_PERIOD_SEC:
+            return
+        self._last_scan_time = now
+
+        angle_min = -math.pi
+        angle_increment = 2.0 * math.pi / LIDAR_SAMPLES
+
+        try:
+            import omni.physx
+            query = omni.physx.get_physx_scene_query_interface()
+        except Exception:
+            query = None
+
+        if query is None:
+            return
+
+        origin = (
+            x + LIDAR_SENSOR_FORWARD * math.cos(yaw),
+            y + LIDAR_SENSOR_FORWARD * math.sin(yaw),
+            LIDAR_SENSOR_HEIGHT,
+        )
+
+        robot_prefix = (
+            str(self.articulation.prim_path)
+            if hasattr(self.articulation, "prim_path")
+            else "/World/NavRobot"
+        )
+
+        ranges = []
+        for index in range(LIDAR_SAMPLES):
+            angle = angle_min + index * angle_increment
+            world_angle = yaw + angle
+            direction = (
+                math.cos(world_angle),
+                math.sin(world_angle),
+                0.0,
+            )
+
+            hit = query.raycast_closest(origin, direction, LIDAR_MAX_RANGE)
+            rigid_body = (
+                str(hit.get("rigidBody", ""))
+                if hit and hit.get("hit")
+                else ""
+            )
+
+            if hit and hit.get("hit") and not rigid_body.startswith(robot_prefix):
+                distance = float(hit["distance"])
+            else:
+                distance = math.inf
+
+            if distance < LIDAR_MIN_RANGE:
+                distance = math.inf
+
+            ranges.append(distance)
+
+        scan = LaserScan()
+        if stamp is not None:
+            scan.header.stamp = stamp
+        scan.header.frame_id = FRONT_LIDAR_FRAME
+        scan.angle_min = angle_min
+        scan.angle_max = angle_min + (LIDAR_SAMPLES - 1) * angle_increment
+        scan.angle_increment = angle_increment
+        scan.time_increment = 0.0
+        scan.scan_time = LIDAR_PERIOD_SEC
+        scan.range_min = LIDAR_MIN_RANGE
+        scan.range_max = LIDAR_MAX_RANGE
+        scan.ranges = ranges
+
+        self.scan_pub.publish(scan)
+        self.nav_scan_pub.publish(scan)
+
+        self._process_obstacle_ranges(
+            ranges,
+            angle_min,
+            angle_increment,
+            LIDAR_MIN_RANGE,
+            LIDAR_MAX_RANGE,
+        )
+
     def _on_scan(self, msg: LaserScan):
+        self._process_obstacle_ranges(
+            msg.ranges,
+            msg.angle_min,
+            msg.angle_increment,
+            msg.range_min,
+            msg.range_max,
+        )
+
+    def _process_obstacle_ranges(
+        self,
+        ranges,
+        angle_min: float,
+        angle_increment: float,
+        range_min: float,
+        range_max: float,
+    ):
         with self._lock:
             mission = self._direct_nav
             if mission is None:
@@ -1479,14 +1584,14 @@ class NavBridge(Node):
             front_angle = math.radians(20.0)
 
             valid_ranges = []
-            for idx, distance in enumerate(msg.ranges):
-                angle = msg.angle_min + idx * msg.angle_increment
+            for idx, distance in enumerate(ranges):
+                angle = angle_min + idx * angle_increment
                 norm_angle = math.atan2(math.sin(angle), math.cos(angle))
                 if abs(norm_angle) > front_angle:
                     continue
                 if not math.isfinite(distance):
                     continue
-                if msg.range_min <= distance <= msg.range_max:
+                if range_min <= distance <= range_max:
                     valid_ranges.append(distance)
 
             if not valid_ranges:
@@ -2401,6 +2506,7 @@ class NavBridge(Node):
         yaw = quaternion_to_yaw(orientation)
 
         stamp = self._sim_stamp
+        self._publish_physx_scan(stamp, x, y, yaw)
         if stamp is None:
             return
 
