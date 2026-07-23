@@ -32,8 +32,11 @@ class CorridorPersonSpawnController:
         self._requested_visibility: bool | None = None
 
         prim = self.stage.GetPrimAtPath(CORRIDOR_PERSON_PRIM)
-        if prim.IsValid():
-            self.stage.RemovePrim(CORRIDOR_PERSON_PRIM)
+        if not prim.IsValid():
+            self._ensure_prim_created()
+        UsdGeom.Imageable(self.stage.GetPrimAtPath(CORRIDOR_PERSON_PRIM)).MakeInvisible()
+        self._set_collision_enabled(False)
+
         print(
             f"[obstacle_test] corridor person controller ready at {tuple(CORRIDOR_PERSON_POSITION)}",
             flush=True,
@@ -44,7 +47,16 @@ class CorridorPersonSpawnController:
         with self._request_lock:
             self._requested_visibility = bool(visible)
 
-    def _spawn(self) -> None:
+    def _set_collision_enabled(self, enabled: bool) -> None:
+        root = self.stage.GetPrimAtPath(CORRIDOR_PERSON_PRIM)
+        if not root.IsValid():
+            return
+        for prim in Usd.PrimRange(root):
+            if prim.HasAPI(UsdPhysics.CollisionAPI):
+                collision = UsdPhysics.CollisionAPI(prim)
+                collision.CreateCollisionEnabledAttr().Set(enabled)
+
+    def _ensure_prim_created(self) -> None:
         prim = self.stage.GetPrimAtPath(CORRIDOR_PERSON_PRIM)
         if not prim.IsValid():
             xform = UsdGeom.Xform.Define(self.stage, CORRIDOR_PERSON_PRIM)
@@ -68,7 +80,11 @@ class CorridorPersonSpawnController:
                     except Exception:
                         pass
 
+    def _spawn(self) -> None:
+        self._ensure_prim_created()
+        prim = self.stage.GetPrimAtPath(CORRIDOR_PERSON_PRIM)
         UsdGeom.Imageable(prim).MakeVisible()
+        self._set_collision_enabled(True)
         self.active = True
         print(
             f"[obstacle_test] corridor person spawned at {tuple(CORRIDOR_PERSON_POSITION)}",
@@ -78,9 +94,10 @@ class CorridorPersonSpawnController:
     def _remove(self) -> None:
         prim = self.stage.GetPrimAtPath(CORRIDOR_PERSON_PRIM)
         if prim.IsValid():
-            self.stage.RemovePrim(CORRIDOR_PERSON_PRIM)
+            UsdGeom.Imageable(prim).MakeInvisible()
+            self._set_collision_enabled(False)
         self.active = False
-        print("[obstacle_test] corridor person and collider completely removed", flush=True)
+        print("[obstacle_test] corridor person and collider hidden & disabled", flush=True)
 
     def update(self) -> None:
         with self._request_lock:

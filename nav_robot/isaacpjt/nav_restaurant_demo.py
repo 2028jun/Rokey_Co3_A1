@@ -990,17 +990,8 @@ def connect_embedded_sensor_ros(stage):
         },
     )
 
-    import omni.replicator.core as rep
-
-    _embedded_lidar_render_product = rep.create.render_product(
-        lidar_path, [1, 1], name="IntegratedServingRPLidar"
-    )
-    _embedded_lidar_writer = rep.writers.get("RtxLidarROS2PublishLaserScan")
-    _embedded_lidar_writer.initialize(topicName="/scan", frameId="base_scan")
-    _embedded_lidar_writer.attach([_embedded_lidar_render_product])
     print(
-        f"[ros] embedded D455 RGB/depth {camera_width}x{camera_height}, "
-        "RPLIDAR /scan and /clock connected",
+        f"[ros] embedded D455 RGB/depth {camera_width}x{camera_height} and /clock connected",
         flush=True,
     )
 
@@ -2161,7 +2152,6 @@ class NavBridge(Node):
                 # Preserve the completed trip as visual-only USD geometry.
                 # Live payload physics remains at stable paths and is reused;
                 # deleting or moving it invalidates Isaac's tensor views.
-                gc.collect()
                 payload_paths = (
                     "/World/ServingDish",
                     "/World/PizzaBoardBail",
@@ -2300,7 +2290,6 @@ class NavBridge(Node):
                 self._active_serving_task.close()
                 self._active_serving_task = None
                 self._active_delivery_table = None
-                gc.collect()
                 remove_parking_brake(self.stage)
                 self.arm_status_pub.publish(Int32(data=3))
                 self.get_logger().error("[integrated-serving] delivery failed")
@@ -2308,7 +2297,6 @@ class NavBridge(Node):
                 self._active_serving_task.close()
                 self._active_serving_task = None
                 self._spawned_serving_tasks = {}
-                gc.collect()
                 self._arm_returning_to_stow = True
                 self._arm_stow_started_at = time.monotonic()
                 self._arm_stow_settle_count = 0
