@@ -67,7 +67,7 @@ class TopicBridge(Node):
             Odometry, RAW_ODOM_TOPIC, self._on_odom, _reliable(20)
         )
 
-        self._scan_pub = self.create_publisher(LaserScan, "/scan", _sensor_data(5))
+        self._scan_pub = self.create_publisher(LaserScan, "/scan", _reliable(5))
         self.create_subscription(
             LaserScan, RAW_SCAN_TOPIC, self._on_scan, _sensor_data(5)
         )

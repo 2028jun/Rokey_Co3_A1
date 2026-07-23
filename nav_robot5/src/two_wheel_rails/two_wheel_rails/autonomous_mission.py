@@ -12,6 +12,9 @@ from two_wheel_rails.autonomous_navigator import SimplifiedPathNavigator
 from two_wheel_rails.nav_bootstrap import (
     make_pose,
     prepare_navigator,
+    publish_initial_pose,
+    sync_spawn,
+    wait_for_existing_localization,
 )
 from two_wheel_rails.rail_geometry import load_routes
 
@@ -47,15 +50,39 @@ def main() -> None:
         action="store_true",
         help="Return to kitchen / spawn position",
     )
+    parser.add_argument(
+        "--initialize-spawn",
+        action="store_true",
+        help="Run initial Isaac spawn teleport and AMCL initial pose reset (First run only)",
+    )
 
     args = parser.parse_args()
 
     routes = load_routes()
+    spawn = routes.get("spawn") or routes.get("kitchen")
+    sx, sy, syaw = float(spawn["x"]), float(spawn["y"]), float(spawn["yaw"])
     gx, gy, gyaw = _goal_from_routes(routes, args.table_id, args.kitchen)
 
     rclpy.init(args=sys.argv)
     nav, tf_buffer, tracker = prepare_navigator(node_name="autonomous_navigator")
-    nav.waitUntilNav2Active()
+
+    if args.initialize_spawn:
+        print("[sync] Initializing spawn & AMCL pose via --initialize-spawn", flush=True)
+        nav.initial_pose = make_pose(nav, sx, sy, syaw)
+        publish_initial_pose(nav, sx, sy, syaw, repeats=2)
+        if tracker.xy is not None:
+            nav.initial_pose_received = True
+        nav.waitUntilNav2Active()
+        if not sync_spawn(nav, tf_buffer, tracker, sx, sy, syaw):
+            rclpy.shutdown()
+            raise SystemExit(1)
+    else:
+        nav.waitUntilNav2Active()
+        current_pose = wait_for_existing_localization(nav, tf_buffer, tracker, timeout_sec=8.0)
+        if current_pose is None:
+            print("[mission] current localization unavailable", flush=True)
+            rclpy.shutdown()
+            raise SystemExit(1)
 
     controller = SimplifiedPathNavigator(nav, tf_buffer, tracker)
     goal = make_pose(nav, gx, gy, gyaw)

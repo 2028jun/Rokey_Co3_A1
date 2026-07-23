@@ -13,6 +13,7 @@ from two_wheel_rails.nav_bootstrap import (
     prepare_navigator,
     publish_initial_pose,
     sync_spawn,
+    wait_for_existing_localization,
 )
 from two_wheel_rails.rail_geometry import load_routes
 from two_wheel_rails.rail_navigator import RailNavigator
@@ -34,9 +35,9 @@ def main() -> None:
         help="routes.yaml 키만 출력하고 종료",
     )
     parser.add_argument(
-        "--no-sync-spawn",
+        "--initialize-spawn",
         action="store_true",
-        help="미션 시작 시 텔레포트/AMCL 생략",
+        help="Run initial Isaac spawn teleport and AMCL initial pose reset (First run only)",
     )
     args = parser.parse_args()
 
@@ -52,14 +53,21 @@ def main() -> None:
     rclpy.init(args=sys.argv)
     nav, tf_buffer, tracker = prepare_navigator()
 
-    nav.initial_pose = make_pose(nav, sx, sy, syaw)
-    publish_initial_pose(nav, sx, sy, syaw, repeats=2)
-    if tracker.xy is not None:
-        nav.initial_pose_received = True
-    nav.waitUntilNav2Active()
-
-    if not args.no_sync_spawn:
+    if args.initialize_spawn:
+        print("[sync] Initializing spawn & AMCL pose via --initialize-spawn", flush=True)
+        nav.initial_pose = make_pose(nav, sx, sy, syaw)
+        publish_initial_pose(nav, sx, sy, syaw, repeats=2)
+        if tracker.xy is not None:
+            nav.initial_pose_received = True
+        nav.waitUntilNav2Active()
         if not sync_spawn(nav, tf_buffer, tracker, sx, sy, syaw):
+            rclpy.shutdown()
+            raise SystemExit(1)
+    else:
+        nav.waitUntilNav2Active()
+        current_pose = wait_for_existing_localization(nav, tf_buffer, tracker, timeout_sec=8.0)
+        if current_pose is None:
+            print("[mission] current localization unavailable", flush=True)
             rclpy.shutdown()
             raise SystemExit(1)
 

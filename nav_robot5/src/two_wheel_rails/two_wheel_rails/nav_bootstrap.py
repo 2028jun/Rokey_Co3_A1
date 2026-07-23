@@ -143,6 +143,23 @@ def resolve_map_xy(
     return xy if xy is not None else (tracker.xy if tracker else None)
 
 
+def wait_for_existing_localization(
+    nav: BasicNavigator,
+    tf_buffer: Buffer,
+    tracker: AmclPoseTracker,
+    timeout_sec: float = 8.0,
+) -> tuple[float, float, float] | None:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        rclpy.spin_once(nav, timeout_sec=0.1)
+        xy = resolve_map_xy(nav, tf_buffer, tracker)
+        yaw = resolve_map_yaw(nav, tf_buffer, tracker)
+        if xy is not None and yaw is not None:
+            print(f"[localization] using current pose ({xy[0]:.2f}, {xy[1]:.2f}, {math.degrees(yaw):.1f}deg)", flush=True)
+            return (xy[0], xy[1], yaw)
+    return None
+
+
 def wait_for_clock(nav: BasicNavigator, timeout_sec: float = 90.0) -> bool:
     received = {"ok": False}
 
