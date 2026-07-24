@@ -58,6 +58,20 @@ from isaacsim.core.utils.types import ArticulationAction
 from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics
 
 import hand_intrusion_test_actor as hand_test
+import actor_sdg_test_actor as actor_sdg
+
+# Pass 9 tried to make "actor_sdg" (a real omni.anim.people character
+# driving a typing/sit/push_button cycle -- see actor_sdg_test_actor.py)
+# the default, per the reviewer's call to discard the hand-authored
+# rigid-arm two-bone-IK mechanism from passes 5-8. That did not ship:
+# integrating actor_sdg into this specific restaurant+robot pipeline hit a
+# confirmed, reproducible omni.anim.graph.core registration failure (see
+# GPU_RUN_LOG.txt pass 9) that a spike on a bare stage never exercised.
+# "rigid_arm" -- the only mechanism that actually works end to end in this
+# pipeline right now -- stays the default until that's resolved.
+# "actor_sdg" remains available as an explicit opt-in for whoever picks up
+# that investigation; "legacy" is the pre-pass-5 whole-body-slide fallback.
+HAND_TEST_RIG_MODE = os.environ.get("HAND_TEST_RIG_MODE", "rigid_arm")
 
 
 WORKSPACE = Path(
@@ -668,6 +682,145 @@ def capture_pose_frames(stage, reach_animator):
     print(f"[capture] done, frames in {out_dir}", flush=True)
 
 
+def _find_hand_joint_world_positions(stage, skelroot_prim):
+    """Return {joint_name: world_position} for every joint in skelroot_prim's
+    skeleton whose name contains "hand" (case-insensitive), computed at the
+    current timeline time. Used to measure where the actor_sdg character's
+    hand actually is during a behavior state, the same kind of true-geometry
+    measurement pass 8 did for the old rig's glove mesh -- except here there
+    is no dedicated glove prim, so the skeleton joint itself is the anchor.
+    """
+    from pxr import UsdSkel
+
+    skel_binding = UsdSkel.BindingAPI(skelroot_prim)
+    skeleton_rel = skel_binding.GetSkeletonRel()
+    targets = skeleton_rel.GetTargets()
+    if not targets:
+        return {}
+    skeleton = UsdSkel.Skeleton(stage.GetPrimAtPath(targets[0]))
+    cache = UsdSkel.Cache()
+    skel_query = cache.GetSkelQuery(skeleton)
+    if not skel_query:
+        return {}
+    joint_order = skel_query.GetJointOrder()
+    time = Usd.TimeCode(omni.timeline.get_timeline_interface().get_current_time() * stage.GetTimeCodesPerSecond())
+    world_transforms = skel_query.ComputeJointWorldTransforms(time)
+    if world_transforms is None:
+        return {}
+    results = {}
+    for name, xform in zip(joint_order, world_transforms):
+        if "hand" in str(name).lower():
+            matrix = Gf.Matrix4d(xform)
+            results[str(name)] = matrix.ExtractTranslation()
+    return results
+
+
+def capture_actor_sdg_frames(stage, person_prim):
+    """Headless visual-QA capture for the actor_sdg_test_actor.py mechanism:
+    runs the real timeline (needed for omni.anim.people's BehaviorScript to
+    self-drive the character) for one full typing/sit/push_button/sit cycle,
+    saving table-camera frames periodically plus front/side/overhead frames
+    at start, and printing the behavior command queue and any "hand" joint
+    world positions (projected through the real table camera, matching pass
+    8's projection technique) at each checkpoint -- so goal 3's "does the
+    hand reach the ROI" question can be answered from real numbers instead
+    of guessing.
+    """
+    import time as _time
+
+    from omni.kit.viewport.utility import capture_viewport_to_file
+    from omni.kit.scripting.scripts.script_manager import ScriptManager
+
+    out_dir = Path(
+        os.environ.get("MOBILE_DEMO_CAPTURE_DIR", "/tmp/vision_test_actor_sdg_frames")
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    stand = Gf.Vec3d(actor_sdg.STAND_XY[0], actor_sdg.STAND_XY[1], 0.0)
+    aim = stand + Gf.Vec3d(0.0, 0.0, 1.0)
+    forward = Gf.Vec3d(-1.0, 1.0, 0.0)
+    forward = forward / forward.GetLength()
+    right = Gf.Vec3d(-forward[1], forward[0], 0.0)
+    cameras = {
+        "front": (stand + forward * 2.2 + Gf.Vec3d(0, 0, 1.5), aim, Gf.Vec3d(0, 0, 1)),
+        "side": (stand + right * 2.2 + Gf.Vec3d(0, 0, 1.5), aim, Gf.Vec3d(0, 0, 1)),
+        "overhead": (stand + Gf.Vec3d(0, 0, 3.0), aim, forward),
+    }
+    viewports = {}
+    for name, (eye, look_target, up) in cameras.items():
+        cam_path = f"/World/QACamera_{name}"
+        _define_lookat_camera(stage, cam_path, eye, look_target, up)
+        window = create_viewport_for_camera(f"QA_{name}", cam_path, width=1280, height=960)
+        viewports[name] = window.viewport_api
+    table_window = create_viewport_for_camera("QA_table", TABLE_CAMERA_PATH, width=1280, height=960)
+    viewports["table"] = table_window.viewport_api
+
+    table_cam_prim = stage.GetPrimAtPath(TABLE_CAMERA_PATH)
+    table_cam = UsdGeom.Camera(table_cam_prim)
+    xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+
+    def _project_to_normalized(world_point):
+        cam_to_world = xform_cache.GetLocalToWorldTransform(table_cam_prim)
+        world_to_cam = cam_to_world.GetInverse()
+        cam_space = world_to_cam.Transform(world_point)
+        focal = table_cam.GetFocalLengthAttr().Get()
+        h_ap = table_cam.GetHorizontalApertureAttr().Get()
+        v_ap = table_cam.GetVerticalApertureAttr().Get()
+        ndc_x = (focal / (h_ap / 2.0)) * (cam_space[0] / -cam_space[2])
+        ndc_y = (focal / (v_ap / 2.0)) * (cam_space[1] / -cam_space[2])
+        return ((ndc_x + 1.0) / 2.0, (1.0 - ndc_y) / 2.0)
+
+    def _render_settle(frames=15):
+        for _ in range(frames):
+            simulation_app.update()
+
+    def _capture(label, views):
+        for view_name in views:
+            path = out_dir / f"{label}_{view_name}.png"
+            capture_viewport_to_file(viewports[view_name], str(path))
+        _render_settle(5)
+        print(f"[capture] wrote {label} ({','.join(views)})", flush=True)
+        sm = ScriptManager.get_instance()
+        for scripts in sm._prim_to_scripts.values():
+            for _, inst in scripts.items():
+                print(
+                    f"[capture]   inst={inst} character={getattr(inst, 'character', 'NO_ATTR')} "
+                    f"commands={getattr(inst, 'commands', 'NO_ATTR')} "
+                    f"character_name={getattr(inst, 'character_name', 'NO_ATTR')} "
+                    f"command_path={getattr(inst, 'command_path', 'NO_ATTR')}",
+                    flush=True,
+                )
+        for prim in Usd.PrimRange(person_prim):
+            if prim.GetTypeName() == "SkelRoot":
+                hand_positions = _find_hand_joint_world_positions(stage, prim)
+                for joint_name, world_pos in hand_positions.items():
+                    norm = _project_to_normalized(world_pos)
+                    print(
+                        f"[capture]   joint '{joint_name}' world={tuple(world_pos)} "
+                        f"projects to normalized={tuple(round(v, 3) for v in norm)}",
+                        flush=True,
+                    )
+
+    _capture("start", ["front", "side", "overhead", "table"])
+
+    print("[capture] entering play...", flush=True)
+    omni.timeline.get_timeline_interface().play()
+    total_seconds = float(os.environ.get("MOBILE_DEMO_CAPTURE_SECONDS", "24"))
+    interval = 1.0
+    elapsed = 0.0
+    while elapsed < total_seconds:
+        simulation_app.update()
+        _time.sleep(1.0 / 30.0)
+        elapsed += 1.0 / 30.0
+        if elapsed >= interval:
+            _capture(f"t{int(interval):03d}", ["table"])
+            interval += 1.0
+
+    _capture("end", ["front", "side", "overhead", "table"])
+    omni.timeline.get_timeline_interface().stop()
+    print(f"[capture] done, frames in {out_dir}", flush=True)
+
+
 def find_articulation_root(stage):
     roots = [
         str(prim.GetPath())
@@ -897,6 +1050,7 @@ def run_stability_check(articulation, dof_names):
 
 
 def main():
+    hand_test_enabled = os.environ.get("MOBILE_DEMO_HAND_TEST", "1") == "1"
     enable_urdf_importer()
     import_robot_usd()
     stage = open_restaurant_and_reference_robot()
@@ -909,11 +1063,16 @@ def main():
     articulation_path = find_articulation_root(stage)
     add_parking_brake(stage, articulation_path)
     configure_physics_stability(stage, articulation_path)
+
+    reach_animator = None
+    person_prim = None
+    if hand_test_enabled and HAND_TEST_RIG_MODE not in ("rigid_arm", "legacy"):
+        person_prim = actor_sdg.spawn_and_configure_actor(stage)
+
     articulation, dof_names = initialize_robot(articulation_path)
     open_table_camera_preview()
 
-    reach_animator = None
-    if os.environ.get("MOBILE_DEMO_HAND_TEST", "1") == "1":
+    if hand_test_enabled and HAND_TEST_RIG_MODE in ("rigid_arm", "legacy"):
         person_prim = hand_test.spawn_seated_person(stage)
         reach_animator = hand_test.ReachAnimator(person_prim)
     if os.environ.get("MOBILE_DEMO_PRINT_BOUNDS", "0") == "1":
@@ -922,9 +1081,12 @@ def main():
     run_stability_check(articulation, dof_names)
 
     if os.environ.get("MOBILE_DEMO_CAPTURE_POSES", "0") == "1":
-        if reach_animator is None:
+        if person_prim is None:
             raise RuntimeError("MOBILE_DEMO_CAPTURE_POSES needs MOBILE_DEMO_HAND_TEST=1")
-        capture_pose_frames(stage, reach_animator)
+        if HAND_TEST_RIG_MODE in ("rigid_arm", "legacy"):
+            capture_pose_frames(stage, reach_animator)
+        else:
+            capture_actor_sdg_frames(stage, person_prim)
         simulation_app.close()
         return
 

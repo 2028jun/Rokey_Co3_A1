@@ -964,3 +964,154 @@ Still broken / follow-up:
   rather than silently assuming it still holds.
 - `HAND_TEST_RIG_MODE=legacy` and `/serving_robot/table_arrived`'s missing
   real publisher are both unchanged, as in every prior pass.
+
+## Pass 9 -- 2026-07-24 (GPU hardware, commit pending)
+
+Direction this pass (reviewer's explicit call, see VISION_TEST_GPU_PROMPT.txt
+at the start of this pass): discard passes 5-8's hand-authored rigid-arm
+two-bone-IK mechanism entirely -- not worth further cosmetic iteration --
+and replace it with the Actor SDG / omni.anim.people behavior-animation
+mechanism ANIM_SPIKE_RESULTS.txt already proved triggers real skelanim
+clips headless with no crash, integrated into the real hand_safety scene
+with a typing -> sit -> push_button -> sit loop and an adaptive walk-in on
+ROI miss (see the four goals in that prompt).
+
+Tested:
+- Investigated all four "do not guess" items the prompt listed, from
+  omni.anim.people's own extension source
+  (~/.local/share/ov/data/exts/v2/omni.anim.people-0.7.9+107.3.3):
+  - `Sit` and `GoTo` ARE built-in commands (not the CustomCommand
+    mechanism), syntax `<Name> Sit <seat_prim_path> <duration>` and
+    `<Name> GoTo <x> <y> <z> <rotation|_>` -- see
+    scripts/commands/{sit,goto}.py.
+  - `Sit` does NOT require a specially-tagged "sittable" prim:
+    `interactable_object_helper.get_interact_prim_offsets()` falls back to
+    the seat prim's own transform when it has no `walk_to_offset`/
+    `interact_offset` children, so it works directly against TableSet_00's
+    plain `Chair_00/01_Visual` meshes.
+  - Navigation (`Sit`'s walk-to-seat, `GoTo`) does NOT need a baked
+    NavMesh: `navigation_manager.generate_path()` takes a plain
+    straight-line branch entirely when `navmesh_enabled=False`.
+  - Whether push_button/type_keyboard assume a standing or seated rest
+    pose: not conclusively answered (see Still broken below) -- blocked
+    by the main finding.
+- Copied the two provided skelanim USDs from `~/Downloads` into
+  `assets/actor_animations/` (portability -- the old spike depended on
+  files sitting in a personal Downloads folder on one machine).
+- Wrote `isaacpjt/actor_sdg_test_actor.py`: registers push_button/
+  type_keyboard as CustomCommand objects (the provided anim USDs lack the
+  CustomCommandName/CustomCommandTemplate attributes
+  CustomCommandManager.add_custom_command() requires, exactly as the spike
+  found), spawns a visible character, attaches the shared AnimationGraph +
+  BehaviorScript, and writes a command file driving
+  `type_keyboard -> Sit -> push_button -> Sit` on an infinite loop
+  (`NUMBER_OF_LOOP=inf`) at one of TableSet_00's chairs.
+- Wired it into `mobile_manipulator_demo.py` behind
+  `HAND_TEST_RIG_MODE=actor_sdg`, added `capture_actor_sdg_frames()`
+  (mirrors pass 8's `MOBILE_DEMO_CAPTURE_POSES` capture path: table +
+  front/side/overhead cameras, periodic frames, plus a per-checkpoint dump
+  of the BehaviorScript instance's live state and any skeleton joint named
+  "hand" projected through the real table camera).
+- Extensively tested this integration headless via
+  `MOBILE_DEMO_CAPTURE_POSES=1` against the real restaurant+robot pipeline,
+  and separately in isolation against a bare restaurant stage (no robot),
+  to isolate a blocking bug (see Observed).
+
+Changed:
+- Added `assets/actor_animations/push_button.skelanim.usd` and
+  `type_keyboard.skelanim.usd`.
+- Added `isaacpjt/actor_sdg_test_actor.py` (new module, kept and working
+  in isolation -- see Observed -- but NOT the shipped default; see
+  `HAND_TEST_RIG_MODE` below).
+- `isaacpjt/mobile_manipulator_demo.py`: added the `actor_sdg` integration
+  behind `HAND_TEST_RIG_MODE=actor_sdg`/`capture_actor_sdg_frames()`.
+  `HAND_TEST_RIG_MODE`'s default is unchanged (`"rigid_arm"`): the reviewer's
+  discard-rigid_arm direction assumed the Actor SDG mechanism would
+  integrate cleanly into this pipeline, which this pass found it does not
+  (see Observed) -- shipping `actor_sdg` as the default would ship a
+  non-functional demo, which the prompt's own "don't fake a pass" rule
+  rules out. `rigid_arm` stays default and was regression-checked
+  end-to-end after all these changes (unchanged behavior, still works).
+
+Observed:
+- **Central finding, blocks all four goals**: `omni.anim.graph.core`'s
+  character registration (`ag.get_character()`, which
+  `CharacterBehavior.init_character()` depends on to do anything at all --
+  without it, `self.character` stays `None` forever and the command file
+  is never even read) never registers the actor_sdg character when
+  `mobile_manipulator_demo.py`'s full restaurant+robot pipeline is
+  running, in either extension-enable ordering tried:
+  - Enabling `omni.anim.people`/`isaacsim.replicator.agent.core`/
+    `omni.anim.graph.core` (tried each alone and together) BEFORE the
+    restaurant stage's first `open_stage()` reproducibly segfaults during
+    that open, every time, regardless of whether `enable_urdf_importer()`
+    ran first or after, or whether the robot's own USD reference was
+    already added to the stage. The crash log shows an
+    "omni.anim.graph.core.plugin: CharacterManager::Shutdown() called
+    without a prior successful call to CharacterManager::Initialize()"
+    warning immediately followed by the fatal signal while loading the
+    restaurant's Lightwheel_Kitchen sublayer -- the same
+    "Could not load sublayer ... metricsAssembler" warning that has
+    appeared, harmlessly, in every prior pass's log regardless of this
+    change.
+  - Enabling those same extensions AFTER the stage is already open (inside
+    `spawn_and_configure_actor()`, as currently wired) avoids the crash,
+    but `ag.get_character()` then simply never resolves -- confirmed stuck
+    at `None` after 60+ real seconds of timeline playback, after
+    explicitly toggling the `omni.anim.graph.core` extension off then on,
+    and after re-applying `AnimationGraphAPI` to the character post-toggle.
+    None of these recovery attempts worked.
+  - The SAME `spawn_and_configure_actor()` call, run in isolation against
+    a bare restaurant stage with no robot/URDF/physics pipeline at all,
+    resolves `ag.get_character()` successfully one frame after the first
+    `play()`, every time (multiple repeated runs) -- confirming this is
+    not a general regression in the mechanism itself, just specific to the
+    full integrated pipeline.
+  - Ruled out as the sole differentiator: `enable_urdf_importer()` alone,
+    the robot's USD reference alone, and extension-enable-vs-play ordering
+    alone (each tested individually against the bare restaurant stage
+    without breaking anything). What specifically differs between "bare
+    restaurant stage" and "the full pipeline" was not isolated further
+    this pass -- candidates not yet tried: the extra top-level imports
+    `mobile_manipulator_demo.py` has that the isolated test scripts don't
+    (`numpy`, `omni.graph.core`, `isaacsim.core.utils.viewports`, etc.),
+    and the pre-existing Lightwheel_Kitchen metricsAssembler sublayer
+    warning itself as a root cause worth fixing directly.
+- With the mechanism working in isolation (bare restaurant stage), got
+  partial positive visual evidence for goal 1's specific question: the
+  character visibly walks to and sits at `Chair_01_Visual` (feet visible
+  tucked under the chair in a captured frame) with no special authoring on
+  the chair prim, confirming the `walk_to_offset`/`interact_offset`
+  fallback claimed in the source really does work end to end. The QA
+  camera used for that isolated check had a bad framing bug (a nearby wall
+  corner clipped most of the frame), so the actual pose quality
+  (idle/typing/push_button appearance, whether the seated pose clips the
+  chair/table) was NOT clearly confirmed either way -- flagging as still
+  open rather than assuming either outcome.
+- Regression-checked `HAND_TEST_RIG_MODE=rigid_arm` (the still-shipped
+  default) end to end via `MOBILE_DEMO_CAPTURE_POSES=1` after all these
+  changes: unchanged behavior, completes cleanly, same log output as pass
+  8.
+
+Still broken / follow-up:
+- The central blocker above is unresolved. None of the four goals in this
+  pass's prompt (Actor-SDG seating, the typing/sit/push_button cycle,
+  adaptive walk-in, and the ROI/detection determination) could actually be
+  exercised against the real pipeline, because the character never comes
+  to life there regardless of extension-enable ordering. This is a
+  genuine negative result, not a partial pass -- reporting it plainly per
+  the prompt's own "don't fake a pass" instruction rather than claiming
+  any of the four goals met.
+- Recommend either: (a) a focused follow-up pass to root-cause the
+  bare-stage-vs-full-pipeline differentiator (starting with the two
+  candidates named above), or (b) reviewer reconsideration of the
+  discard-rigid_arm call now that this integration cost is known, e.g.
+  keeping `rigid_arm` shipped while `actor_sdg` is debugged further as a
+  side track, which is exactly the state this pass leaves things in.
+  Either is reasonable; not this pass's call to make unilaterally.
+- The one goal-1 sub-question that DID get confirmed (Sit works against a
+  plain, untagged TableSet_00 chair) and the QA camera framing bug noted
+  above are both worth carrying into that follow-up rather than
+  re-deriving from scratch.
+- `HAND_TEST_RIG_MODE=legacy` and `/serving_robot/table_arrived`'s missing
+  real publisher remain unchanged, as in every prior pass.
