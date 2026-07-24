@@ -1,6 +1,0 @@
-build/
-install/
-log/
-
-# Sync via tools/sync_restaurant_assets.sh (large CC BY-NC kitchen pack).
-assets/Lightwheel_Kitchen/Collected_KitchenRoom/
