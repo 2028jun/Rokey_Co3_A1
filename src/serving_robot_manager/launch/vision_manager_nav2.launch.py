@@ -66,6 +66,7 @@ def generate_launch_description():
                 executable="isaac_subsystem_adapter_node",
                 name="isaac_subsystem_adapter_node",
                 output="screen",
+                parameters=[{"use_sim_time": use_sim_time}],
             ),
             # 3. Navigation Subsystem Node interfacing Nav2 with Manager Node
             Node(
@@ -73,13 +74,23 @@ def generate_launch_description():
                 executable="navigation_subsystem",
                 name="navigation_subsystem",
                 output="screen",
+                parameters=[{"use_sim_time": use_sim_time}],
             ),
-            # 4. Serving Manager Node handling ordering state machine
+            # 4. Automatic Navigation Initializer Node
+            Node(
+                package="two_wheel_rails",
+                executable="navigation_auto_initializer",
+                name="navigation_auto_initializer",
+                output="screen",
+                parameters=[{"use_sim_time": use_sim_time}],
+            ),
+            # 5. Serving Manager Node handling ordering state machine
             Node(
                 package="serving_robot_manager",
                 executable="manager_node",
                 name="manager_node",
                 output="screen",
+                parameters=[{"use_sim_time": use_sim_time}],
             ),
             # 5. Hand Safety Detector Node
             Node(

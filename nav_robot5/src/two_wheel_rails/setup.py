@@ -34,6 +34,7 @@ setup(
             "topic_bridge = two_wheel_rails.topic_bridge:main",
             "navigation_subsystem = two_wheel_rails.navigation_subsystem_node:main",
             "navigation_initialize = two_wheel_rails.navigation_initialize:main",
+            "navigation_auto_initializer = two_wheel_rails.navigation_auto_initializer:main",
         ],
     },
 )
