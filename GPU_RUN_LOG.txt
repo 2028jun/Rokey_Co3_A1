@@ -1351,7 +1351,7 @@ Still broken / follow-up:
 - `HAND_TEST_RIG_MODE=legacy` and `/serving_robot/table_arrived`'s missing
   real publisher remain unchanged, as in every prior pass.
 
-## Pass 12 -- 2026-07-24 (GPU hardware, commit TBD)
+## Pass 12 -- 2026-07-24 (GPU hardware, commit d7241c6)
 
 Continuation of the same session, per user direction after pass 11: leave
 the sit/stand rotation bug (2) as documented and open, and investigate the
