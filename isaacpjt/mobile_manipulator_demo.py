@@ -726,12 +726,13 @@ def capture_actor_sdg_frames(stage, person_prim):
     """Headless visual-QA capture for the actor_sdg_test_actor.py mechanism:
     runs the real timeline (needed for omni.anim.people's BehaviorScript to
     self-drive the character) for one full typing/sit/push_button/sit cycle,
-    saving table-camera frames periodically plus front/side/overhead frames
-    at start, and printing the behavior command queue and any "hand" joint
-    world positions (projected through the real table camera, matching pass
-    8's projection technique) at each checkpoint -- so goal 3's "does the
-    hand reach the ROI" question can be answered from real numbers instead
-    of guessing.
+    saving frames from a camera that TRACKS the character's live position
+    (fixed cameras proved unreliable once the character starts walking --
+    see GPU_RUN_LOG.txt pass 10) plus the real table camera, and printing
+    the behavior command queue, the active command's own sub-state (e.g.
+    Sit's "walk"/"sit"/"stand" phase), the character's live world
+    position/rotation, and any "hand" joint world position (projected
+    through the real table camera) at each checkpoint.
     """
     import time as _time
 
@@ -743,28 +744,63 @@ def capture_actor_sdg_frames(stage, person_prim):
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    stand = Gf.Vec3d(actor_sdg.STAND_XY[0], actor_sdg.STAND_XY[1], 0.0)
-    aim = stand + Gf.Vec3d(0.0, 0.0, 1.0)
-    forward = Gf.Vec3d(-1.0, 1.0, 0.0)
-    forward = forward / forward.GetLength()
-    right = Gf.Vec3d(-forward[1], forward[0], 0.0)
-    cameras = {
-        "front": (stand + forward * 2.2 + Gf.Vec3d(0, 0, 1.5), aim, Gf.Vec3d(0, 0, 1)),
-        "side": (stand + right * 2.2 + Gf.Vec3d(0, 0, 1.5), aim, Gf.Vec3d(0, 0, 1)),
-        "overhead": (stand + Gf.Vec3d(0, 0, 3.0), aim, forward),
-    }
-    viewports = {}
-    for name, (eye, look_target, up) in cameras.items():
-        cam_path = f"/World/QACamera_{name}"
-        _define_lookat_camera(stage, cam_path, eye, look_target, up)
-        window = create_viewport_for_camera(f"QA_{name}", cam_path, width=1280, height=960)
-        viewports[name] = window.viewport_api
+    xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+
+    def _character_world_transform():
+        matrix = xform_cache.GetLocalToWorldTransform(person_prim)
+        return matrix.ExtractTranslation(), matrix.ExtractRotation()
+
+    def _ag_character_world_transform():
+        """The outer spawned Xform's own xformOp never moves during
+        walk/sit (confirmed by testing) -- Sit/GoTo move the character
+        through the ag.Character wrapper's own get_world_transform()/
+        set_world_transform(), exactly like Sit.setup()'s own
+        `Utils.get_character_pos(self.character)` call does, not a plain
+        USD Xform translate. Query that same way for a true reading.
+        """
+        import carb as _carb
+        import omni.anim.graph.core as ag
+
+        skelroot_path = None
+        for prim in Usd.PrimRange(person_prim):
+            if prim.GetTypeName() == "SkelRoot":
+                skelroot_path = str(prim.GetPath())
+                break
+        if skelroot_path is None:
+            return None
+        character = ag.get_character(skelroot_path)
+        if character is None:
+            return None
+        pos = _carb.Float3(0, 0, 0)
+        rot = _carb.Float4(0, 0, 0, 0)
+        character.get_world_transform(pos, rot)
+        return tuple(pos), tuple(rot)
+
+    tracking_cam_path = "/World/QACamera_tracking"
+    _define_lookat_camera(
+        stage, tracking_cam_path,
+        Gf.Vec3d(0, 0, 0) + Gf.Vec3d(2.0, -2.0, 1.6),
+        Gf.Vec3d(0, 0, 0.9),
+        Gf.Vec3d(0, 0, 1),
+    )
+    tracking_window = create_viewport_for_camera(
+        "QA_tracking", tracking_cam_path, width=1280, height=960
+    )
     table_window = create_viewport_for_camera("QA_table", TABLE_CAMERA_PATH, width=1280, height=960)
-    viewports["table"] = table_window.viewport_api
+    viewports = {"tracking": tracking_window.viewport_api, "table": table_window.viewport_api}
+
+    tracking_cam_prim = stage.GetPrimAtPath(tracking_cam_path)
+
+    def _update_tracking_camera():
+        ag_transform = _ag_character_world_transform()
+        char_pos = Gf.Vec3d(*ag_transform[0]) if ag_transform else Gf.Vec3d(*actor_sdg.STAND_XY, 0.0)
+        eye = char_pos + Gf.Vec3d(0.1, 0.1, 3.5)
+        target = char_pos + Gf.Vec3d(0, 0, 0.3)
+        cam_to_world = Gf.Matrix4d().SetLookAt(eye, target, Gf.Vec3d(0, 0, 1)).GetInverse()
+        UsdGeom.Xformable(tracking_cam_prim).MakeMatrixXform().Set(cam_to_world)
 
     table_cam_prim = stage.GetPrimAtPath(TABLE_CAMERA_PATH)
     table_cam = UsdGeom.Camera(table_cam_prim)
-    xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
 
     def _project_to_normalized(world_point):
         cam_to_world = xform_cache.GetLocalToWorldTransform(table_cam_prim)
@@ -781,20 +817,34 @@ def capture_actor_sdg_frames(stage, person_prim):
         for _ in range(frames):
             simulation_app.update()
 
-    def _capture(label, views):
-        for view_name in views:
+    def _capture(label):
+        actor_sdg._patch_sit_command_stand_rotation()
+        _update_tracking_camera()
+        _render_settle(3)
+        for view_name in ("tracking", "table"):
             path = out_dir / f"{label}_{view_name}.png"
             capture_viewport_to_file(viewports[view_name], str(path))
         _render_settle(5)
-        print(f"[capture] wrote {label} ({','.join(views)})", flush=True)
+
+        char_pos, char_rot = _character_world_transform()
+        ag_transform = _ag_character_world_transform()
+        print(
+            f"[capture] wrote {label} | outer Xform world pos={tuple(round(v, 3) for v in char_pos)} "
+            f"rot_axis={tuple(round(v, 3) for v in char_rot.GetAxis())} "
+            f"rot_angle={round(char_rot.GetAngle(), 2)} | "
+            f"ag.Character world pos={tuple(round(v, 3) for v in ag_transform[0]) if ag_transform else None} "
+            f"rot={ag_transform[1] if ag_transform else None}",
+            flush=True,
+        )
+
         sm = ScriptManager.get_instance()
         for scripts in sm._prim_to_scripts.values():
             for _, inst in scripts.items():
+                cur_cmd = getattr(inst, "current_command", "NO_ATTR")
+                sub_state = getattr(cur_cmd, "current_action", None)
                 print(
-                    f"[capture]   inst={inst} character={getattr(inst, 'character', 'NO_ATTR')} "
-                    f"commands={getattr(inst, 'commands', 'NO_ATTR')} "
-                    f"character_name={getattr(inst, 'character_name', 'NO_ATTR')} "
-                    f"command_path={getattr(inst, 'command_path', 'NO_ATTR')}",
+                    f"[capture]   commands={getattr(inst, 'commands', 'NO_ATTR')} "
+                    f"current_command={cur_cmd} sub_state={sub_state!r}",
                     flush=True,
                 )
         for prim in Usd.PrimRange(person_prim):
@@ -808,22 +858,81 @@ def capture_actor_sdg_frames(stage, person_prim):
                         flush=True,
                     )
 
-    _capture("start", ["front", "side", "overhead", "table"])
+    chair_prim = stage.GetPrimAtPath(actor_sdg.CHAIR_PRIM_PATH)
+    if chair_prim.IsValid():
+        matrix = xform_cache.GetLocalToWorldTransform(chair_prim)
+        print(
+            f"[capture][chair] {actor_sdg.CHAIR_PRIM_PATH} "
+            f"world pos={tuple(round(v, 3) for v in matrix.ExtractTranslation())} "
+            f"rot_axis={tuple(round(v, 3) for v in matrix.ExtractRotation().GetAxis())} "
+            f"rot_angle={round(matrix.ExtractRotation().GetAngle(), 2)}",
+            flush=True,
+            )
+
+    _capture("start")
+
+    # Watchdog: confirmed by testing (GPU_RUN_LOG.txt pass 11) that the
+    # character's world ROTATION drifts off pure-Z-yaw during some (not
+    # all) Sit "stand" transitions -- specifically the 2nd sit in a
+    # type_keyboard->Sit->push_button->Sit loop, reproduced identically
+    # even with two different Sit.update() patch strategies and with 2x
+    # the settle time, proving it's the AnimationGraph's own per-frame
+    # evaluation overriding rotation, not anything Sit's Python wrapper
+    # sets. Since that's vendored/non-repo, correct it here instead:
+    # every frame, if rotation has drifted off pure Z, snap it back
+    # (preserving current yaw) via the same ag.Character world-transform
+    # API Sit itself uses -- this runs after the graph's own evaluation
+    # for the frame, so it can override what the graph just computed.
+    # NOT a clean fix: confirmed by testing this does hold rotation
+    # upright, but the character's Z position sinks noticeably (down to
+    # ~-0.19) instead, presumably because stomping rotation every frame
+    # fights whatever foot-planting/height logic the graph ties to the
+    # same transform. Left here, opt-in via MOBILE_DEMO_UPRIGHT_WATCHDOG=1,
+    # for further investigation -- disabled by default.
+    import carb as _carb
+    import omni.anim.graph.core as _ag
+
+    _watchdog_skelroot_path = None
+    for _prim in Usd.PrimRange(person_prim):
+        if _prim.GetTypeName() == "SkelRoot":
+            _watchdog_skelroot_path = str(_prim.GetPath())
+            break
+
+    def _enforce_upright_rotation():
+        if _watchdog_skelroot_path is None:
+            return
+        character = _ag.get_character(_watchdog_skelroot_path)
+        if character is None:
+            return
+        pos = _carb.Float3(0, 0, 0)
+        rot = _carb.Float4(0, 0, 0, 0)
+        character.get_world_transform(pos, rot)
+        if abs(rot[0]) < 1e-4 and abs(rot[1]) < 1e-4:
+            return
+        z, w = rot[2], rot[3]
+        mag = (z * z + w * w) ** 0.5
+        if mag < 1e-6:
+            return
+        upright_rot = _carb.Float4(0.0, 0.0, z / mag, w / mag)
+        character.set_world_transform(pos, upright_rot)
 
     print("[capture] entering play...", flush=True)
     omni.timeline.get_timeline_interface().play()
     total_seconds = float(os.environ.get("MOBILE_DEMO_CAPTURE_SECONDS", "24"))
-    interval = 1.0
+    interval = float(os.environ.get("MOBILE_DEMO_CAPTURE_INTERVAL", "1.0"))
+    next_capture = interval
     elapsed = 0.0
     while elapsed < total_seconds:
         simulation_app.update()
+        if os.environ.get("MOBILE_DEMO_UPRIGHT_WATCHDOG", "0") == "1":
+            _enforce_upright_rotation()
         _time.sleep(1.0 / 30.0)
         elapsed += 1.0 / 30.0
-        if elapsed >= interval:
-            _capture(f"t{int(interval):03d}", ["table"])
-            interval += 1.0
+        if elapsed >= next_capture:
+            _capture(f"t{elapsed:05.1f}")
+            next_capture += interval
 
-    _capture("end", ["front", "side", "overhead", "table"])
+    _capture("end")
     omni.timeline.get_timeline_interface().stop()
     print(f"[capture] done, frames in {out_dir}", flush=True)
 

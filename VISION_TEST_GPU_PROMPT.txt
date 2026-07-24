@@ -1,4 +1,4 @@
-# Vision-test GPU prompt: confirm actor_sdg pose quality, then finish the loop
+# Vision-test GPU prompt: fix the actor_sdg sit/stand rotation bug, then finish the loop
 
 Paste this entire document into a coding-agent session on the GPU machine.
 Target: Isaac Sim 5.1.0-rc.19, ROS 2 Humble, RTX 5080, branch `vision-test`,
@@ -15,74 +15,116 @@ output, and finish per "Finishing" below.
 
 - `git status`, then `git fetch origin` and `git pull --ff-only origin
   vision-test`. Never discard existing work with reset/checkout/clean.
-- Read `AGENTS.md`, `GPU_RUN_LOG.txt` (all passes, especially 9 and 10),
-  `ANIM_SPIKE_RESULTS.txt`, `isaacpjt/actor_sdg_test_actor.py`, and
+- Read `AGENTS.md`, `GPU_RUN_LOG.txt` (all passes, especially 9, 10, and
+  11), `ANIM_SPIKE_RESULTS.txt`, `isaacpjt/actor_sdg_test_actor.py`, and
   `isaacpjt/mobile_manipulator_demo.py`'s `main()`, `capture_actor_sdg_
   frames()`, and `enable_extensions()` docstring completely before changing
   anything. Confirm for yourself that `HAND_TEST_RIG_MODE` still defaults
   to `"rigid_arm"` -- pass 10 fixed the registration blocker that made
-  `actor_sdg` non-functional, but deliberately did not flip the default
-  because visual pose quality still isn't confirmed (see below). If that
-  has changed by the time you read this, the direction below still
-  applies, just adjust the starting point accordingly.
+  `actor_sdg` non-functional, but pass 11 found (not fixed) a real
+  rotation-drift bug in the sit/stand cycle, so the default has still not
+  been flipped. If that has changed by the time you read this, the
+  direction below still applies, just adjust the starting point
+  accordingly.
 
 ## Current state (do not re-litigate)
 
 Passes 9-10 replaced `hand_intrusion_test_actor.py`'s rigid-arm two-bone-IK
 mechanism with a real `omni.anim.people` character (a
-typing -> sit -> push_button -> sit loop at a `TableSet_00` chair), per the
-reviewer's call to discard rigid-arm. As of pass 10:
+typing -> sit -> push_button -> sit loop at a `TableSet_00` chair). Pass 11
+investigated the user's own GUI testing report of two problems: the
+character not visibly sitting, and it ending up lying on the floor after
+sitting.
 
-- The mechanism WORKS end to end in the real restaurant+robot pipeline:
-  `ag.get_character()` registers the character reliably (confirmed over
-  35-42 second runs, zero crashes), and the real `CharacterBehavior`
-  command queue executes and loops (`type_keyboard -> Sit -> push_button ->
-  Sit -> GoTo`, then repeats via `NUMBER_OF_LOOP=inf`) -- confirmed by
-  reading the live instance's own `.commands` list at each checkpoint, not
-  assumed.
-- The fix was a settle gap: `enable_extensions()` must be called, then
-  several `simulation_app.update()` calls must run, THEN the stage opens.
-  Getting either half of that wrong breaks it (segfault if the gap is
-  missing, or -- pass 9's original mistake -- permanent silent
-  registration failure if the extensions are enabled after the stage is
-  already open). See `enable_extensions()`'s docstring for the full
-  account.
-- Visual pose quality is NOT yet confirmed. Pass 10's own ad hoc QA
-  cameras (fixed at the character's spawn point) became unreliable once
-  the character moved -- wall clipping, chair occlusion, and one
-  overhead frame at a loop restart that looked like a flattened/collapsed
-  silhouette but could just as easily be a foreshortened top-down view of
-  a normal forward-lean typing pose. Not distinguishable from what pass 10
-  captured.
-- Pass 10 also found a concrete, likely-related lead: the framework's own
-  auto-appended loop-closing `GoTo` command's rotation (read back via
-  `Utils.convert_to_angle()`) came out to roughly -90 degrees although
-  `actor_sdg_test_actor.STAND_YAW_DEGREES` is 0 -- a real yaw-convention
-  mismatch, not confirmed as the cause of the pose-quality question above
-  but the most likely lead.
+- The mechanism WORKS end to end mechanically: `ag.get_character()`
+  registers reliably, the command queue executes and loops correctly, and
+  the character's real position (read via `ag.Character.get_world_
+  transform()`, NOT the outer spawned Xform's own `xformOp:translate`,
+  which never changes and is a red herring) walks to and settles exactly
+  at the chair's own position with the correct facing rotation. The
+  "doesn't look like it sits" complaint is NOT a positional bug.
+- **There is a real, confirmed, NOT-yet-fixed rotation-drift bug**: on the
+  SECOND `Sit` command in the `type_keyboard -> Sit -> push_button -> Sit
+  -> GoTo` loop (not the first), the character's world rotation tips off
+  pure-Z-yaw during the "stand" sub-phase (quaternion x growing to roughly
+  -0.19), visibly and numerically confirmed, making the character appear
+  to collapse/lie on the floor. The first sit-then-stand cycle in the loop
+  is clean; only the second is affected.
+- **Ruled out** (each confirmed by a real test, not assumed): `Sit.update()`
+  re-reading live rotation every frame during "stand" instead of a frozen
+  value (fixed via a monkey-patch, verified internally to actually hold
+  the freeze -- no change to the external symptom); the frozen rotation
+  being captured from a transient mid-turn snapshot instead of the stable
+  chair-geometry-derived `self.interact_rot` (tried, no change); and
+  insufficient settle time between the two `Sit` commands (doubled
+  `SIT_DURATION_SECONDS` from 3.0 to 6.0, no change). All three produced
+  byte-for-byte identical drift, proving the drift is NOT controlled by
+  `Sit.update()`'s Python-level `set_world_transform()` calls at all --
+  something inside `omni.anim.people`'s AnimationGraph itself is
+  re-deriving/overriding rotation on the second sit-cycle specifically.
+- A monkey-patched `_patch_sit_command_stand_rotation()` now correctly
+  patches the REAL `Sit` class Kit actually uses at runtime (previously it
+  silently patched the wrong class -- Kit's extension loader imports
+  `omni.anim.people.scripts.commands.sit` under a mangled, install-path-
+  specific module name, different from what a normal top-level import
+  resolves to; the fix scans `sys.modules` for every module ending in
+  `commands.sit`). This patch is real, correct, and worth keeping, but by
+  itself does not fix the observed drift -- see above.
+- A per-frame "snap rotation to pure Z" watchdog
+  (`_enforce_upright_rotation()` in `mobile_manipulator_demo.py`, gated
+  off by default via `MOBILE_DEMO_UPRIGHT_WATCHDOG=1`) DOES hold rotation
+  upright, but introduces a different defect instead: the character's Z
+  position sinks to around -0.19 m (into the floor) during the same
+  window. Not a working fix as-is.
 
 ## Required work
 
-1. **Build a QA camera that tracks the character**, not a fixed point.
-   Query the character prim's live world position/orientation each
-   capture (the same way `_find_hand_joint_world_positions()` already
-   queries skeleton joints) and aim the camera at that, with enough
-   standoff distance to avoid wall/furniture clipping regardless of where
-   in the restaurant the character currently is. Verify this camera itself
-   works by capturing the character clearly at several different points in
-   the cycle before trusting it for anything else.
-2. **Investigate the ~90 degree yaw mismatch** pass 10 found. Determine
-   whether it's a real bug (fix it -- likely means adjusting
-   `STAND_YAW_DEGREES` to compensate for the character asset's actual
-   skeleton-forward axis, or finding the correct way to read/set this
-   character's orientation) or a red herring, with evidence either way.
-3. **Confirm pose quality by eye** with the fixed camera: rest, typing,
-   sitting, and push_button should all look like a natural person, not a
-   T-pose, not collapsed/clipping into the floor or furniture, through at
-   least one full loop (type -> sit -> push -> sit -> repeat).
-4. **Only after 1-3 hold**, flip `HAND_TEST_RIG_MODE`'s default from
+1. **Find and fix the actual root cause of the second-cycle rotation
+   drift.** Leads worth checking, in rough priority order: (a) whether
+   `InteractableObjectHelper.add_owner()`/`remove_owner()` re-acquiring
+   the SAME chair prim a second time in one loop leaves stale ownership
+   state that affects the animation graph's blend; (b) whether the
+   `omni.anim.people` "Action" variable or some other animation-graph
+   variable has residual state from the first sit-stand cycle that
+   isn't fully reset before the second `Sit` command starts (e.g. try
+   explicitly setting `Action` to some neutral/idle value with a real
+   gap, or querying whatever state/variable introspection
+   `omni.anim.graph.core`/`omni.anim.people` exposes, right before the
+   second `Sit` begins, and compare it against the first cycle's state at
+   the equivalent point); (c) if the underlying default biped character
+   asset's AnimationGraph genuinely has a defect that can't be worked
+   around from Python, consider whether the demo needs two `Sit` calls at
+   the same chair per loop at all, or whether one sit (or alternating
+   between two different chairs) sidesteps the bug entirely -- if so,
+   propose and implement that restructuring, with evidence that it's
+   clean.
+2. **If pursuing the watchdog approach further**, it must also correct
+   the Z-sink side effect (e.g. hold Z at a known-good value using the
+   same style of correction used for rotation), not just rotation, before
+   it counts as a fix. Don't ship a "upright but sinking into the floor"
+   result as done.
+3. **Confirm pose quality by eye** with the existing character-tracking
+   camera (`_update_tracking_camera()`, already built and confirmed
+   working in pass 11): rest, typing, sitting, and push_button should all
+   look like a natural person, not a T-pose, not collapsed/clipping into
+   the floor or furniture, through at least two full sit-then-stand
+   cycles (the first alone is not sufficient -- the bug is specifically
+   on the second).
+4. **Re-confirm complaint (1)** ("doesn't look like it sits") by eye once
+   (2)/(3) above are genuinely fixed -- pass 11's position data says it's
+   very likely not a separate bug, just masked by the rotation drift, but
+   don't assume that without looking.
+5. **Only after 1-4 hold**, flip `HAND_TEST_RIG_MODE`'s default from
    `"rigid_arm"` to `"actor_sdg"` in `mobile_manipulator_demo.py`.
-5. **Adaptive walk-in (goal 3 from pass 9's original scope).** Project the
+6. **Confirm hand detection during typing (the user's complaint 3,
+   untouched so far).** Run the real four-terminal `hand_safety` workflow
+   (per `hand_safety/README.md`) with the actor_sdg character typing, and
+   determine via `/hand_detection/image` and `/hand_detection/detections`/
+   `/hand_safety/roi_intrusion` whether the hand is actually detected by
+   YOLO during `type_keyboard`. Report a genuine positive or negative
+   result with evidence (annotated frames, topic echoes) -- do not assume
+   detection works without checking.
+7. **Adaptive walk-in (goal 3 from pass 9's original scope).** Project the
    real hand/glove skeleton joint's world position through the table
    camera's intrinsics/extrinsics (`_find_hand_joint_world_positions()` +
    `_project_to_normalized()` already exist for this in
@@ -93,14 +135,6 @@ reviewer's call to discard rigid-arm. As of pass 10:
    `HAND_TEST_WALK_IN_X`/`HAND_TEST_WALK_IN_Y` mechanism (already wired,
    never yet exercised with real measurements) to insert a `GoTo` before
    that behavior. Show the before/after projected numbers.
-6. **Determine and report which is true, with real evidence (goal 4):**
-   either (a) `hand_safety`'s YOLO-based detector correctly reports the
-   hand whenever it's genuinely inside the ROI, confirmed by annotated
-   frames plus `/hand_safety/roi_intrusion: true` pulses lined up with the
-   right behavior states; or (b) the hand is geometrically inside the ROI
-   but `hand_safety` does not report it -- say so plainly with the
-   frame(s)/topic echo proving the geometric overlap and the absence of a
-   detection. Do not assume (a) without checking.
 
 ## Iterate until it actually meets the criteria
 
@@ -111,11 +145,12 @@ executes without error.
 
 Never paper over a real defect to make it look finished: don't flip
 `HAND_TEST_RIG_MODE`'s default without actually confirming pose quality by
-eye, don't lower YOLO confidence or move/shrink the ROI without a measured,
-camera-projected reason, and don't claim a criterion is met without an
-actual rendered frame or real topic echo proving it. Goal 4 explicitly
-allows -- requires -- reporting a genuine negative result if that's what
-you find; do not convert it into a false pass.
+eye across at least two sit-cycles, don't claim the rotation bug is fixed
+just because one experiment happened not to trigger it, and don't claim a
+criterion is met without an actual rendered frame or real topic echo
+proving it. Item 6 explicitly allows -- requires -- reporting a genuine
+negative result if that's what you find; do not convert it into a false
+pass.
 
 ## Finishing (required every time, no exceptions)
 

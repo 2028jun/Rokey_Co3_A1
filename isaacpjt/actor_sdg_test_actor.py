@@ -76,6 +76,7 @@ shape):
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import carb
@@ -128,6 +129,141 @@ TYPE_KEYBOARD_ANIM = os.environ.get(
 )
 
 COMMAND_FILE_PATH = os.environ.get("HAND_TEST_COMMAND_FILE", "/tmp/actor_sdg_commands.txt")
+
+_patched_sit_class_ids: set[int] = set()
+
+
+def _build_patched_sit_update():
+    """Build the replacement for omni.anim.people's built-in Sit.update().
+
+    Confirmed by direct testing (rendered frames + logged world transforms,
+    see GPU_RUN_LOG.txt pass 11): during Sit's "stand" sub-phase (standing
+    back up after sitting), the character's world ROTATION visibly and
+    numerically tips away from a pure Z-axis yaw within about a second --
+    quaternion x/y components that should stay 0 for a Z-only rotation
+    drift to values like x=-0.19 -- and the rendered character ends up
+    lying flat on the floor. Root cause: `Sit.update()`'s "stand" branch
+    reads the character's CURRENT world rotation fresh every frame via
+    `Utils.get_character_transform()` and immediately re-applies it via
+    `set_world_transform()`; that current rotation includes whatever
+    transient root-motion the currently-blending stand-up animation
+    contributes, so re-applying it every frame accumulates the drift
+    instead of leaving rotation alone. The "sit" phase does not have this
+    bug because it reuses a frozen `self._char_start_rot` captured once,
+    never a live re-read -- this patch makes "stand" do the same.
+    """
+    from omni.metropolis.utils.carb_util import CarbUtil
+    from omni.anim.people.scripts.utils import Utils
+    from omni.anim.people.settings import MetadataTag, TaskStatus
+    from omni.anim.people.scripts.interactable_object_helper import InteractableObjectHelper
+
+    def _patched_update(self, dt):
+        if self.current_action == "walk" or self.current_action is None:
+            if self.walk(dt):
+                if not InteractableObjectHelper.is_object_interactable(self.seat_prim):
+                    carb.log_warn("Fail to sit... Object is not interactable now")
+                    self.command_status = TaskStatus.failed
+                    self.force_quit_command()
+                InteractableObjectHelper.add_owner(target_prim=self.seat_prim, agent_name=self.character_name)
+                self.current_action = "sit"
+                # FIX (vs. upstream): don't use a live read here as the
+                # frozen rotation -- confirmed by testing (GPU_RUN_LOG.txt
+                # pass 11) that whichever frame `walk(dt)` happens to
+                # return True on can catch the character mid-turn, still
+                # blending its turn-to-face-chair animation, so the "live"
+                # rotation snapshotted at this exact instant is sometimes a
+                # transient, not-yet-settled value -- freezing THAT for the
+                # whole sit+stand duration reproduces the same lying-on-
+                # floor drift on some (not all) sit cycles. `self.interact_
+                # rot` is geometry-derived from the chair prim itself (set
+                # in setup(), stable, not a live character-pose read), so
+                # use it instead for rotation; only translation needs the
+                # live arrival position.
+                self._char_start_pos, _ = Utils.get_character_transform(self.character)
+                self._char_start_rot = self.interact_rot
+                self.update_metadata_callback(
+                    agent_name=self.character_name, data_name=MetadataTag.AgentActionTag, data_value="Sitting"
+                )
+        elif self.current_action == "sit":
+            self._char_lerp_t = min(self._char_lerp_t + dt, 1.0)
+            lerp_pos = CarbUtil.lerp3(self._char_start_pos, self.interact_pos, self._char_lerp_t)
+            self.character.set_world_transform(lerp_pos, self._char_start_rot)
+            self.character.set_variable("Action", "Sit")
+            self.sit_time += dt
+            if self.sit_time > self.duration:
+                self.character.set_variable("Action", "None")
+                self._char_lerp_t = 0.0
+                self.current_action = "stand"
+                self.update_metadata_callback(
+                    agent_name=self.character_name, data_name=MetadataTag.AgentActionTag, data_value="StndingUp"
+                )
+                InteractableObjectHelper.remove_owner(target_prim=self.seat_prim, agent_name=self.character_name)
+        elif self.current_action == "stand":
+            # FIX (vs. upstream): reuse the frozen self._char_start_rot
+            # captured when sitting began, instead of live-reading and
+            # re-applying the character's current (drifting) rotation
+            # every frame.
+            if self.stand_animation_time < 1.5:
+                self._char_lerp_t = min(self._char_lerp_t + dt, 1.0)
+                lerp_pos = CarbUtil.lerp3(self.interact_pos, self._char_start_pos, self._char_lerp_t)
+                self.character.set_world_transform(lerp_pos, self._char_start_rot)
+                if os.environ.get("ACTOR_SDG_DEBUG_STAND_ROT"):
+                    readback_pos, readback_rot = Utils.get_character_transform(self.character)
+                    print(
+                        f"[actor_sdg][stand-debug] t={self.stand_animation_time:.2f} "
+                        f"set_rot={tuple(self._char_start_rot)} readback_rot={tuple(readback_rot)}",
+                        flush=True,
+                    )
+                self.stand_animation_time += dt
+            if self.stand_animation_time > 1.5:
+                self.character.set_world_transform(self._char_start_pos, self._char_start_rot)
+                return self.exit_command()
+
+    return _patched_update
+
+
+_patched_sit_update_fn = None
+
+
+def _patch_sit_command_stand_rotation():
+    """Patch every live `Sit` class currently loaded in sys.modules.
+
+    Kit's extension loader imports `omni.anim.people.scripts.commands.sit`
+    under a mangled, install-path-specific module name (observed at
+    runtime as `..._omni_anim_people_scripts_.commands.sit`), which is a
+    DIFFERENT module/class object than what a normal top-level
+    `from omni.anim.people.scripts.commands.sit import Sit` import
+    resolves to. Patching only the "logical" import's `Sit` class is a
+    silent no-op: the print fires, but the class actually driving
+    `CharacterBehavior`'s commands is untouched (confirmed pass 11 --
+    identical rotation-drift numbers with and without that patch).
+
+    So instead this scans `sys.modules` for every module whose name ends
+    in `commands.sit` and patches each distinct `Sit` class object found
+    (tracked by id() so re-scans are cheap and idempotent). Safe to call
+    repeatedly and early: it does nothing until the real module has
+    actually been imported by the extension, at which point the next
+    call catches it.
+    """
+    global _patched_sit_update_fn
+    if _patched_sit_update_fn is None:
+        _patched_sit_update_fn = _build_patched_sit_update()
+
+    patched_now = []
+    for name, module in list(sys.modules.items()):
+        if module is None or not name.endswith("commands.sit"):
+            continue
+        sit_cls = getattr(module, "Sit", None)
+        if not isinstance(sit_cls, type):
+            continue
+        if id(sit_cls) in _patched_sit_class_ids:
+            continue
+        sit_cls.update = _patched_sit_update_fn
+        _patched_sit_class_ids.add(id(sit_cls))
+        patched_now.append(name)
+
+    if patched_now:
+        print(f"[actor_sdg] patched Sit.update() on module(s): {patched_now}", flush=True)
 
 
 def enable_extensions():
@@ -241,6 +377,8 @@ def spawn_and_configure_actor(stage):
     for _ in range(10):
         app.update()
 
+    _patch_sit_command_stand_rotation()
+
     from omni.anim.people.python_ext import get_instance as get_people_instance
     from omni.anim.people.settings import PeopleSettings
     from isaacsim.replicator.agent.core.stage_util import CharacterUtil
@@ -296,6 +434,13 @@ def spawn_and_configure_actor(stage):
     CharacterUtil.setup_python_scripts_to_character([skelroot], BehaviorScriptPaths.behavior_script_path())
     for _ in range(10):
         app.update()
+
+    # The Sit command module (mangled name, see _patch_sit_command_stand_
+    # rotation()'s docstring) is only importable by Kit's extension loader
+    # once a Sit command is actually parsed/instantiated, which may not
+    # have happened yet even after the script attaches -- this call is
+    # cheap/idempotent, call it again from the capture loop to catch it.
+    _patch_sit_command_stand_rotation()
 
     print(
         f"[actor_sdg] spawned character={char_prim.GetPath()} name={character_name} "

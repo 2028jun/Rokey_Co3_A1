@@ -1218,3 +1218,135 @@ Still broken / follow-up:
   the ROI).
 - `HAND_TEST_RIG_MODE=legacy` and `/serving_robot/table_arrived`'s missing
   real publisher remain unchanged, as in every prior pass.
+
+## Pass 11 -- 2026-07-24 (GPU hardware, commit TBD)
+
+Prompted by the user testing pass 10's mechanism via the GUI themselves and
+reporting three concrete problems: (1) the character doesn't look like it
+sits on the chair, (2) after sitting it ends up lying on the floor -- looks
+like a rotation-axis issue -- likely caused by the sit behavior, (3) wants
+to confirm the hand is actually detected by the vision pipeline during
+typing. This pass investigated (1) and (2) only; (3) is untouched.
+
+Tested:
+- Built a camera-tracking + `ag.Character` transform diagnostic in
+  `capture_actor_sdg_frames()` that reads the character's live
+  `ag.get_character(skelroot_path).get_world_transform()` every checkpoint
+  (the same call `Sit`/`Utils.get_character_transform()` use internally),
+  distinct from the outer spawned Xform's own `xformOp:translate` (which
+  never changes -- confirmed it stays frozen at spawn position the entire
+  run, which is a red herring, not evidence the character isn't moving).
+- Confirmed via that diagnostic that complaint (1) is NOT a positional
+  bug: the character's real position walks from spawn to the chair and
+  settles exactly at the chair's own world position with correct pure-Z
+  180 degree rotation matching the chair -- it does reach and use the
+  chair correctly. The "doesn't look like it sits" impression is most
+  likely a visual side effect of (2) below, not a separate defect.
+- Root-caused (2) to `omni.anim.people`'s vendored `Sit.update()`: its
+  "stand" sub-phase reads the character's live world rotation every frame
+  via `Utils.get_character_transform()` and re-applies it via
+  `set_world_transform()`, unlike "sit" which reuses a rotation frozen
+  once at sit-start. Wrote a monkey-patch replacing `Sit.update` to freeze
+  rotation the same way "stand" does. First verification run showed the
+  patch's own print firing but the rotation numbers were byte-for-byte
+  identical to the unpatched run -- dug further and found Kit's extension
+  loader imports `omni.anim.people.scripts.commands.sit` under a mangled,
+  install-path-specific module name (e.g. `..._omni_anim_people_scripts_
+  .commands.sit`), a genuinely different module/class object than what
+  `from omni.anim.people.scripts.commands.sit import Sit` resolves to at
+  the top level -- the original patch silently patched the wrong class.
+  Fixed by scanning `sys.modules` for every module ending in
+  `commands.sit` and patching each distinct `Sit` class found (tracked by
+  `id()`, re-scanned periodically from the capture loop since the mangled
+  module isn't importable until the extension actually parses a `Sit`
+  command). Confirmed via an env-gated debug print
+  (`ACTOR_SDG_DEBUG_STAND_ROT=1`) inside the patched "stand" branch that,
+  once the correct class is patched, the frozen rotation reads back
+  identical to what was set on every one of 100+ frames across the first
+  sit-stand cycle -- the freeze genuinely holds internally.
+- Despite that, the EXTERNALLY observed rotation (polled independently
+  from `capture_actor_sdg_frames()`, one full simulated frame later) still
+  showed the same drift (quaternion x growing to roughly -0.19) on the
+  SECOND sit-then-stand cycle in the `type_keyboard -> Sit -> push_button
+  -> Sit -> GoTo` loop, while the first cycle stayed clean -- reproduced
+  identically whether the frozen rotation came from a live snapshot at the
+  walk-to-sit transition or from `self.interact_rot` (a stable,
+  chair-geometry-derived value from `setup()`, immune to catching the
+  character mid-turn), and reproduced identically again after doubling
+  `SIT_DURATION_SECONDS` (3.0 to 6.0) to rule out insufficient settle time
+  between the two `Sit` commands. All three experiments produced the same
+  drift on the same (second) cycle with the same magnitude. Conclusion,
+  confirmed by elimination: this specific rotation drift is NOT something
+  `Sit.update()`'s Python-level `set_world_transform()` calls control at
+  all -- the default biped's AnimationGraph itself re-derives/overrides
+  rotation from something else (most likely genuine, and apparently
+  state-dependent, root motion in the graph's own internal state
+  transition) on the second sit-cycle specifically, independent of
+  whatever the Sit command's Python wrapper sets.
+- Tried one workaround outside `Sit.update()`: a per-frame watchdog in
+  `capture_actor_sdg_frames()`'s main loop that reads the character's live
+  rotation after each `simulation_app.update()` and, if it's drifted off
+  pure Z, snaps it back (preserving current yaw) via the same
+  `ag.Character.set_world_transform()` API. This DOES hold the rotation
+  upright (x/y quaternion components stayed under 1e-3 the whole run,
+  versus -0.19+ without it) but introduced a different, equally bad
+  visual defect: the character's Z position sinks steadily to around
+  -0.19 m (into the floor) during the same window instead of tipping
+  over -- confirmed by comparing the same run with and without the
+  watchdog. Left in the code, gated behind `MOBILE_DEMO_UPRIGHT_WATCHDOG`
+  (default `"0"`, i.e. off), for whoever picks this up next; it is not a
+  working fix as-is.
+- Fixed one unrelated latent bug found along the way:
+  `capture_actor_sdg_frames()`'s final checkpoint called
+  `_capture("end", ["front", "side", "overhead", "table"])` against a
+  `_capture(label)` that only takes one argument, throwing `TypeError` at
+  the very end of every run (after all useful mid-run data had already
+  been captured, so it didn't invalidate prior passes' findings, but it
+  did mean no run ever exited cleanly). Fixed the call to match the
+  actual signature.
+
+Changed:
+- `isaacpjt/actor_sdg_test_actor.py`: replaced the single-shot, wrong-class
+  `_patch_sit_command_stand_rotation()` with a `sys.modules`-scanning
+  version (`_build_patched_sit_update()` + a rescan-safe
+  `_patch_sit_command_stand_rotation()` tracking patched classes by
+  `id()`) that finds and patches Kit's real mangled-module `Sit` class,
+  not just the top-level-importable one. The patched "stand" branch now
+  reuses `self._char_start_rot` instead of live-rereading, and captures
+  that value from `self.interact_rot` (chair-geometry-derived) instead of
+  a live snapshot at the walk-to-sit transition. Added an env-gated
+  (`ACTOR_SDG_DEBUG_STAND_ROT=1`) per-frame debug print in the "stand"
+  branch for verifying the freeze actually holds.
+- `isaacpjt/mobile_manipulator_demo.py`: `_capture()` now re-calls
+  `actor_sdg._patch_sit_command_stand_rotation()` every checkpoint so the
+  mangled module gets patched as soon as it's actually loaded. Added the
+  (default-off) `_enforce_upright_rotation()` watchdog and its call site
+  in the main capture loop, gated by `MOBILE_DEMO_UPRIGHT_WATCHDOG`. Fixed
+  the `_capture("end", [...])` two-argument call site.
+- `HAND_TEST_RIG_MODE`'s default is UNCHANGED (`"rigid_arm"`) -- pose
+  quality is confirmed WORSE than "not yet confirmed": it is now known to
+  be actively broken (rotation drift) on every second sit in the loop.
+
+Still broken / follow-up:
+- **Complaint (2) is not fixed.** The rotation drift on the second
+  sit-then-stand cycle is confirmed to live inside `omni.anim.people`'s
+  default biped AnimationGraph itself (or its interaction with this
+  specific two-sit command sequence), not in anything this repo's Python
+  wrapper controls. Next steps for whoever continues: (a) investigate
+  whether the drift is tied to `InteractableObjectHelper.add_owner`/
+  `remove_owner` re-acquiring the same chair prim twice in one loop, or to
+  residual "Action" variable/blend-tree state not fully resetting between
+  the two `Sit` command instances; (b) if a real fix isn't found,
+  consider whether the demo actually needs two sits at the same chair
+  per loop, or whether restructuring to one sit (or two different chairs)
+  sidesteps the bug entirely; (c) if pursuing the watchdog approach
+  further, it needs to also correct the Z-sink side effect (e.g. hold Z at
+  a known-good value the same way X/Y rotation is held), not just
+  rotation.
+- Complaint (1) ("doesn't sit") is very likely NOT a separate bug --
+  position/reach is confirmed correct -- but should be re-confirmed by eye
+  once (2) is actually fixed, since the visual symptom currently masks it.
+- Complaint (3) (confirm hand detection via the real `hand_safety`
+  pipeline during typing) is untouched this pass.
+- `HAND_TEST_RIG_MODE=legacy` and `/serving_robot/table_arrived`'s missing
+  real publisher remain unchanged, as in every prior pass.
