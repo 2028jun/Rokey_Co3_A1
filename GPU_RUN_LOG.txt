@@ -1115,3 +1115,106 @@ Still broken / follow-up:
   re-deriving from scratch.
 - `HAND_TEST_RIG_MODE=legacy` and `/serving_robot/table_arrived`'s missing
   real publisher remain unchanged, as in every prior pass.
+
+## Pass 10 -- 2026-07-24 (GPU hardware, commit pending)
+
+Direct continuation of pass 9 in the same session, prompted by the user
+asking why the mechanism that worked in the ANIM_SPIKE_PROMPT.txt spike
+didn't work once integrated. Re-examining that question found the actual
+fix pass 9 missed.
+
+Tested:
+- Compared pass 9's crash-reproducing code against every prior *working*
+  test (the spike, and pass 9's own bare-restaurant-stage isolation test)
+  line by line. The one structural difference: every working test enabled
+  the extensions and then pumped several `simulation_app.update()` calls
+  before opening/transitioning the stage; pass 9's integrated-pipeline
+  attempts enabled the extensions and opened the stage back-to-back with
+  no gap.
+- Added that pump gap (~30 updates) to `mobile_manipulator_demo.py`'s
+  `main()`, gated the same way pass 9's attempt was (before
+  `enable_urdf_importer()`/`open_restaurant_and_reference_robot()`, only
+  when `HAND_TEST_RIG_MODE` is not `rigid_arm`/`legacy`), and re-ran the
+  full restaurant+robot pipeline headlessly via
+  `MOBILE_DEMO_CAPTURE_POSES=1` with `HAND_TEST_RIG_MODE=actor_sdg`.
+- Ran two further headless captures (35 s and 42 s of real playback) to
+  confirm the fix holds over a full cycle and a loop restart, not just the
+  first few frames.
+- Regression-checked `HAND_TEST_RIG_MODE=rigid_arm` (still the default)
+  end to end after all changes.
+
+Changed:
+- `isaacpjt/mobile_manipulator_demo.py`: `main()` now calls
+  `actor_sdg.enable_extensions()` followed by ~30 `simulation_app.update()`
+  calls, before `enable_urdf_importer()`/opening the restaurant stage, when
+  `HAND_TEST_RIG_MODE` selects `actor_sdg`. This replaces pass 9's
+  early-enable attempt (which had no pump gap and crashed) and its
+  fallback (enabling late inside `spawn_and_configure_actor()`, safe but
+  broken).
+- `isaacpjt/actor_sdg_test_actor.py`: rewrote `enable_extensions()`'s and
+  the module's docstrings with the corrected root cause and fix (the pump
+  gap), superseding pass 9's "this may be a genuine engine limitation"
+  framing -- it wasn't; pass 9 just hadn't isolated the pump-gap variable.
+- `HAND_TEST_RIG_MODE`'s default is UNCHANGED (`"rigid_arm"`) -- see Still
+  broken below for why this pass didn't flip it despite fixing the
+  blocker.
+
+Observed:
+- **The registration blocker is fixed.** Across two independent runs (35 s
+  and 42 s of real headless playback), `ag.get_character()` returned a
+  real `Character` object (never `None`) from the very first checkpoint
+  onward, with zero crashes and zero dropped registrations.
+- **The behavior cycle genuinely executes and loops in the real pipeline.**
+  Grepping the live `CharacterBehavior` instance's own `.commands` queue at
+  each checkpoint shows it shrinking in the expected order --
+  `type_keyboard` popped, then `Sit`, then `push_button`, then `Sit`, then
+  the framework's own auto-appended loop-closing `GoTo` -- and then
+  refilling with the full 5-command list again, confirming
+  `NUMBER_OF_LOOP=inf` genuinely loops the cycle rather than running once.
+  This is goal 2 (cyclic behavior loop) essentially confirmed at the
+  command-execution level.
+- **Visual pose quality is still NOT confirmed either way.** This pass's
+  own ad hoc QA cameras (front/side/overhead, aimed at a fixed `STAND_XY`
+  point) produced one clearly good frame (the character standing normally
+  at the start of the very first `type_keyboard`) but became unreliable
+  afterward: a wall corner clips most of the "side" camera's frame, the
+  "table" camera's fixed real-world angle mostly shows the character
+  occluded behind a chair, and an overhead frame captured right at a loop
+  restart shows a flattened, spread-out silhouette that could either be a
+  genuine bad pose (character on the ground) or just a foreshortened
+  top-down view of a person leaning forward to type -- not distinguishable
+  from the captures gathered this pass.
+- **Found a real, separate, smaller issue while investigating the above:**
+  the framework's auto-appended loop-closing `GoTo` command's target
+  rotation (read back via `Utils.convert_to_angle()` from the character's
+  own transform right after spawn) came out to approximately -90 degrees,
+  not the ~0 degrees `actor_sdg_test_actor.STAND_YAW_DEGREES` was set to.
+  This is a real rotation-convention mismatch (likely the character
+  asset's skeleton bind pose faces a different local axis than the USD
+  prim's own yaw=0 convention assumes) that could plausibly explain an odd
+  pose right at the loop boundary, though this pass did not confirm the
+  causal link -- flagged as the most likely lead for the pose-quality
+  question above, not confirmed as the actual cause.
+
+Still broken / follow-up:
+- `HAND_TEST_RIG_MODE`'s default was deliberately left at `rigid_arm`
+  despite fixing the registration blocker: the prompt's own acceptance
+  criteria are judged "by eye on rendered frames... not by code executing
+  without error," and this pass cannot yet honestly claim the visual pose
+  quality is acceptable -- only that the mechanism runs. Flipping the
+  default is the very next step once pose quality is actually confirmed,
+  not before.
+- Next concrete steps, in order: (1) build a QA camera that reliably
+  frames the character regardless of where it walks (not fixed at
+  `STAND_XY` -- track the character's live position each capture); (2)
+  investigate and likely fix the ~90 degree yaw mismatch noted above,
+  either by adjusting `STAND_YAW_DEGREES` to compensate or by
+  understanding the actual convention difference; (3) with a trustworthy
+  camera, confirm rest/typing/sit/push_button poses all look natural
+  through at least one full loop; (4) only then attempt goal 3 (adaptive
+  walk-in measured via the real table camera's projection, exactly as pass
+  8 did for the old rig) and goal 4 (live four-terminal hardware
+  confirmation of `hand_safety` detecting the hand when it's genuinely in
+  the ROI).
+- `HAND_TEST_RIG_MODE=legacy` and `/serving_robot/table_arrived`'s missing
+  real publisher remain unchanged, as in every prior pass.

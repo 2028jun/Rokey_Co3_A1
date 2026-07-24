@@ -63,14 +63,21 @@ import actor_sdg_test_actor as actor_sdg
 # Pass 9 tried to make "actor_sdg" (a real omni.anim.people character
 # driving a typing/sit/push_button cycle -- see actor_sdg_test_actor.py)
 # the default, per the reviewer's call to discard the hand-authored
-# rigid-arm two-bone-IK mechanism from passes 5-8. That did not ship:
-# integrating actor_sdg into this specific restaurant+robot pipeline hit a
-# confirmed, reproducible omni.anim.graph.core registration failure (see
-# GPU_RUN_LOG.txt pass 9) that a spike on a bare stage never exercised.
-# "rigid_arm" -- the only mechanism that actually works end to end in this
-# pipeline right now -- stays the default until that's resolved.
-# "actor_sdg" remains available as an explicit opt-in for whoever picks up
-# that investigation; "legacy" is the pre-pass-5 whole-body-slide fallback.
+# rigid-arm two-bone-IK mechanism from passes 5-8. Pass 9 hit a reproducible
+# omni.anim.graph.core registration failure integrating it into this
+# restaurant+robot pipeline; pass 10 root-caused and fixed that (a missing
+# settle gap between enabling the extensions and opening the stage -- see
+# the comment in main() and enable_extensions()'s docstring) and confirmed
+# the full cycle now registers, executes, and loops correctly via real
+# command-queue logs. What pass 10 could NOT yet confirm is visual pose
+# quality (its own ad hoc QA cameras were unreliable -- wall clipping,
+# occlusion -- and a real ~90 degree yaw convention mismatch was found
+# between the spawned character's orientation and what
+# Utils.convert_to_angle() reads back for the loop-closing GoTo). Until
+# that's confirmed by eye, "rigid_arm" -- proven end to end -- stays the
+# default; "actor_sdg" is a real, working-mechanically opt-in for whoever
+# finishes that visual confirmation next. "legacy" is the pre-pass-5
+# whole-body-slide fallback.
 HAND_TEST_RIG_MODE = os.environ.get("HAND_TEST_RIG_MODE", "rigid_arm")
 
 
@@ -1051,6 +1058,21 @@ def run_stability_check(articulation, dof_names):
 
 def main():
     hand_test_enabled = os.environ.get("MOBILE_DEMO_HAND_TEST", "1") == "1"
+    if hand_test_enabled and HAND_TEST_RIG_MODE not in ("rigid_arm", "legacy"):
+        # Must run BEFORE the restaurant stage is opened below, AND must be
+        # followed by several simulation_app.update() calls before that
+        # open happens -- confirmed by testing (see actor_sdg_test_actor.
+        # enable_extensions()'s docstring): enabling these extensions and
+        # opening the stage back-to-back with no settle gap reproducibly
+        # segfaults during that open (omni.anim.graph.core's
+        # CharacterManager gets torn down mid-startup by the stage
+        # transition). Pumping ~30 frames here lets the extensions'
+        # startup fully complete first, after which the same stage open is
+        # clean and ag.get_character() registers the character normally
+        # once it's spawned.
+        actor_sdg.enable_extensions()
+        for _ in range(30):
+            simulation_app.update()
     enable_urdf_importer()
     import_robot_usd()
     stage = open_restaurant_and_reference_robot()

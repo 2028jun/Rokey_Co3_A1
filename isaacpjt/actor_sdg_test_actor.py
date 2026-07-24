@@ -1,18 +1,25 @@
 """Actor SDG / omni.anim.people replacement for the hand-authored
 rigid-arm two-bone-IK mechanism in hand_intrusion_test_actor.py.
 
-STATUS (pass 9, see GPU_RUN_LOG.txt): NOT currently shipped as the default
-(HAND_TEST_RIG_MODE stays "rigid_arm" in mobile_manipulator_demo.py).
-This module works correctly when driven in isolation on a bare restaurant
-stage (confirmed by rendering: the character walks to and sits at a real
-TableSet_00 chair, stands, and plays push_button/type_keyboard, looping).
-It does NOT currently work when wired into mobile_manipulator_demo.py's
-full restaurant+robot pipeline: `ag.get_character()` (which
-CharacterBehavior.init_character() depends on to do anything at all) never
-registers the character there, for reasons isolated but not resolved this
-pass -- see enable_extensions()'s docstring for the full account. Kept and
-gated behind HAND_TEST_RIG_MODE=actor_sdg as a real, working starting point
-for whoever picks up that investigation next, not as dead code.
+STATUS (pass 10, see GPU_RUN_LOG.txt): mechanically working, NOT yet the
+default (HAND_TEST_RIG_MODE stays "rigid_arm" in mobile_manipulator_demo.py).
+Pass 9 found `ag.get_character()` (which CharacterBehavior.init_character()
+depends on to do anything at all) never registered the character inside
+mobile_manipulator_demo.py's full restaurant+robot pipeline, though the
+identical setup worked on a bare restaurant stage. Pass 10 root-caused and
+fixed that -- see enable_extensions()'s docstring -- and confirmed via real
+command-queue logs that the full type_keyboard -> Sit -> push_button -> Sit
+cycle now registers, executes, and loops correctly (NUMBER_OF_LOOP=inf)
+inside the real pipeline, across 40+ second runs with zero crashes and zero
+registration failures. What pass 10 could NOT yet confirm is visual pose
+quality there: its own ad hoc QA cameras were unreliable (wall clipping,
+chair occlusion), and it found a real ~90 degree yaw convention mismatch
+between the character's spawned orientation and what
+`Utils.convert_to_angle()` reads back for the automatic loop-closing `GoTo`
+(see `STAND_YAW_DEGREES`). Until pose quality is confirmed by eye with a
+working camera, `HAND_TEST_RIG_MODE` stays "rigid_arm"; this module is a
+real, mechanically-working opt-in (`HAND_TEST_RIG_MODE=actor_sdg`) for
+whoever finishes that confirmation next, not dead code.
 
 Passes 5-8 built a custom static two-bone IK rig to make a hand reach a
 fixed table target. The reviewer's explicit call (see GPU_RUN_LOG.txt pass
@@ -126,40 +133,37 @@ COMMAND_FILE_PATH = os.environ.get("HAND_TEST_COMMAND_FILE", "/tmp/actor_sdg_com
 def enable_extensions():
     """Enable omni.anim.people/isaacsim.replicator.agent.core.
 
-    Must be called after the target stage is already open, not before --
-    confirmed by repeated testing in mobile_manipulator_demo.py's
-    restaurant+robot pipeline specifically: enabling any anim.graph.core-
-    derived extension (tried omni.anim.people, isaacsim.replicator.agent.
-    core, and omni.anim.graph.core alone, in every ordering relative to
-    enable_urdf_importer()) BEFORE that stage's first open reproducibly
-    segfaults during the open -- observed right after an
-    "omni.anim.graph.core.plugin: CharacterManager::Shutdown() called
-    without a prior successful call to CharacterManager::Initialize()"
-    warning, immediately followed by the crash while loading the
-    restaurant's Lightwheel_Kitchen sublayer (a pre-existing, unrelated
-    "Could not load sublayer ... metricsAssembler" warning that appears in
-    every pass's log regardless of this module -- worth investigating
-    directly as a possible root cause, not yet done).
+    Call this BEFORE the target stage is opened, and pump several
+    simulation_app.update() calls before opening it (mobile_manipulator_
+    demo.py's main() does ~30) -- both parts of this ordering matter, and
+    getting either wrong breaks `ag.get_character()` (what
+    CharacterBehavior.init_character() depends on to do anything at all)
+    for the rest of the session:
 
-    Enabling after the stage is open avoids that crash, but does not fully
-    fix the underlying problem: `ag.get_character()` (what
-    CharacterBehavior.init_character() depends on to do anything) still
-    never registers the character in THIS SPECIFIC integrated pipeline --
-    confirmed stuck at None even after 60+ real seconds of playback, after
-    toggling the omni.anim.graph.core extension off/on, and after
-    re-applying AnimationGraphAPI post-toggle. None of these symptoms
-    reproduce on a bare restaurant stage with no robot: there, the
-    identical spawn_and_configure_actor() call resolves ag.get_character()
-    within 1 frame of the first play(). The actual differentiator between
-    "bare restaurant stage" (works) and "mobile_manipulator_demo.py's full
-    pipeline" (crashes if enabled early, silently never registers if
-    enabled late) was not isolated this pass -- ruled out so far: extension
-    enable ordering relative to enable_urdf_importer()/import_robot_usd(),
-    the robot's own USD reference being present, and timeline stop()/play()
-    transition timing. Suspects not yet tried: the specific extra Python
-    imports mobile_manipulator_demo.py has at module load time (numpy,
-    omni.graph.core, isaacsim.core.utils.viewports, etc.), and the
-    Lightwheel_Kitchen metricsAssembler warning noted above.
+    - Enabling these extensions and opening the stage back-to-back with no
+      settle gap reproducibly segfaults during that open (pass 9's
+      finding), observed right after an "omni.anim.graph.core.plugin:
+      CharacterManager::Shutdown() called without a prior successful call
+      to CharacterManager::Initialize()" warning -- the extensions'
+      startup (which happens lazily, visible as "[ext: omni.anim.graph.
+      core-...] startup" appearing several frames after
+      set_extension_enabled_immediate() returns) was still in progress
+      when the stage transition fired, and the stage-close notification
+      reached a CharacterManager that hadn't finished initializing yet.
+    - Enabling them AFTER the stage is already open avoids the crash but
+      leaves `ag.get_character()` stuck at None forever, confirmed even
+      after 60+ real seconds, toggling the extension off/on, and
+      re-applying AnimationGraphAPI post-toggle (pass 9's other finding).
+    - Pass 10 found the actual fix: enable before opening (like pass 9
+      tried), but pump ~30 simulation_app.update() calls first so the
+      extensions' own startup fully completes before the stage transition
+      happens. With that gap, the same stage open is clean (no crash) and
+      `ag.get_character()` registers the character normally once it's
+      spawned -- confirmed across multiple 35-42 second runs with zero
+      crashes and the full command queue (type_keyboard -> Sit ->
+      push_button -> Sit -> GoTo, looping via NUMBER_OF_LOOP=inf) executing
+      and cycling correctly, read directly from the live BehaviorScript
+      instance.
     """
     ext_manager = omni.kit.app.get_app().get_extension_manager()
     for ext in ("omni.anim.people", "isaacsim.replicator.agent.core"):
