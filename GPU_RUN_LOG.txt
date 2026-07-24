@@ -1116,7 +1116,7 @@ Still broken / follow-up:
 - `HAND_TEST_RIG_MODE=legacy` and `/serving_robot/table_arrived`'s missing
   real publisher remain unchanged, as in every prior pass.
 
-## Pass 10 -- 2026-07-24 (GPU hardware, commit pending)
+## Pass 10 -- 2026-07-24 (GPU hardware, commit 1802dd2)
 
 Direct continuation of pass 9 in the same session, prompted by the user
 asking why the mechanism that worked in the ANIM_SPIKE_PROMPT.txt spike
