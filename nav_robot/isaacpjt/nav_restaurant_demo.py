@@ -1143,6 +1143,12 @@ class NavBridge(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
         )
+        transient_local_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
         sensor_qos = QoSProfile(
             depth=5,
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -1166,13 +1172,13 @@ class NavBridge(Node):
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
 
         # Subsystems Services & Publishers for Manager Node
-        self.spawn_status_pub = self.create_publisher(Int32, "/food_spawn/status", qos)
-        self.arm_status_pub = self.create_publisher(Int32, "/arm/status", qos)
+        self.spawn_status_pub = self.create_publisher(Int32, "/food_spawn/status", transient_local_qos)
+        self.arm_status_pub = self.create_publisher(Int32, "/arm/status", transient_local_qos)
         self.navigation_status_pub = self.create_publisher(
-            Int32, "/navigation/status", qos
+            Int32, "/navigation/status", transient_local_qos
         )
         self.navigation_location_pub = self.create_publisher(
-            Int32, "/navigation/current_location", qos
+            Int32, "/navigation/current_location", transient_local_qos
         )
 
         # Standard Int32 topic subscribers for Isaac Sim food spawning & arm serving
@@ -2315,16 +2321,23 @@ class NavBridge(Node):
                     dish_prim = self.stage.GetPrimAtPath("/World/ServingDish")
                     if dish_prim.IsValid():
                         dish_body = UsdPhysics.RigidBodyAPI.Get(self.stage, dish_prim.GetPath())
-                        if dish_body:
-                            dish_body.GetKinematicEnabledAttr().Set(False)
-                            self.get_logger().info(
-                                "[FoodSpawn] Enabled dynamic physics for pizza dish"
-                            )
-            except Exception as exc:
-                self.get_logger().error(f"Food spawn execution error: {exc}")
-                self.spawn_status_pub.publish(Int32(data=3))
-            else:
+                # Verify required prims exist on Stage for requested items
+                missing_prims = []
+                if pizza_requested and not self.stage.GetPrimAtPath("/World/ServingDish").IsValid():
+                    missing_prims.append("/World/ServingDish")
+                if drink_count and not self.stage.GetPrimAtPath("/World/ServingDrinks").IsValid():
+                    missing_prims.append("/World/ServingDrinks")
+                if cutlery_requested and not self.stage.GetPrimAtPath("/World/ServingCutlery").IsValid():
+                    missing_prims.append("/World/ServingCutlery")
+
+                if missing_prims:
+                    raise RuntimeError(f"Food spawn missing required prims on Stage: {missing_prims}")
+
+                self.get_logger().info(f"[FoodSpawn] Successfully spawned and verified food prims for command={spawn_command}")
                 self.spawn_status_pub.publish(Int32(data=2))  # 2 = COMPLETED
+            except Exception as exc:
+                self.get_logger().exception(f"Food spawn execution error for command={pending_spawn}: {exc}")
+                self.spawn_status_pub.publish(Int32(data=3))  # 3 = FAILED
 
         with self._lock:
             arm_command = self._pending_arm_command

@@ -608,9 +608,11 @@ class ManagerNode(Node):
     # 자율주행 상태 처리
     # ------------------------------------------------------------------
     def _on_nav_status(self, msg):
+        prev_status = getattr(self, "_nav_status", None)
         self._nav_status = msg.data
-        status_name = {1: "MOVING", 2: "ARRIVED", 3: "FAILED"}.get(msg.data, str(msg.data))
-        self.get_logger().info(f'📥 [수신/RECV Topic] /navigation/status = {msg.data} ({status_name})')
+        if prev_status != msg.data:
+            status_name = {1: "MOVING", 2: "ARRIVED", 3: "FAILED"}.get(msg.data, str(msg.data))
+            self.get_logger().info(f'📥 [수신/RECV Topic] /navigation/status = {msg.data} ({status_name})')
         if self._nav_status == NAV_STATUS_MOVING:
             if self._state in (_State.RETURNING_TO_KITCHEN, _State.MOVING_TO_TABLE):
                 if not self._nav_moving_confirmed:
@@ -628,9 +630,11 @@ class ManagerNode(Node):
         self._check_kitchen_arrival()
 
     def _on_nav_location(self, msg):
+        prev_location = getattr(self, "_nav_location", None)
         self._nav_location = msg.data
-        loc_name = "주방" if msg.data == 4 else f"테이블 {msg.data}"
-        self.get_logger().info(f'📥 [수신/RECV Topic] /navigation/current_location = {msg.data} ({loc_name})')
+        if prev_location != msg.data:
+            loc_name = "주방" if msg.data == 4 else f"테이블 {msg.data}"
+            self.get_logger().info(f'📥 [수신/RECV Topic] /navigation/current_location = {msg.data} ({loc_name})')
         self._check_table_arrival()
         self._check_kitchen_arrival()
 
