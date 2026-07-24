@@ -16,7 +16,7 @@ from rclpy.qos import (
 )
 from nav_msgs.msg import Odometry
 from rosgraph_msgs.msg import Clock
-from std_msgs.msg import String, Bool, Int32
+from std_msgs.msg import String, Bool, Int32, Empty
 from std_srvs.srv import Trigger, SetBool
 
 try:
@@ -149,6 +149,11 @@ class HMIBridgeNode(Node):
         self.manager_reset_client = self.create_client(Trigger, '/manager/reset_fault')
         self.hand_test_client = self.create_client(SetBool, '/hand_test/set_visible')
         self.obstacle_test_client = self.create_client(SetBool, '/obstacle_test/set_visible')
+        self.typing_trigger_pub = self.create_publisher(
+            Empty,
+            '/hand_test/type_keyboard',
+            10,
+        )
         if ORDER_REQUEST_SRV_AVAILABLE:
             self.manager_order_client = self.create_client(OrderRequest, '/manager/order')
             self.get_logger().info("Manager /manager/order Service Client created.")
@@ -179,6 +184,12 @@ class HMIBridgeNode(Node):
         req.data = visible
         self.obstacle_test_client.call_async(req)
         return True, f"corridor person spawn visible={visible} request queued"
+
+    def trigger_typing_animation(self):
+        if not hasattr(self, 'typing_trigger_pub'):
+            return False, "typing_trigger_pub not initialized"
+        self.typing_trigger_pub.publish(Empty())
+        return True, "typing animation trigger published"
 
     def table_camera_callback(self, msg):
         try:
@@ -694,10 +705,21 @@ async def websocket_endpoint(websocket: WebSocket):
                     if ros_node:
                         ros_node.publish_estop(stop_flag)
 
+                elif msg_type == "TRIGGER_TYPING":
+                    if ros_node:
+                        sent, msg = ros_node.trigger_typing_animation()
+                        print(f"[HMI Backend] TRIGGER TYPING: {msg}", flush=True)
+
                 elif msg_type == "SET_HAND_TEST_VISIBLE":
+                    # Legacy compat: hand-only USD test is retired. visible=True
+                    # now triggers the typing animation; visible=False is a
+                    # no-op since there is no hand-only prim left to remove.
                     visible = bool(data.get("visible", False))
                     if ros_node:
-                        sent, msg = ros_node.set_hand_test_visible(visible)
+                        if visible:
+                            sent, msg = ros_node.trigger_typing_animation()
+                        else:
+                            sent, msg = True, "hand remove is obsolete; no action required"
                         print(f"[HMI Backend] SET HAND TEST VISIBLE ({visible}): {msg}", flush=True)
 
                 elif msg_type == "SET_OBSTACLE_TEST_VISIBLE":
@@ -758,7 +780,10 @@ async def get_index():
     if web_ui_dir:
         index_file = os.path.join(web_ui_dir, "index.html")
         if os.path.exists(index_file):
-            return FileResponse(index_file)
+            return FileResponse(
+                index_file,
+                headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+            )
     return {"error": "HMI Frontend index.html not found", "searched_paths": candidate_paths}
 
 @app.get("/css/{file_name}")

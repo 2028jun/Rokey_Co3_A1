@@ -3192,39 +3192,28 @@ def main():
                     crossing_person
                 )
             )
+            # HMI's legacy "person spawn/remove" test controls now drive the
+            # walking CrossingPedestrian instead of the retired corridor
+            # test actor.
+            bridge.set_obstacle_test_controller(crossing_pedestrian_controller)
+            print(
+                "[crossing_pedestrian] enabled service-controlled visibility: "
+                "/obstacle_test/set_visible",
+                flush=True,
+            )
         except Exception as exc:
             print(
                 f"[crossing_pedestrian] actor setup warning: {exc}",
                 flush=True,
             )
 
-    reach_animator = None
-    if os.environ.get("MOBILE_DEMO_HAND_TEST", "0") == "1":
-        try:
-            import hand_intrusion_test_actor as hand_test
-            reach_animator = hand_test.HandSpawnAnimator(stage)
-            bridge.set_hand_test_controller(reach_animator)
-            print(
-                "[hand_test] enabled service-controlled hand-only test: "
-                "/hand_test/set_visible",
-                flush=True,
-            )
-        except Exception as exc:
-            print(f"[hand_test] actor setup warning: {exc}", flush=True)
-
-    obstacle_person_controller = None
-    if os.environ.get("MOBILE_DEMO_OBSTACLE_TEST", "0") == "1":
-        try:
-            import corridor_obstacle_test_actor as obstacle_test
-            obstacle_person_controller = obstacle_test.CorridorPersonSpawnController(stage)
-            bridge.set_obstacle_test_controller(obstacle_person_controller)
-            print(
-                "[obstacle_test] enabled service-controlled corridor person test: "
-                "/obstacle_test/set_visible",
-                flush=True,
-            )
-        except Exception as exc:
-            print(f"[obstacle_test] actor setup warning: {exc}", flush=True)
+    # The simple hand-only intrusion actor and the corridor obstacle test
+    # actor are retired from the default run path.  HMI's "hand" test button
+    # now triggers TypingTopicController via /hand_test/type_keyboard, and
+    # the "person" test button drives crossing_pedestrian_controller above.
+    # The legacy /hand_test/set_visible and /obstacle_test/set_visible
+    # services stay registered on NavBridge for compatibility; without a
+    # controller attached, /hand_test/set_visible simply reports "not ready".
 
     try:
         while simulation_app.is_running():
@@ -3234,16 +3223,6 @@ def main():
             # tick() was publishing navigation completion, corrupting native
             # rclpy/Fast DDS state and terminating with "stack smashing".
             executor.spin_once(timeout_sec=0.0)
-            if reach_animator is not None:
-                try:
-                    reach_animator.update()
-                except Exception:
-                    pass
-            if obstacle_person_controller is not None:
-                try:
-                    obstacle_person_controller.update()
-                except Exception:
-                    pass
             if typing_customer_controller is not None:
                 try:
                     typing_customer_controller.update()

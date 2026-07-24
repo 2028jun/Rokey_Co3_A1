@@ -362,19 +362,18 @@ function toggleEmergencyStop() {
     }
 }
 
-function setHandTestVisible(visible) {
+function triggerTypingAnimation() {
     if (!socket || socket.readyState !== WebSocket.OPEN) {
         alert("백엔드 서버와 연결되어 있지 않습니다.");
         return;
     }
     socket.send(JSON.stringify({
-        type: "SET_HAND_TEST_VISIBLE",
-        visible: visible
+        type: "TRIGGER_TYPING"
     }));
     const statusEl = document.getElementById('test-service-status') || document.getElementById('hand-service-status');
     if (statusEl) {
-        statusEl.innerText = visible ? "손 스폰 요청됨 (Visible)" : "손 제거 요청됨 (Removed)";
-        statusEl.style.color = visible ? "#f59e0b" : "#10b981";
+        statusEl.innerText = "타이핑 요청 전송";
+        statusEl.style.color = "#f59e0b";
     }
 }
 

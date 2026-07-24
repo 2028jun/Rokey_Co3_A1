@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from pathlib import Path
 
 import carb
 import carb.settings
 import omni.kit.app
-from pxr import Gf
+from pxr import Gf, Usd, UsdGeom, UsdPhysics
 
 
 PERSON_NAME = "CrossingPedestrian"
@@ -32,6 +33,24 @@ LANE_TOLERANCE = float(
 )
 PROGRESS_LOG_SECONDS = float(
     os.environ.get("NAV_CROSSING_PROGRESS_LOG_SECONDS", "5.0")
+)
+
+# Actor SDG bipeds carry no PhysX collider, so the front RPLIDAR S2E's PhysX
+# raycast (/scan) cannot see CrossingPedestrian without a proxy.  This
+# invisible capsule is a sibling prim (not a child of the animated
+# character), because the animation graph drives the SkelRoot transform
+# directly and does not propagate through a parent Xform -- so its position
+# is synced explicitly from the character's root position every update().
+# TypingCustomer never gets one: it is stationary and off the drive path.
+PERSON_COLLIDER_PATH = "/World/CrossingPedestrian_person_lidar_collider"
+PERSON_COLLIDER_RADIUS = float(
+    os.environ.get("NAV_CROSSING_COLLIDER_RADIUS", "0.30")
+)
+PERSON_COLLIDER_TOTAL_HEIGHT = float(
+    os.environ.get("NAV_CROSSING_COLLIDER_HEIGHT", "1.5")
+)
+PERSON_COLLIDER_CENTER_Z = float(
+    os.environ.get("NAV_CROSSING_COLLIDER_CENTER_Z", "0.875")
 )
 
 # The typing customer stays at the far chair of TableSet_00, facing the
@@ -189,6 +208,50 @@ def spawn(stage):
     return person_prim
 
 
+def _create_person_lidar_collider(stage):
+    """Create (or reuse) the invisible capsule that stands in for
+    CrossingPedestrian in PhysX raycasts.  Returns (prim, translate_op)."""
+    existing = stage.GetPrimAtPath(PERSON_COLLIDER_PATH)
+    if existing.IsValid():
+        translate_op = None
+        for op in UsdGeom.Xformable(existing).GetOrderedXformOps():
+            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                translate_op = op
+                break
+        return existing, translate_op
+
+    capsule = UsdGeom.Capsule.Define(stage, PERSON_COLLIDER_PATH)
+    capsule.CreateAxisAttr("Z")
+    capsule.CreateRadiusAttr(PERSON_COLLIDER_RADIUS)
+    cylinder_height = max(
+        PERSON_COLLIDER_TOTAL_HEIGHT - 2.0 * PERSON_COLLIDER_RADIUS, 0.01
+    )
+    capsule.CreateHeightAttr(cylinder_height)
+
+    prim = capsule.GetPrim()
+    UsdGeom.Imageable(prim).MakeInvisible()
+
+    xformable = UsdGeom.Xformable(prim)
+    xformable.ClearXformOpOrder()
+    translate_op = xformable.AddTranslateOp(
+        precision=UsdGeom.XformOp.PrecisionDouble
+    )
+    translate_op.Set(Gf.Vec3d(LEFT_X, LANE_Y, PERSON_COLLIDER_CENTER_Z))
+
+    UsdPhysics.CollisionAPI.Apply(prim)
+    rigid_body_api = UsdPhysics.RigidBodyAPI.Apply(prim)
+    rigid_body_api.CreateRigidBodyEnabledAttr(True)
+    rigid_body_api.CreateKinematicEnabledAttr(True)
+
+    print(
+        f"[crossing_pedestrian] lidar collider created at "
+        f"{PERSON_COLLIDER_PATH} radius={PERSON_COLLIDER_RADIUS:.2f} "
+        f"height={PERSON_COLLIDER_TOTAL_HEIGHT:.2f}",
+        flush=True,
+    )
+    return prim, translate_op
+
+
 class CrossingPedestrianController:
     """Keep one character walking wall-to-wall along the world X axis."""
 
@@ -215,6 +278,7 @@ class CrossingPedestrianController:
                 f"no SkelRoot found under {person_prim.GetPath()}"
             )
 
+        self._person_prim = person_prim
         self._character = None
         self._target_x = RIGHT_X
         self._path_points = None
@@ -222,6 +286,57 @@ class CrossingPedestrianController:
         self._turn_count = 0
         self._last_correction_log = 0.0
         self._last_progress_log = 0.0
+
+        self._visible = True
+        self._requested_visibility = None
+        self._request_lock = threading.Lock()
+
+        self._collider_prim, self._collider_translate_op = (
+            _create_person_lidar_collider(person_prim.GetStage())
+        )
+        self._set_collider_enabled(True)
+
+    def request_visible(self, visible: bool) -> None:
+        with self._request_lock:
+            self._requested_visibility = bool(visible)
+
+    def _set_collider_enabled(self, enabled: bool) -> None:
+        if self._collider_prim is None or not self._collider_prim.IsValid():
+            return
+        UsdPhysics.CollisionAPI(
+            self._collider_prim
+        ).CreateCollisionEnabledAttr().Set(enabled)
+
+    def _sync_collider(self, position) -> None:
+        if self._collider_translate_op is None:
+            return
+        self._collider_translate_op.Set(
+            Gf.Vec3d(position[0], position[1], PERSON_COLLIDER_CENTER_Z)
+        )
+
+    def _apply_visibility(self, visible: bool) -> None:
+        from pxr import UsdGeom
+
+        imageable = UsdGeom.Imageable(self._person_prim)
+
+        # Do NOT touch the "Action"/"Walk" character variables here.  Cycling
+        # Walk -> None -> Walk on this motion-matching graph is a known crash
+        # (see the "never transition through idle" note in _set_target /
+        # update() below): NodeDataMotionMatchingInstance::UpdateTime ->
+        # NearestPointOnSpline segfaults when the graph re-enters Walk from
+        # None.  Hide/show is therefore purely a render + collision toggle;
+        # the character keeps walking its last PathPoints off-screen while
+        # hidden and simply reappears in place when shown again.
+        if visible:
+            imageable.MakeVisible()
+            self._visible = True
+            self._set_collider_enabled(True)
+            print("[crossing_pedestrian] visibility -> visible", flush=True)
+        else:
+            imageable.MakeInvisible()
+            self._visible = False
+            self._set_collider_enabled(False)
+            print("[crossing_pedestrian] visibility -> hidden", flush=True)
 
     def _get_character(self):
         if self._character is None:
@@ -245,6 +360,15 @@ class CrossingPedestrianController:
         )
 
     def update(self) -> None:
+        with self._request_lock:
+            requested = self._requested_visibility
+            self._requested_visibility = None
+        if requested is not None:
+            self._apply_visibility(requested)
+
+        if not self._visible:
+            return
+
         character = self._get_character()
         if character is None:
             return
@@ -283,6 +407,8 @@ class CrossingPedestrianController:
                     flush=True,
                 )
                 self._last_correction_log = now
+
+        self._sync_collider(current_position)
 
         if abs(current_position[0] - self._target_x) <= TURN_DISTANCE:
             next_x = LEFT_X if self._target_x == RIGHT_X else RIGHT_X
