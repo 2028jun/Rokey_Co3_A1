@@ -1,0 +1,2 @@
+# The canonical hand_safety package is /hand_safety at the workspace root.
+# This legacy copy is ignored so colcon never discovers the package twice.

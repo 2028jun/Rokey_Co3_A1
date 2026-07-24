@@ -52,10 +52,14 @@ PERSON_COLLIDER_TOTAL_HEIGHT = float(
 PERSON_COLLIDER_CENTER_Z = float(
     os.environ.get("NAV_CROSSING_COLLIDER_CENTER_Z", "0.875")
 )
-# Must match ROBOT_ROOT in nav_restaurant_demo.py.  Used to exclude the
-# capsule from physical contact response against the robot (see
-# UsdPhysics.FilteredPairsAPI below) without affecting PhysX raycast
-# queries, which ignore filtered-pairs exclusions.
+# Root to search for the robot's collision-enabled prims (see
+# _create_person_lidar_collider below).  Must match ROBOT_ROOT in
+# nav_restaurant_demo.py.  The robot is an articulation made of several
+# separate PhysX bodies (base link, wheels, arm links...); every
+# collision-enabled descendant under this path gets individually filtered
+# against the pedestrian's capsule, since filtering only a single
+# ancestor path is not reliably recursed into every body by every Isaac
+# Sim/PhysX version.
 ROBOT_ROOT_PATH = os.environ.get("NAV_ROBOT_ROOT_PATH", "/World/NavRobot")
 
 # The typing customer stays at the far chair of TableSet_00, facing the
@@ -261,17 +265,68 @@ def _create_person_lidar_collider(stage):
     rigid_body_api.CreateKinematicEnabledAttr(True)
 
     # Suppress contact response against the robot only -- raycast/scene
-    # queries (what the front RPLIDAR uses) match by shape flag, not by
-    # filtered-pairs exclusions, so this leaves the capsule fully visible
-    # to /scan while stopping it from pushing or being pushed by the robot.
-    filtered_pairs_api = UsdPhysics.FilteredPairsAPI.Apply(prim)
-    filtered_pairs_api.CreateFilteredPairsRel().AddTarget(ROBOT_ROOT_PATH)
+    # queries (what the front RPLIDAR uses) match by shape flag and are
+    # unaffected by collision-group filtering, so this leaves the capsule
+    # fully visible to /scan while stopping it from pushing or being
+    # pushed by the robot.
+    #
+    # UsdPhysics.CollisionGroup + a UsdCollectionAPI "colliders" set is
+    # used instead of per-shape UsdPhysics.FilteredPairsAPI: a per-shape
+    # scan via HasAPI(UsdPhysics.CollisionAPI) found zero robot shapes
+    # (the URDF-imported robot's colliders evidently aren't exposed that
+    # way), even though the robot obviously does collide.  A Collection
+    # rooted at ROBOT_ROOT_PATH resolves its member shapes inside PhysX
+    # itself at simulation time, not through our own USD introspection,
+    # so it does not depend on guessing the right schema/shape prims.
+    robot_root_prim = stage.GetPrimAtPath(ROBOT_ROOT_PATH)
+    diagnostic_type_counts: dict[str, int] = {}
+    if robot_root_prim.IsValid():
+        for descendant in Usd.PrimRange(robot_root_prim):
+            diagnostic_type_counts[descendant.GetTypeName()] = (
+                diagnostic_type_counts.get(descendant.GetTypeName(), 0) + 1
+            )
+        print(
+            f"[crossing_pedestrian] diagnostic: prim types under "
+            f"{ROBOT_ROOT_PATH} = {diagnostic_type_counts}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[crossing_pedestrian] warning: {ROBOT_ROOT_PATH} not found "
+            "yet -- contact filter not applied (robot may not be spawned "
+            "before the pedestrian)",
+            flush=True,
+        )
+
+    if robot_root_prim.IsValid():
+        try:
+            groups_scope = "/World/PhysicsCollisionGroups"
+            person_group_path = f"{groups_scope}/PersonLidarGroup"
+            robot_group_path = f"{groups_scope}/RobotGroup"
+
+            person_group = UsdPhysics.CollisionGroup.Define(
+                stage, person_group_path
+            )
+            person_group.CreateFilteredGroupsRel().AddTarget(robot_group_path)
+            person_collection = person_group.GetCollidersCollectionAPI()
+            person_collection.CreateIncludesRel().AddTarget(PERSON_COLLIDER_PATH)
+
+            robot_group = UsdPhysics.CollisionGroup.Define(stage, robot_group_path)
+            robot_group.CreateFilteredGroupsRel().AddTarget(person_group_path)
+            robot_collection = robot_group.GetCollidersCollectionAPI()
+            robot_collection.CreateIncludesRel().AddTarget(ROBOT_ROOT_PATH)
+        except Exception as exc:
+            print(
+                f"[crossing_pedestrian] warning: CollisionGroup filter "
+                f"setup failed: {exc}",
+                flush=True,
+            )
 
     print(
         f"[crossing_pedestrian] lidar collider created at "
         f"{PERSON_COLLIDER_PATH} radius={PERSON_COLLIDER_RADIUS:.2f} "
         f"height={PERSON_COLLIDER_TOTAL_HEIGHT:.2f} "
-        f"(contact filtered against {ROBOT_ROOT_PATH})",
+        f"(collision-group filtered against {ROBOT_ROOT_PATH})",
         flush=True,
     )
     return prim, translate_op
