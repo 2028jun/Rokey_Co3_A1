@@ -22,6 +22,11 @@ Isaac Sim의 테이블 카메라 영상에서 사람이 타이핑할 때 손이 
 7. `/serving_robot/table_arrived=true`일 때만 추론하며 결과는
    `/hand_detection/image`, `/hand_detection/detections`,
    `/hand_safety/roi_intrusion`으로 발행한다.
+8. 별도 보행자는 주방 출구 앞쪽 통로의
+   `(-5.40, 3.00, 0.0) <-> (5.40, 3.00, 0.0)` 구간을 X축으로
+   계속 왕복한다. 좌우 벽에서 각각 0.60m 안쪽까지 이동하면서 주방에서
+   Y축으로 나오는 로봇 경로를 직각으로 가로지르고, 테이블·의자·후방
+   화분 영역에는 들어가지 않는다.
 
 ## 주요 코드
 
@@ -35,6 +40,9 @@ Isaac Sim의 테이블 카메라 영상에서 사람이 타이핑할 때 손이 
   - IDLE 자세 고정, ROS 타이핑 트리거 수신, 10초 실행과 자세 복귀 담당
   - 사전 작성 커맨드 루프, `Sit`, `push_button`, 자동 복귀 `GoTo`를 사용하지
     않아 루트 회전 누적과 바닥 침하를 방지한다.
+  - `CrossingPedestrianController`가 두 번째 사람의 X축 왕복 경로를
+    유지하고 Y/Z 이탈을 중앙 통로로 복구한다. 끝점에서도 `Walk` 상태를
+    유지해 IDLE 전환에 따른 자세 뒤틀림을 피한다.
 - `hand_safety/hand_safety/roi_intrusion.py`
   - `origin/woduq`와 같은 정규화 테이블 다각형 ROI를 사용한다.
 - `hand_safety/hand_safety/hand_detector_node.py`
@@ -54,3 +62,8 @@ ros2 topic pub --once \
 
 기본 타이핑 시간은 10초이며 필요하면 Isaac Sim 실행 전에
 `HAND_TEST_TYPING_SECONDS`로 변경할 수 있다.
+
+보행자는 기본 활성화된다. 끄려면 Isaac Sim 실행 전에
+`MOBILE_DEMO_CROSSING_PEDESTRIAN=0`을 설정한다. 경로는
+`CROSSING_PEDESTRIAN_LEFT_X`, `CROSSING_PEDESTRIAN_RIGHT_X`,
+`CROSSING_PEDESTRIAN_Y`로 조정할 수 있다.

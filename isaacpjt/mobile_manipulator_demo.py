@@ -731,7 +731,9 @@ def _find_hand_joint_world_positions(stage, skelroot_prim):
     return results
 
 
-def capture_actor_sdg_frames(stage, person_prim):
+def capture_actor_sdg_frames(
+    stage, person_prim, crossing_controller=None
+):
     """Headless visual-QA capture for the actor_sdg_test_actor.py mechanism:
     runs the real timeline (needed for omni.anim.people's BehaviorScript to
     self-drive the character) for one full typing/sit/push_button/sit cycle,
@@ -796,7 +798,24 @@ def capture_actor_sdg_frames(stage, person_prim):
         "QA_tracking", tracking_cam_path, width=1280, height=960
     )
     table_window = create_viewport_for_camera("QA_table", TABLE_CAMERA_PATH, width=1280, height=960)
-    viewports = {"tracking": tracking_window.viewport_api, "table": table_window.viewport_api}
+    viewports = {
+        "tracking": tracking_window.viewport_api,
+        "table": table_window.viewport_api,
+    }
+
+    crossing_cam_path = "/World/QACamera_crossing"
+    if crossing_controller is not None:
+        _define_lookat_camera(
+            stage,
+            crossing_cam_path,
+            Gf.Vec3d(0.0, actor_sdg.CROSSING_Y - 7.0, 13.0),
+            Gf.Vec3d(0.0, actor_sdg.CROSSING_Y, 0.8),
+            Gf.Vec3d(0.0, 0.0, 1.0),
+        )
+        crossing_window = create_viewport_for_camera(
+            "QA_crossing", crossing_cam_path, width=1280, height=960
+        )
+        viewports["crossing"] = crossing_window.viewport_api
 
     tracking_cam_prim = stage.GetPrimAtPath(tracking_cam_path)
 
@@ -831,7 +850,7 @@ def capture_actor_sdg_frames(stage, person_prim):
         actor_sdg._patch_timing_template_position_anchor()
         _update_tracking_camera()
         _render_settle(3)
-        for view_name in ("tracking", "table"):
+        for view_name in viewports:
             path = out_dir / f"{label}_{view_name}.png"
             capture_viewport_to_file(viewports[view_name], str(path))
         _render_settle(5)
@@ -857,6 +876,16 @@ def capture_actor_sdg_frames(stage, person_prim):
                 f"rot_angle={round(robot_matrix.ExtractRotation().GetAngle(), 2)}",
                 flush=True,
             )
+        if crossing_controller is not None:
+            crossing_transform = crossing_controller.get_world_transform()
+            if crossing_transform is not None:
+                crossing_pos, crossing_rot = crossing_transform
+                print(
+                    "[capture]   crossing pedestrian "
+                    f"pos={tuple(round(v, 3) for v in crossing_pos)} "
+                    f"rot={tuple(round(v, 3) for v in crossing_rot)}",
+                    flush=True,
+                )
 
         sm = ScriptManager.get_instance()
         for scripts in sm._prim_to_scripts.values():
@@ -945,6 +974,8 @@ def capture_actor_sdg_frames(stage, person_prim):
     elapsed = 0.0
     while elapsed < total_seconds:
         simulation_app.update()
+        if crossing_controller is not None:
+            crossing_controller.update()
         if os.environ.get("MOBILE_DEMO_UPRIGHT_WATCHDOG", "0") == "1":
             _enforce_upright_rotation()
         _time.sleep(1.0 / 30.0)
@@ -1218,10 +1249,16 @@ def main():
 
     reach_animator = None
     typing_controller = None
+    crossing_controller = None
     person_prim = None
     if hand_test_enabled and HAND_TEST_RIG_MODE not in ("rigid_arm", "legacy"):
         person_prim = actor_sdg.spawn_and_configure_actor(stage)
         typing_controller = actor_sdg.TypingTopicController(person_prim)
+        if actor_sdg.CROSSING_PEDESTRIAN_ENABLED:
+            crossing_prim = actor_sdg.spawn_crossing_pedestrian(stage)
+            crossing_controller = (
+                actor_sdg.CrossingPedestrianController(crossing_prim)
+            )
 
     articulation, dof_names = initialize_robot(articulation_path)
 
@@ -1239,13 +1276,19 @@ def main():
         if HAND_TEST_RIG_MODE in ("rigid_arm", "legacy"):
             capture_pose_frames(stage, reach_animator)
         else:
-            capture_actor_sdg_frames(stage, person_prim)
+            capture_actor_sdg_frames(
+                stage, person_prim, crossing_controller
+            )
+        if crossing_controller is not None:
+            crossing_controller.shutdown()
         if typing_controller is not None:
             typing_controller.shutdown()
         simulation_app.close()
         return
 
     if os.environ.get("MOBILE_DEMO_EXIT_AFTER_READY", "0") == "1":
+        if crossing_controller is not None:
+            crossing_controller.shutdown()
         if typing_controller is not None:
             typing_controller.shutdown()
         simulation_app.close()
@@ -1258,10 +1301,14 @@ def main():
                 reach_animator.update()
             if typing_controller is not None:
                 typing_controller.update()
+            if crossing_controller is not None:
+                crossing_controller.update()
             # Keep the GUI event loop responsive without throttling it to the old
             # uneven 16 ms cadence.
             time.sleep(0.010)
     finally:
+        if crossing_controller is not None:
+            crossing_controller.shutdown()
         if typing_controller is not None:
             typing_controller.shutdown()
 

@@ -86,6 +86,39 @@ import omni.kit.app
 from pxr import Gf
 
 PERSON_PRIM_PATH = "/World/Characters/Customer"
+CROSSING_PERSON_NAME = "CrossingPedestrian"
+
+# The kitchen exit is centered on x=0 and the robot initially travels along
+# Y before turning toward a table.  Keep the pedestrian in the wide aisle
+# between the kitchen-side wall and the upper table row:
+#
+#   kitchen-side rear wall y=5.00
+#   upper table edge y=1.17, upper chair centers y=1.70
+#   restaurant side walls x=-6.00 / x=6.00
+#
+# Move nearly wall-to-wall along X at y=3.00.  The 0.60 m inset from each
+# wall leaves body clearance, while the y offset avoids the tables, chairs,
+# and the two rear-corner plants at y=3.90.
+CROSSING_PEDESTRIAN_ENABLED = (
+    os.environ.get("MOBILE_DEMO_CROSSING_PEDESTRIAN", "1") == "1"
+)
+CROSSING_LEFT_X = float(
+    os.environ.get("CROSSING_PEDESTRIAN_LEFT_X", "-5.40")
+)
+CROSSING_RIGHT_X = float(
+    os.environ.get("CROSSING_PEDESTRIAN_RIGHT_X", "5.40")
+)
+CROSSING_Y = float(os.environ.get("CROSSING_PEDESTRIAN_Y", "3.00"))
+CROSSING_Z = float(os.environ.get("CROSSING_PEDESTRIAN_Z", "0.0"))
+CROSSING_SPAWN_YAW_DEGREES = float(
+    os.environ.get("CROSSING_PEDESTRIAN_SPAWN_YAW", "90.0")
+)
+CROSSING_TURN_DISTANCE = float(
+    os.environ.get("CROSSING_PEDESTRIAN_TURN_DISTANCE", "0.20")
+)
+CROSSING_LANE_TOLERANCE = float(
+    os.environ.get("CROSSING_PEDESTRIAN_LANE_TOLERANCE", "0.05")
+)
 
 # TableSet_00 (assets/lightweight_restaurant/lightweight_pizza_restaurant.usda)
 # has Chair_00_Visual/Chair_01_Visual under this path; Chair_01 sits on the
@@ -492,6 +525,183 @@ def spawn_and_configure_actor(stage):
         flush=True,
     )
     return char_prim
+
+
+def spawn_crossing_pedestrian(stage):
+    """Spawn a second Actor SDG character in the central dining aisle."""
+    del stage  # CharacterUtil operates on omni.usd's active stage.
+
+    app = omni.kit.app.get_app()
+    from isaacsim.replicator.agent.core.settings import AssetPaths
+    from isaacsim.replicator.agent.core.stage_util import CharacterUtil
+
+    biped_prim = CharacterUtil.load_default_biped_to_stage()
+    for _ in range(10):
+        app.update()
+    anim_graph_prim = CharacterUtil.get_anim_graph_from_character(biped_prim)
+    if anim_graph_prim is None or not anim_graph_prim.IsValid():
+        raise RuntimeError(
+            "default biped animation graph missing for crossing pedestrian"
+        )
+
+    spawn_position = Gf.Vec3d(
+        CROSSING_LEFT_X, CROSSING_Y, CROSSING_Z
+    )
+    char_prim = CharacterUtil.load_character_usd_to_stage(
+        AssetPaths.default_biped_asset_path(),
+        spawn_position,
+        CROSSING_SPAWN_YAW_DEGREES,
+        CROSSING_PERSON_NAME,
+    )
+    for _ in range(20):
+        app.update()
+
+    skelroot = CharacterUtil.get_character_skelroot_by_root(char_prim)
+    if skelroot is None:
+        raise RuntimeError(
+            f"no SkelRoot found under crossing pedestrian {char_prim.GetPath()}"
+        )
+    CharacterUtil.setup_animation_graph_to_character(
+        [skelroot], anim_graph_prim
+    )
+    for _ in range(10):
+        app.update()
+
+    print(
+        f"[crossing_pedestrian] spawned={char_prim.GetPath()} "
+        f"path=({CROSSING_LEFT_X:.2f}, {CROSSING_Y:.2f}) <-> "
+        f"({CROSSING_RIGHT_X:.2f}, {CROSSING_Y:.2f})",
+        flush=True,
+    )
+    return char_prim
+
+
+class CrossingPedestrianController:
+    """Continuously walk across the robot's Y-axis route along the X axis.
+
+    The AnimationGraph remains in Walk throughout endpoint reversals.  This
+    avoids the Walk->None root-pose transition that previously made the
+    typing customer tip or sink.  The route is also clamped to the known
+    table-free central aisle.
+    """
+
+    def __init__(self, person_prim):
+        if CROSSING_LEFT_X >= CROSSING_RIGHT_X:
+            raise ValueError(
+                "CROSSING_PEDESTRIAN_LEFT_X must be smaller than "
+                "CROSSING_PEDESTRIAN_RIGHT_X"
+            )
+        if CROSSING_TURN_DISTANCE <= 0.0:
+            raise ValueError(
+                "CROSSING_PEDESTRIAN_TURN_DISTANCE must be greater than zero"
+            )
+
+        from pxr import Usd
+
+        self._skelroot_path = None
+        for prim in Usd.PrimRange(person_prim):
+            if prim.GetTypeName() == "SkelRoot":
+                self._skelroot_path = str(prim.GetPath())
+                break
+        if self._skelroot_path is None:
+            raise RuntimeError(
+                f"no SkelRoot found under {person_prim.GetPath()}"
+            )
+
+        self._character = None
+        self._target_x = CROSSING_RIGHT_X
+        self._path_points = None
+        self._initialized = False
+        self._turn_count = 0
+
+    def _get_character(self):
+        if self._character is None:
+            import omni.anim.graph.core as ag
+
+            self._character = ag.get_character(self._skelroot_path)
+        return self._character
+
+    def _set_target(self, current_pos, target_x: float) -> None:
+        self._target_x = target_x
+        self._path_points = [
+            carb.Float3(current_pos[0], CROSSING_Y, CROSSING_Z),
+            carb.Float3(target_x, CROSSING_Y, CROSSING_Z),
+        ]
+        self._turn_count += 1
+        direction = "+X" if target_x == CROSSING_RIGHT_X else "-X"
+        print(
+            f"[crossing_pedestrian] walking {direction} toward "
+            f"x={target_x:.2f} (turn={self._turn_count})",
+            flush=True,
+        )
+
+    def update(self) -> None:
+        character = self._get_character()
+        if character is None:
+            return
+
+        from omni.anim.people.scripts.utils import Utils
+
+        current_pos, current_rot = Utils.get_character_transform(character)
+        if not self._initialized:
+            clean_pos = carb.Float3(
+                CROSSING_LEFT_X, CROSSING_Y, CROSSING_Z
+            )
+            character.set_world_transform(clean_pos, current_rot)
+            current_pos = clean_pos
+            self._set_target(current_pos, CROSSING_RIGHT_X)
+            self._initialized = True
+
+        # Correct only real lane/height drift, while preserving the
+        # AnimationGraph's live turn rotation and normal walking motion.
+        if (
+            abs(current_pos[1] - CROSSING_Y) > CROSSING_LANE_TOLERANCE
+            or abs(current_pos[2] - CROSSING_Z) > CROSSING_LANE_TOLERANCE
+        ):
+            corrected_pos = carb.Float3(
+                min(
+                    max(current_pos[0], CROSSING_LEFT_X),
+                    CROSSING_RIGHT_X,
+                ),
+                CROSSING_Y,
+                CROSSING_Z,
+            )
+            character.set_world_transform(corrected_pos, current_rot)
+            current_pos = corrected_pos
+            self._path_points[0] = corrected_pos
+            print(
+                "[crossing_pedestrian] corrected lane drift to "
+                f"{tuple(round(v, 3) for v in corrected_pos)}",
+                flush=True,
+            )
+
+        if abs(current_pos[0] - self._target_x) <= CROSSING_TURN_DISTANCE:
+            next_x = (
+                CROSSING_LEFT_X
+                if self._target_x == CROSSING_RIGHT_X
+                else CROSSING_RIGHT_X
+            )
+            self._set_target(current_pos, next_x)
+
+        # Keep Walk active across reversals; PathPoints makes Actor SDG
+        # handle forward motion and turning without a command-file loop.
+        character.set_variable("Action", "Walk")
+        character.set_variable("Walk", 1.0)
+        character.set_variable("PathPoints", self._path_points)
+
+    def get_world_transform(self):
+        character = self._get_character()
+        if character is None:
+            return None
+        from omni.anim.people.scripts.utils import Utils
+
+        return Utils.get_character_transform(character)
+
+    def shutdown(self) -> None:
+        character = self._get_character()
+        if character is not None:
+            character.set_variable("Walk", 0.0)
+            character.set_variable("Action", "None")
 
 
 class TypingTopicController:
