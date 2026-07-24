@@ -52,6 +52,11 @@ PERSON_COLLIDER_TOTAL_HEIGHT = float(
 PERSON_COLLIDER_CENTER_Z = float(
     os.environ.get("NAV_CROSSING_COLLIDER_CENTER_Z", "0.875")
 )
+# Must match ROBOT_ROOT in nav_restaurant_demo.py.  Used to exclude the
+# capsule from physical contact response against the robot (see
+# UsdPhysics.FilteredPairsAPI below) without affecting PhysX raycast
+# queries, which ignore filtered-pairs exclusions.
+ROBOT_ROOT_PATH = os.environ.get("NAV_ROBOT_ROOT_PATH", "/World/NavRobot")
 
 # The typing customer stays at the far chair of TableSet_00, facing the
 # tabletop.  The controller holds this exact pose before, during, and after
@@ -255,10 +260,18 @@ def _create_person_lidar_collider(stage):
     rigid_body_api.CreateRigidBodyEnabledAttr(True)
     rigid_body_api.CreateKinematicEnabledAttr(True)
 
+    # Suppress contact response against the robot only -- raycast/scene
+    # queries (what the front RPLIDAR uses) match by shape flag, not by
+    # filtered-pairs exclusions, so this leaves the capsule fully visible
+    # to /scan while stopping it from pushing or being pushed by the robot.
+    filtered_pairs_api = UsdPhysics.FilteredPairsAPI.Apply(prim)
+    filtered_pairs_api.CreateFilteredPairsRel().AddTarget(ROBOT_ROOT_PATH)
+
     print(
         f"[crossing_pedestrian] lidar collider created at "
         f"{PERSON_COLLIDER_PATH} radius={PERSON_COLLIDER_RADIUS:.2f} "
-        f"height={PERSON_COLLIDER_TOTAL_HEIGHT:.2f}",
+        f"height={PERSON_COLLIDER_TOTAL_HEIGHT:.2f} "
+        f"(contact filtered against {ROBOT_ROOT_PATH})",
         flush=True,
     )
     return prim, translate_op

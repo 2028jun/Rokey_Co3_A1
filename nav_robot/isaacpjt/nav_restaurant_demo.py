@@ -273,13 +273,13 @@ LIDAR_SENSOR_HEIGHT = 0.45
 # nav2_collision_monitor -- this mirrors that node's stop/slowdown polygons
 # from nav2_params.yaml so the two stay in sync).  Unlike the old
 # front_angle=15deg cone, these cover the robot's sides and rear too.
-OBSTACLE_STOP_FRONT = 0.55
-OBSTACLE_STOP_BACK = -0.35
-OBSTACLE_STOP_HALF_WIDTH = 0.50
-OBSTACLE_SLOWDOWN_FRONT = 1.20
-OBSTACLE_SLOWDOWN_BACK = -0.45
-OBSTACLE_SLOWDOWN_HALF_WIDTH = 0.70
-OBSTACLE_SLOWDOWN_RATIO = 0.3
+OBSTACLE_STOP_FRONT = 0.75
+OBSTACLE_STOP_BACK = -0.55
+OBSTACLE_STOP_HALF_WIDTH = 0.60
+OBSTACLE_SLOWDOWN_FRONT = 1.35
+OBSTACLE_SLOWDOWN_BACK = -0.75
+OBSTACLE_SLOWDOWN_HALF_WIDTH = 0.85
+OBSTACLE_SLOWDOWN_RATIO = 0.30
 
 _front_lidar_render_product = None
 _front_lidar_writer = None

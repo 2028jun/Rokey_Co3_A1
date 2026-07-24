@@ -323,10 +323,18 @@ collision_monitor:
     base_shift_correction: true
     stop_pub_timeout: 2.0
     polygons: ["stop_zone", "slowdown_zone"]
+    # Footprint is [[0.42,0.35],[0.42,-0.35],[-0.42,-0.35],[-0.42,0.35]]
+    # (0.84m x 0.70m).  Zone clearance beyond the footprint, ISO 12100 /
+    # ISO 13482 risk-reduction principle applied to Nav2's stop/slowdown
+    # zones -- initial tuning values, not a certified safety boundary; see
+    # nav_restaurant_demo.py's OBSTACLE_STOP_*/OBSTACLE_SLOWDOWN_* and
+    # robot_map.js's stopZone/slowdownZone, which mirror these and must be
+    # kept in sync when retuning.
     stop_zone:
       type: "polygon"
       action_type: "stop"
-      points: [0.55, 0.50, 0.55, -0.50, -0.35, -0.50, -0.35, 0.50]
+      # front +0.33m, rear +0.13m, sides +0.25m beyond footprint
+      points: [0.75, 0.60, 0.75, -0.60, -0.55, -0.60, -0.55, 0.60]
       max_points: 3
       visualize: true
       polygon_pub_topic: "polygon_stop"
@@ -334,8 +342,9 @@ collision_monitor:
     slowdown_zone:
       type: "polygon"
       action_type: "slowdown"
-      points: [1.20, 0.70, 1.20, -0.70, -0.45, -0.70, -0.45, 0.70]
-      slowdown_ratio: 0.3
+      # front +0.93m, rear +0.33m, sides +0.50m beyond footprint
+      points: [1.35, 0.85, 1.35, -0.85, -0.75, -0.85, -0.75, 0.85]
+      slowdown_ratio: 0.30
       max_points: 3
       visualize: true
       polygon_pub_topic: "polygon_slowdown"

@@ -27,8 +27,8 @@ class RestaurantMap {
         // collision_monitor polygons in nav2_params.yaml and the
         // OBSTACLE_STOP_*/OBSTACLE_SLOWDOWN_* constants in
         // nav_restaurant_demo.py -- update all three together.
-        this.stopZone = { front: 0.55, back: -0.35, halfWidth: 0.50 };
-        this.slowdownZone = { front: 1.20, back: -0.45, halfWidth: 0.70 };
+        this.stopZone = { front: 0.75, back: -0.55, halfWidth: 0.60 };
+        this.slowdownZone = { front: 1.35, back: -0.75, halfWidth: 0.85 };
         
         this.init();
     }
