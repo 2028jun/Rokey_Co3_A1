@@ -79,6 +79,12 @@ TYPE_KEYBOARD_ANIM = os.environ.get(
     "HAND_TEST_TYPE_KEYBOARD_ANIM",
     str(_ANIMATION_DIR / "type_keyboard.skelanim.usd"),
 )
+TYPING_PERSON_USD = os.environ.get(
+    "NAV_TYPING_PERSON_USD",
+    "https://omniverse-content-production.s3-us-west-2.amazonaws.com/"
+    "Assets/Isaac/5.1/Isaac/People/Characters/F_Business_02/"
+    "F_Business_02.usd",
+)
 
 
 def enable_extensions() -> None:
@@ -97,7 +103,12 @@ def enable_extensions() -> None:
         )
 
 
-def _load_character(position, yaw_degrees: float, name: str):
+def _load_character(
+    position,
+    yaw_degrees: float,
+    name: str,
+    character_asset_path: str | None = None,
+):
     from isaacsim.replicator.agent.core.settings import AssetPaths
     from isaacsim.replicator.agent.core.stage_util import CharacterUtil
 
@@ -111,7 +122,7 @@ def _load_character(position, yaw_degrees: float, name: str):
         raise RuntimeError("default biped animation graph is unavailable")
 
     person_prim = CharacterUtil.load_character_usd_to_stage(
-        AssetPaths.default_biped_asset_path(),
+        character_asset_path or AssetPaths.default_biped_asset_path(),
         position,
         yaw_degrees,
         name,
@@ -180,11 +191,12 @@ def spawn_typing_customer(stage):
         Gf.Vec3d(TYPING_X, TYPING_Y, TYPING_Z),
         TYPING_YAW_DEGREES,
         TYPING_PERSON_NAME,
+        TYPING_PERSON_USD,
     )
     print(
         f"[typing_topic] spawned={person_prim.GetPath()} "
         f"home=({TYPING_X:.2f},{TYPING_Y:.2f},{TYPING_Z:.2f}) "
-        f"yaw={TYPING_YAW_DEGREES:.1f}",
+        f"yaw={TYPING_YAW_DEGREES:.1f} asset={TYPING_PERSON_USD}",
         flush=True,
     )
     return person_prim
