@@ -277,6 +277,30 @@ class SimplifiedPathNavigator:
         while time.monotonic() < deadline:
             rclpy.spin_once(self._nav, timeout_sec=0.03)
 
+    def drive_distance(
+        self,
+        distance_m: float,
+        speed_mps: float,
+        *,
+        label: str = "drive_distance",
+    ) -> bool:
+        mission_id = f"{label}_{int(time.monotonic())}"
+        self._last_status = None
+        self._spin_sleep(0.25)
+        self._send_mission_command(
+            {
+                "mission_id": mission_id,
+                "kind": "drive_distance",
+                "distance": abs(float(distance_m)),
+                "speed": float(speed_mps),
+            }
+        )
+        timeout = abs(float(distance_m)) / max(abs(float(speed_mps)), 0.05) + 8.0
+        ok, _reason = self._wait_for_mission_completion(
+            mission_id, timeout, label
+        )
+        return ok
+
     def _wait_for_navigation_inputs(self, timeout_sec: float = 8.0) -> bool:
         started = time.monotonic()
         last_log = 0.0
@@ -541,7 +565,13 @@ class SimplifiedPathNavigator:
 
         raise RuntimeError("Orthogonal path planning failed all corner clearance checks")
 
-    def navigate_to(self, goal: PoseStamped, *, label: str = "goal") -> bool:
+    def navigate_to(
+        self,
+        goal: PoseStamped,
+        *,
+        label: str = "goal",
+        position_then_align: bool = False,
+    ) -> bool:
         if not self._wait_for_navigation_inputs(timeout_sec=8.0):
             print(f"[{label}] navigation aborted: required inputs are unavailable", flush=True)
             return False
@@ -556,8 +586,12 @@ class SimplifiedPathNavigator:
 
         app_dist = self._cfg.dock_approach_distance_m
         approach_pt = (
-            gx - app_dist * math.cos(goal_yaw),
-            gy - app_dist * math.sin(goal_yaw),
+            (gx, gy)
+            if position_then_align
+            else (
+                gx - app_dist * math.cos(goal_yaw),
+                gy - app_dist * math.sin(goal_yaw),
+            )
         )
         self._publish_rviz_path(self._pub_dock_approach, [approach_pt, (gx, gy)])
 
@@ -580,24 +614,17 @@ class SimplifiedPathNavigator:
                     continue
                 return False
 
-            yaw_offset = normalize_angle(raw_p[2] - map_p[2])
-            c_rot = math.cos(yaw_offset)
-            s_rot = math.sin(yaw_offset)
-
-            # Transform Map Points to Control Frame Points for Isaac Execution
-            ctrl_points = []
-            for p in points:
-                dx_map = p[0] - map_p[0]
-                dy_map = p[1] - map_p[1]
-                ctrl_x = raw_p[0] + c_rot * dx_map - s_rot * dy_map
-                ctrl_y = raw_p[1] + s_rot * dx_map + c_rot * dy_map
-                ctrl_points.append({"x": round(ctrl_x, 4), "y": round(ctrl_y, 4)})
-
-            dx_dock = gx - map_p[0]
-            dy_dock = gy - map_p[1]
-            ctrl_dock_x = raw_p[0] + c_rot * dx_dock - s_rot * dy_dock
-            ctrl_dock_y = raw_p[1] + s_rot * dx_dock + c_rot * dy_dock
-            ctrl_dock_yaw = normalize_angle(goal_yaw + yaw_offset)
+            # Isaac world, map, and route coordinates are deliberately the
+            # same in this simulation.  Applying the instantaneous AMCL/raw
+            # offset here duplicated localization error and shifted the whole
+            # executed route away from the path displayed in RViz.
+            ctrl_points = [
+                {"x": round(p[0], 4), "y": round(p[1], 4)}
+                for p in points
+            ]
+            ctrl_dock_x = gx
+            ctrl_dock_y = gy
+            ctrl_dock_yaw = normalize_angle(goal_yaw)
 
             mission_payload = {
                 "mission_id": mission_id,
@@ -608,11 +635,15 @@ class SimplifiedPathNavigator:
                     "y": round(ctrl_dock_y, 4),
                     "yaw": round(ctrl_dock_yaw, 4),
                 },
+                "finish_after_route": position_then_align,
+                "final_yaw": round(ctrl_dock_yaw, 4),
             }
 
             print(
                 f"[mission] sent mission={mission_id} points={len(ctrl_points)} "
-                f"dock=({ctrl_dock_x:.3f},{ctrl_dock_y:.3f})",
+                f"dock=({ctrl_dock_x:.3f},{ctrl_dock_y:.3f}) "
+                f"map_raw_delta=({raw_p[0] - map_p[0]:.3f},"
+                f"{raw_p[1] - map_p[1]:.3f})",
                 flush=True,
             )
             self._send_mission_command(mission_payload)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 
 import rclpy
@@ -77,6 +78,12 @@ def main() -> None:
             rclpy.shutdown()
             raise SystemExit(1)
     else:
+        # BasicNavigator defaults initial_pose to map (0, 0, 0) and
+        # waitUntilNav2Active() republishes it until an AMCL callback arrives.
+        # This branch must preserve the running localization, so suppress that
+        # implicit initial-pose publication and validate the existing pose
+        # explicitly below.
+        nav.initial_pose_received = True
         nav.waitUntilNav2Active()
         current_pose = wait_for_existing_localization(nav, tf_buffer, tracker, timeout_sec=8.0)
         if current_pose is None:
@@ -85,12 +92,63 @@ def main() -> None:
             raise SystemExit(1)
 
     controller = SimplifiedPathNavigator(nav, tf_buffer, tracker)
+
+    if args.kitchen:
+        current_pose = wait_for_existing_localization(
+            nav, tf_buffer, tracker, timeout_sec=8.0
+        )
+        if current_pose is None:
+            print("[park_out] current localization unavailable", flush=True)
+            rclpy.shutdown()
+            raise SystemExit(1)
+
+        px, py, pyaw = current_pose
+        near_table_row = min(abs(py + 2.20), abs(py - 0.70)) <= 0.70
+        parked_at_table = abs(px) >= 1.15 and near_table_row
+        if parked_at_table:
+            expected_yaw = math.pi if px < 0.0 else 0.0
+            yaw_error = math.atan2(
+                math.sin(expected_yaw - pyaw),
+                math.cos(expected_yaw - pyaw),
+            )
+            if abs(yaw_error) > math.radians(20.0):
+                print(
+                    f"[park_out] unsafe heading: yaw_error="
+                    f"{math.degrees(yaw_error):.1f}deg",
+                    flush=True,
+                )
+                rclpy.shutdown()
+                raise SystemExit(1)
+
+            backup_m = 0.50
+            print(
+                f"[park_out] table dock detected at ({px:.2f},{py:.2f}); "
+                f"reverse {backup_m:.2f}m before kitchen planning",
+                flush=True,
+            )
+            ok = controller.drive_distance(
+                backup_m,
+                -0.20,
+                label="park_out",
+            )
+            print(
+                f"[park_out] reverse target={backup_m:.2f}m ok={ok}",
+                flush=True,
+            )
+            if not ok:
+                rclpy.shutdown()
+                raise SystemExit(1)
+
     goal = make_pose(nav, gx, gy, gyaw)
 
     label = "kitchen" if args.kitchen else f"table_{args.table_id}"
     print(f"[mission] target={label} goal=({gx:.2f},{gy:.2f},{gyaw:.2f})", flush=True)
 
-    ok = controller.navigate_to(goal, label=label)
+    ok = controller.navigate_to(
+        goal,
+        label=label,
+        position_then_align=args.kitchen,
+    )
     rclpy.shutdown()
     if not ok:
         raise SystemExit(1)

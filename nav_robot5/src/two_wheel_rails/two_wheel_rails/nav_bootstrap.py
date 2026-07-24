@@ -17,6 +17,7 @@ from std_srvs.srv import Empty
 from tf2_ros import Buffer, TransformListener
 
 TELEPORT_TOPIC = "/two_wheel/teleport"
+DIRECT_CMD_VEL_TOPIC = "/two_wheel/direct_cmd_vel"
 
 AMCL_POSE_QOS = QoSProfile(
     depth=10,
@@ -260,7 +261,9 @@ def reverse_open_loop(
     if xy0 is None:
         xy0 = (0.0, 0.0)
 
-    pub = nav.create_publisher(Twist, "/cmd_vel", 10)
+    # Use a dedicated direct-drive topic so Nav2's velocity smoother cannot
+    # overwrite the parking-exit command with zero-velocity messages.
+    pub = nav.create_publisher(Twist, DIRECT_CMD_VEL_TOPIC, 10)
     twist = Twist()
     twist.linear.x = -speed_mps
 

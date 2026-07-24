@@ -64,6 +64,9 @@ def main() -> None:
             rclpy.shutdown()
             raise SystemExit(1)
     else:
+        # Do not let BasicNavigator publish its default map (0, 0, 0) pose
+        # while merely waiting for an already-running Nav2 stack.
+        nav.initial_pose_received = True
         nav.waitUntilNav2Active()
         current_pose = wait_for_existing_localization(nav, tf_buffer, tracker, timeout_sec=8.0)
         if current_pose is None:

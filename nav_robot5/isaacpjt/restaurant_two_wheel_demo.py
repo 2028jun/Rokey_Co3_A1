@@ -119,6 +119,8 @@ TIRE_DYNAMIC_FRICTION = 0.50
 # Hysteresis and Settle Tolerances for Docking
 DOCK_POSITION_ENTER_TOL = 0.040
 DOCK_POSITION_EXIT_TOL = 0.050
+DOCK_LATERAL_ENTER_TOL = 0.015
+DOCK_LATERAL_EXIT_TOL = 0.025
 DOCK_YAW_ENTER_TOL = math.radians(2.0)
 DOCK_YAW_EXIT_TOL = math.radians(3.0)
 DOCK_SETTLE_TICKS = 20
@@ -128,9 +130,19 @@ DOCK_SETTLE_TIMEOUT = 5.0
 DOCK_NEAR_DISTANCE = 0.060
 DOCK_NEAR_FORWARD_TOL = 0.060
 DOCK_NEAR_YAW_TOL = math.radians(2.0)
-DOCK_NEAR_TIMEOUT = 30.0
+DOCK_NEAR_TIMEOUT = 8.0
 DOCK_NEAR_ALIGN_ENTER_TOL = math.radians(2.0)
 DOCK_NEAR_ALIGN_EXIT_TOL = math.radians(1.5)
+DOCK_CREEP_GAIN = 0.80
+DOCK_CREEP_MIN_SPEED = 0.040
+DOCK_CREEP_MAX_SPEED = 0.060
+DOCK_APPROACH_MIN_SPEED = 0.040
+DOCK_RECOVERY_BACKOUT_DISTANCE = 0.25
+DOCK_RECOVERY_BACKOUT_SPEED = 0.12
+DOCK_RECOVERY_REAPPROACH_SPEED = 0.12
+PRE_DOCK_POSITION_TOL = 0.030
+AXIS_CROSS_TRACK_GAIN = 0.60
+AXIS_CROSS_TRACK_MAX_CORRECTION = 0.12
 
 ROBOT_ROOT = "/World/NavRobot"
 ARTICULATION_CANDIDATES = [
@@ -143,6 +155,9 @@ RAW_SCAN_TOPIC = "/two_wheel/scan_raw"
 TELEPORT_TOPIC = "/two_wheel/teleport"
 MISSION_CMD_TOPIC = "/two_wheel/mission_command"
 MISSION_STATUS_TOPIC = "/two_wheel/mission_status"
+CMD_VEL_TOPIC = "/cmd_vel"
+DIRECT_CMD_VEL_TOPIC = "/two_wheel/direct_cmd_vel"
+EXTERNAL_CMD_TIMEOUT = 0.25
 
 LIDAR_MIN_RANGE = 0.20
 LIDAR_MAX_RANGE = 12.0
@@ -363,30 +378,21 @@ def build_stages_from_points(points: list[dict], current_x: float, current_y: fl
         if dist < 0.02:
             continue
 
-        if abs(dx) >= abs(dy):
-            stage_yaw = 0.0 if dx >= 0.0 else math.pi
-            stages.append({
-                "kind": "pivot",
-                "yaw": stage_yaw,
-            })
-            stages.append({
-                "kind": "axis_x",
-                "value": target_x,
-                "yaw": stage_yaw,
-                "speed": 0.22,  # Speed is always positive since pivot pre-aligns heading
-            })
-        else:
-            stage_yaw = math.pi / 2.0 if dy >= 0.0 else -math.pi / 2.0
-            stages.append({
-                "kind": "pivot",
-                "yaw": stage_yaw,
-            })
-            stages.append({
-                "kind": "axis_y",
-                "value": target_y,
-                "yaw": stage_yaw,
-                "speed": 0.22,  # Speed is always positive since pivot pre-aligns heading
-            })
+        stage_yaw = math.atan2(dy, dx)
+        stages.append({
+            "kind": "pivot",
+            "yaw": stage_yaw,
+        })
+        stages.append({
+            "kind": "line",
+            "start_x": curr_x,
+            "start_y": curr_y,
+            "target_x": target_x,
+            "target_y": target_y,
+            "length": dist,
+            "yaw": stage_yaw,
+            "speed": 0.22,
+        })
 
         curr_x, curr_y = target_x, target_y
 
@@ -408,6 +414,12 @@ class DiffNavBridge(Node):
         self._cmd_wz = 0.0
         self._last_cmd_time = time.monotonic()
         self._last_cmd_log_time = 0.0
+        self._external_cmd_vx = 0.0
+        self._external_cmd_wz = 0.0
+        self._external_cmd_time = 0.0
+        self._direct_cmd_vx = 0.0
+        self._direct_cmd_wz = 0.0
+        self._direct_cmd_time = 0.0
         self._last_scan_time = -LIDAR_PERIOD_SEC
         self._last_tick_time = time.monotonic()
         self._lock = threading.Lock()
@@ -439,6 +451,12 @@ class DiffNavBridge(Node):
         self.create_subscription(
             StringMsg, MISSION_CMD_TOPIC, self._on_mission_command, stage_qos
         )
+        self.create_subscription(
+            Twist, CMD_VEL_TOPIC, self._on_cmd_vel, stage_qos
+        )
+        self.create_subscription(
+            Twist, DIRECT_CMD_VEL_TOPIC, self._on_direct_cmd_vel, stage_qos
+        )
 
         qos = QoSProfile(
             depth=10,
@@ -461,6 +479,18 @@ class DiffNavBridge(Node):
             self._cmd_queue.put(payload)
         except Exception as exc:
             self.get_logger().error(f"failed to parse mission command JSON: {exc}")
+
+    def _on_cmd_vel(self, msg: Twist):
+        with self._lock:
+            self._external_cmd_vx = float(msg.linear.x)
+            self._external_cmd_wz = float(msg.angular.z)
+            self._external_cmd_time = time.monotonic()
+
+    def _on_direct_cmd_vel(self, msg: Twist):
+        with self._lock:
+            self._direct_cmd_vx = float(msg.linear.x)
+            self._direct_cmd_wz = float(msg.angular.z)
+            self._direct_cmd_time = time.monotonic()
 
     # Exact Line-by-Line Original Helper: Angle Error from nav_restaurant_demo.py
     @staticmethod
@@ -502,9 +532,41 @@ class DiffNavBridge(Node):
             self._update_status_snapshot(mission_id, "cancelled", "cancel", x, y, yaw)
             return
 
+        if kind == "drive_distance":
+            speed = float(payload.get("speed", -0.15))
+            distance = max(0.05, abs(float(payload.get("distance", 0.0))))
+            self._obstacle_stop = False
+            self._direct_nav = {
+                "mode": "drive_distance",
+                "mission_id": mission_id,
+                "start_x": x,
+                "start_y": y,
+                "start_yaw": yaw,
+                "speed": speed,
+                "distance": distance,
+                "stage_start": time.monotonic(),
+                "last_log": 0.0,
+            }
+            self._cmd_vx = 0.0
+            self._cmd_wz = 0.0
+            self._update_status_snapshot(
+                mission_id, "accepted", "drive_distance", x, y, yaw
+            )
+            self.get_logger().info(
+                f"direct distance started mission={mission_id} "
+                f"distance={distance:.2f}m speed={speed:.2f}m/s"
+            )
+            return
+
         points = payload.get("points", [])
         dock_info = payload.get("dock", {})
         stages = build_stages_from_points(points, x, y)
+        finish_after_route = bool(payload.get("finish_after_route", False))
+        if finish_after_route:
+            stages.append({
+                "kind": "pivot",
+                "yaw": float(payload.get("final_yaw", dock_info.get("yaw", yaw))),
+            })
 
         self._direct_nav = {
             "mode": "route_and_dock",
@@ -513,6 +575,7 @@ class DiffNavBridge(Node):
             "index": 0,
             "stage_start": time.monotonic(),
             "last_log": 0.0,
+            "finish_after_route": finish_after_route,
             "dock": (
                 float(dock_info.get("x", x)),
                 float(dock_info.get("y", y)),
@@ -552,11 +615,67 @@ class DiffNavBridge(Node):
         if self._navigation_paused or self._obstacle_stop:
             return 0.0, 0.0
 
+        if mission["mode"] == "drive_distance":
+            dx = x - mission["start_x"]
+            dy = y - mission["start_y"]
+            signed_travel = (
+                math.cos(mission["start_yaw"]) * dx
+                + math.sin(mission["start_yaw"]) * dy
+            )
+            direction = 1.0 if mission["speed"] >= 0.0 else -1.0
+            traveled = direction * signed_travel
+            yaw_error = self._angle_error(mission["start_yaw"], yaw)
+            elapsed = time.monotonic() - mission["stage_start"]
+
+            if traveled >= mission["distance"] - 0.03:
+                self._finish_direct_navigation(
+                    True, "completed", x, y, yaw
+                )
+                return 0.0, 0.0
+
+            timeout = mission["distance"] / max(abs(mission["speed"]), 0.05) + 5.0
+            if elapsed > timeout:
+                self._finish_direct_navigation(
+                    False,
+                    f"drive_distance timeout; traveled={traveled:.3f}m",
+                    x,
+                    y,
+                    yaw,
+                )
+                return 0.0, 0.0
+
+            if time.monotonic() - mission["last_log"] >= 1.0:
+                mission["last_log"] = time.monotonic()
+                self.get_logger().info(
+                    f"direct distance pose=({x:.2f},{y:.2f},"
+                    f"{math.degrees(yaw):.1f}deg) "
+                    f"traveled={traveled:.2f}/{mission['distance']:.2f}m "
+                    f"yaw_error={math.degrees(yaw_error):.1f}deg"
+                )
+                self._update_status_snapshot(
+                    mission["mission_id"],
+                    "running",
+                    "drive_distance",
+                    x,
+                    y,
+                    yaw,
+                )
+
+            vx = mission["speed"]
+            wz = float(np.clip(1.6 * yaw_error, -0.20, 0.20))
+            return vx, wz
+
         if mission["mode"] == "legacy_table":
             return self._update_legacy_table_navigation(mission, x, y, yaw)
 
         stages = mission["stages"]
         if mission["index"] >= len(stages):
+            if mission.get("finish_after_route", False):
+                self._finish_direct_navigation(
+                    True, "position_reached_and_aligned", x, y, yaw
+                )
+                return 0.0, 0.0
+
             # Route stages complete -> Transition to legacy table docking!
             goal = mission["dock"]
             mission_id = mission["mission_id"]
@@ -600,39 +719,46 @@ class DiffNavBridge(Node):
             timeout = 25.0
             detail = f"yaw_error={math.degrees(error):.1f}deg"
         else:
-            axis = x if kind == "axis_x" else y
-            error = stage["value"] - axis
-            done = abs(error) <= 0.05
+            heading_x = math.cos(stage["yaw"])
+            heading_y = math.sin(stage["yaw"])
+            from_start_x = x - stage["start_x"]
+            from_start_y = y - stage["start_y"]
+            along = heading_x * from_start_x + heading_y * from_start_y
+            remaining = stage["length"] - along
+            cross_error = (
+                -heading_y * from_start_x + heading_x * from_start_y
+            )
+            target_distance = math.hypot(
+                stage["target_x"] - x,
+                stage["target_y"] - y,
+            )
+            done = target_distance <= 0.05 or remaining <= 0.02
 
             if not done:
-                # Heading Mismatch Check is evaluated ONLY when not done
-                expected_sign = 1.0 if error >= 0.0 else -1.0
-                heading_axis_sign = (
-                    math.cos(stage["yaw"])
-                    if kind == "axis_x"
-                    else math.sin(stage["yaw"])
-                )
-                if expected_sign * heading_axis_sign <= 0.0:
-                    self._finish_direct_navigation(
-                        False,
-                        (
-                            f"stage heading mismatch: "
-                            f"kind={kind} target={stage['value']:.3f} "
-                            f"axis={axis:.3f} yaw={math.degrees(stage['yaw']):.1f}"
-                        ),
-                        x,
-                        y,
-                        yaw,
+                # Steer back toward the actual transformed segment, rather
+                # than forcing every segment onto the raw world's X/Y axes.
+                heading_offset = float(
+                    np.clip(
+                        math.atan2(-AXIS_CROSS_TRACK_GAIN * cross_error, 0.8),
+                        -AXIS_CROSS_TRACK_MAX_CORRECTION,
+                        AXIS_CROSS_TRACK_MAX_CORRECTION,
                     )
-                    return 0.0, 0.0
-
-                desired_yaw = stage["yaw"]
+                )
+                desired_yaw = self._angle_error(
+                    stage["yaw"] + heading_offset, 0.0
+                )
                 yaw_error = self._angle_error(desired_yaw, yaw)
-                requested = min(abs(stage["speed"]), max(0.045, abs(error) * 0.8))
-                vx = requested  # Always forward linear velocity since pivot pre-aligned heading
+                requested = min(
+                    abs(stage["speed"]),
+                    max(0.045, max(0.0, remaining) * 0.8),
+                )
+                vx = requested
                 wz = float(np.clip(1.6 * yaw_error, -0.28, 0.28))
             timeout = 90.0
-            detail = f"axis_error={error:.3f}m yaw_error={math.degrees(self._angle_error(stage['yaw'], yaw)):.1f}deg"
+            detail = (
+                f"remaining={remaining:.3f}m cross_error={cross_error:.3f}m "
+                f"yaw_error={math.degrees(self._angle_error(stage['yaw'], yaw)):.1f}deg"
+            )
 
         now = time.monotonic()
         if now - mission["last_log"] >= 1.0:
@@ -681,7 +807,7 @@ class DiffNavBridge(Node):
                 vx = min(0.35, max(0.08, 0.8 * distance))
                 wz = float(np.clip(1.2 * heading_error, -0.65, 0.65))
 
-            if distance <= 0.08:
+            if distance <= PRE_DOCK_POSITION_TOL:
                 mission["stage"] = "align_at_pre_dock"
                 mission["path_aligned"] = False
                 mission["stage_start"] = time.monotonic()
@@ -724,9 +850,9 @@ class DiffNavBridge(Node):
                 wz = float(np.clip(1.8 * yaw_error, -0.45, 0.45))
                 if abs(wz) < 0.18:
                     wz = math.copysign(0.18, yaw_error)
-            elif forward_error < 0.55:
+            elif forward_error < DOCK_RECOVERY_BACKOUT_DISTANCE:
                 phase = "recovery_backout"
-                vx = -0.08
+                vx = -DOCK_RECOVERY_BACKOUT_SPEED
                 wz = float(np.clip(1.8 * yaw_error, -0.20, 0.20))
             else:
                 mission["stage"] = "recovery_align"
@@ -772,7 +898,10 @@ class DiffNavBridge(Node):
             phase = "recovery_reapproach"
             if distance > 0.08:
                 if abs(heading_error) < math.radians(12.0):
-                    vx = min(0.08, max(0.018, 0.45 * distance))
+                    vx = min(
+                        DOCK_RECOVERY_REAPPROACH_SPEED,
+                        max(DOCK_APPROACH_MIN_SPEED, 0.60 * distance),
+                    )
                 wz = float(np.clip(1.8 * heading_error, -0.25, 0.25))
             else:
                 mission["stage"] = "recovery_final_align"
@@ -821,6 +950,11 @@ class DiffNavBridge(Node):
             if (
                 mission.get("near_goal_active", False)
                 and now - mission.get("near_goal_start", now) > DOCK_NEAR_TIMEOUT
+                and not (
+                    distance <= DOCK_POSITION_ENTER_TOL
+                    and abs(lateral_error) <= DOCK_LATERAL_ENTER_TOL
+                    and abs(yaw_error) <= DOCK_YAW_ENTER_TOL
+                )
             ):
                 mission["recovery_count"] = mission.get("recovery_count", 0) + 1
                 if mission["recovery_count"] > 3:
@@ -868,10 +1002,13 @@ class DiffNavBridge(Node):
             # Priority 2: Active Settle State Maintenance (Hysteresis Exit Tolerances)
             elif mission.get("settling", False):
                 position_exit_ok = distance <= DOCK_POSITION_EXIT_TOL
+                lateral_exit_ok = (
+                    abs(lateral_error) <= DOCK_LATERAL_EXIT_TOL
+                )
                 yaw_exit_ok = abs(yaw_error) <= DOCK_YAW_EXIT_TOL
                 motion_stopped = (abs(self._cmd_vx) <= 0.005 and abs(self._cmd_wz) <= 0.01)
 
-                if position_exit_ok and yaw_exit_ok:
+                if position_exit_ok and lateral_exit_ok and yaw_exit_ok:
                     phase = "settle_at_table"
                     vx = 0.0
                     wz = 0.0
@@ -887,6 +1024,7 @@ class DiffNavBridge(Node):
                     elif mission["settle_count"] >= DOCK_SETTLE_TICKS:
                         self.get_logger().info(
                             f"[nav_robot5] docking completed: distance={distance:.3f}m "
+                            f"lateral={lateral_error:.3f}m "
                             f"yaw_error={math.degrees(yaw_error):.2f}deg"
                         )
                         self._finish_direct_navigation(True, "completed", x, y, yaw)
@@ -896,7 +1034,11 @@ class DiffNavBridge(Node):
                     mission["settle_count"] = 0
 
             # Priority 3: New Settle State Entry (Strict Enter Tolerances)
-            elif distance <= DOCK_POSITION_ENTER_TOL and abs(yaw_error) <= DOCK_YAW_ENTER_TOL:
+            elif (
+                distance <= DOCK_POSITION_ENTER_TOL
+                and abs(lateral_error) <= DOCK_LATERAL_ENTER_TOL
+                and abs(yaw_error) <= DOCK_YAW_ENTER_TOL
+            ):
                 mission["settling"] = True
                 mission["settle_count"] = 1
                 mission["settle_start"] = now
@@ -906,7 +1048,9 @@ class DiffNavBridge(Node):
                 vx = 0.0
                 wz = 0.0
                 self.get_logger().info(
-                    f"[nav_robot5] dock settle entered: distance={distance:.3f}m yaw_error={math.degrees(yaw_error):.2f}deg"
+                    f"[nav_robot5] dock settle entered: distance={distance:.3f}m "
+                    f"lateral={lateral_error:.3f}m "
+                    f"yaw_error={math.degrees(yaw_error):.2f}deg"
                 )
 
             # Priority 4: Near Goal Docking (distance <= 6cm)
@@ -948,11 +1092,29 @@ class DiffNavBridge(Node):
                 else:
                     phase = "near_goal_creep"
                     mission["near_align_started"] = False
-                    vx = float(np.clip(0.30 * forward_error, -0.020, 0.025))
-                    if abs(vx) < 0.008 and abs(forward_error) > 0.004:
-                        vx = math.copysign(0.008, forward_error)
-                    # Maintain yaw error ONLY; remove lateral error coupling to prevent yaw degradation
-                    wz = float(np.clip(1.2 * yaw_error, -0.10, 0.10))
+                    vx = float(
+                        np.clip(
+                            DOCK_CREEP_GAIN * forward_error,
+                            -DOCK_CREEP_MAX_SPEED,
+                            DOCK_CREEP_MAX_SPEED,
+                        )
+                    )
+                    # Commands below 0.04 m/s do not reliably overcome the
+                    # simulated wheel-drive damping and contact stiction.
+                    if (
+                        abs(vx) < DOCK_CREEP_MIN_SPEED
+                        and abs(forward_error) > 0.004
+                    ):
+                        vx = math.copysign(DOCK_CREEP_MIN_SPEED, forward_error)
+                    # A differential-drive base must briefly steer toward the
+                    # goal line to remove lateral error before it can settle.
+                    wz = float(
+                        np.clip(
+                            1.2 * yaw_error + 1.8 * lateral_error,
+                            -0.12,
+                            0.12,
+                        )
+                    )
 
                 mission["settling"] = False
                 mission["settle_count"] = 0
@@ -962,8 +1124,13 @@ class DiffNavBridge(Node):
                 phase = "final_forward_approach"
                 if abs(yaw_error) <= math.radians(8.0):
                     vx = float(np.clip(0.45 * forward_error, -0.04, 0.08))
-                    if abs(vx) < 0.015 and abs(forward_error) > 0.004:
-                        vx = math.copysign(0.015, forward_error)
+                    if (
+                        abs(vx) < DOCK_APPROACH_MIN_SPEED
+                        and abs(forward_error) > 0.004
+                    ):
+                        vx = math.copysign(
+                            DOCK_APPROACH_MIN_SPEED, forward_error
+                        )
                 wz = float(np.clip(1.8 * yaw_error + 1.4 * lateral_error, -0.20, 0.20))
                 mission["settling"] = False
                 mission["settle_count"] = 0
@@ -1120,7 +1287,17 @@ class DiffNavBridge(Node):
         if nav_res is not None:
             target_vx, target_wz = nav_res
         else:
-            target_vx, target_wz = 0.0, 0.0
+            with self._lock:
+                direct_cmd_age = now - self._direct_cmd_time
+                external_cmd_age = now - self._external_cmd_time
+                if direct_cmd_age <= EXTERNAL_CMD_TIMEOUT:
+                    target_vx = self._direct_cmd_vx
+                    target_wz = self._direct_cmd_wz
+                elif external_cmd_age <= EXTERNAL_CMD_TIMEOUT:
+                    target_vx = self._external_cmd_vx
+                    target_wz = self._external_cmd_wz
+                else:
+                    target_vx, target_wz = 0.0, 0.0
 
         # Exact Slew Sequence from nav_restaurant_demo.py
         self._cmd_vx = self._slew(
