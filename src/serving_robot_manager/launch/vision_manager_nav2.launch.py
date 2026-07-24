@@ -22,6 +22,10 @@ from launch_ros.parameter_descriptions import ParameterValue
 
 def generate_launch_description():
     vision_debug = LaunchConfiguration("vision_debug")
+    use_sim_time = LaunchConfiguration("use_sim_time")
+    autostart = LaunchConfiguration("autostart")
+    rviz = LaunchConfiguration("rviz")
+
     two_wheel_share = get_package_share_directory("two_wheel_rails")
     nav2_launch_path = os.path.join(two_wheel_share, "launch", "nav2.launch.py")
 
@@ -32,25 +36,52 @@ def generate_launch_description():
                 default_value="false",
                 description="Publish /hand_detection/image with boxes and ROI",
             ),
-            # 1. Nav2 Stack bringing up AMCL, Costmaps, Planner, Controller and Topic Bridge
-            IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(nav2_launch_path)
+            DeclareLaunchArgument(
+                "use_sim_time",
+                default_value="true",
+                description="Use simulation clock",
             ),
-            # 2. Navigation Subsystem Node interfacing Nav2 with Manager Node
+            DeclareLaunchArgument(
+                "autostart",
+                default_value="true",
+                description="Automatically startup Nav2 stack",
+            ),
+            DeclareLaunchArgument(
+                "rviz",
+                default_value="true",
+                description="Launch RViz2 for navigation visualization",
+            ),
+            # 1. Nav2 Stack bringing up AMCL, Costmaps, Planner, Controller, Topic Bridge & RViz
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(nav2_launch_path),
+                launch_arguments={
+                    "use_sim_time": use_sim_time,
+                    "autostart": autostart,
+                    "rviz": rviz,
+                }.items(),
+            ),
+            # 2. Isaac Subsystem Adapter Node bridging Manager's TaskCommand to Isaac Sim's std_msgs/Int32 triggers/statuses
+            Node(
+                package="serving_robot_manager",
+                executable="isaac_subsystem_adapter_node",
+                name="isaac_subsystem_adapter_node",
+                output="screen",
+            ),
+            # 3. Navigation Subsystem Node interfacing Nav2 with Manager Node
             Node(
                 package="two_wheel_rails",
                 executable="navigation_subsystem",
                 name="navigation_subsystem",
                 output="screen",
             ),
-            # 3. Serving Manager Node handling ordering state machine
+            # 4. Serving Manager Node handling ordering state machine
             Node(
                 package="serving_robot_manager",
                 executable="manager_node",
                 name="manager_node",
                 output="screen",
             ),
-            # 4. Hand Safety Detector Node
+            # 5. Hand Safety Detector Node
             Node(
                 package="hand_safety",
                 executable="hand_detector_node",

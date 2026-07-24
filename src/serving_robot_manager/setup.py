@@ -29,6 +29,7 @@ setup(
         'console_scripts': [
             'manager_node = serving_robot_manager.manager_node:main',
             'mock_subsystems_node = serving_robot_manager.mock_subsystems_node:main',
+            'isaac_subsystem_adapter_node = serving_robot_manager.isaac_subsystem_adapter_node:main',
         ],
     },
 )
