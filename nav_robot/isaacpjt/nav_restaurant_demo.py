@@ -1122,6 +1122,8 @@ class NavBridge(Node):
         self._spawned_serving_tasks = {}
         self._direct_nav = None
         self._direct_nav_request = None
+        self._active_two_wheel_mission_id = ""
+        self._active_two_wheel_target = None
         self._navigation_paused = False
         self._navigation_pause_started = None
         self._navigation_location = 4
@@ -1187,6 +1189,23 @@ class NavBridge(Node):
         self.create_subscription(
             Int32, "/navigation/trigger", self._on_navigation_trigger, qos
         )
+
+        mission_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.two_wheel_mission_status_pub = self.create_publisher(
+            String, "/two_wheel/mission_status", mission_qos
+        )
+        self.create_subscription(
+            String,
+            "/two_wheel/mission_command",
+            self._on_two_wheel_mission_command,
+            mission_qos,
+        )
+
         self._obstacle_test_controller = None
         self.create_service(
             SetBool,
@@ -1397,6 +1416,152 @@ class NavBridge(Node):
             )
         self.arm_status_pub.publish(Int32(data=1))
         return True
+
+    def _publish_two_wheel_mission_status(
+        self, state, phase, reason="", mission_id=None, **extra
+    ):
+        active_id = mission_id or self._active_two_wheel_mission_id
+        if not active_id:
+            return
+        payload = {
+            "mission_id": active_id,
+            "state": str(state),
+            "phase": str(phase),
+        }
+        if reason:
+            payload["reason"] = str(reason)
+        payload.update(extra)
+        self.two_wheel_mission_status_pub.publish(
+            String(data=json.dumps(payload, ensure_ascii=False))
+        )
+
+    @staticmethod
+    def _two_wheel_target_from_payload(payload):
+        mission_id = str(payload.get("mission_id", "")).strip().lower()
+
+        for table_id in range(4):
+            if mission_id.startswith(f"table_{table_id}_"):
+                return table_id
+        if mission_id.startswith("kitchen_"):
+            return 4
+
+        for key in (
+            "target",
+            "command",
+            "route_id",
+            "table_id",
+            "destination",
+            "goal_name",
+        ):
+            if key not in payload:
+                continue
+            value = payload[key]
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                value = int(value)
+                if value in (0, 1, 2, 3, 4):
+                    return value
+                continue
+
+            value = str(value).strip().lower()
+            if value in ("kitchen", "home", "주방"):
+                return 4
+            for table_id in range(4):
+                if value in (
+                    str(table_id),
+                    f"table_{table_id}",
+                    f"table{table_id}",
+                    f"table {table_id}",
+                ):
+                    return table_id
+        return None
+
+    def _on_two_wheel_mission_command(self, msg: String):
+        try:
+            payload = json.loads(msg.data)
+            if not isinstance(payload, dict):
+                raise ValueError("payload must be a JSON object")
+        except Exception as exc:
+            self.get_logger().error(
+                f"[Mission RX] invalid JSON: {exc}; raw={msg.data!r}"
+            )
+            return
+
+        mission_id = str(payload.get("mission_id", "")).strip()
+        kind = str(payload.get("kind", "")).strip().lower()
+
+        if kind == "cancel":
+            if mission_id and mission_id == self._active_two_wheel_mission_id:
+                with self._lock:
+                    self._direct_nav = None
+                    self._direct_nav_request = None
+                    self._target_vx = 0.0
+                    self._target_wz = 0.0
+                    self._cmd_vx = 0.0
+                    self._cmd_wz = 0.0
+                self._publish_two_wheel_mission_status(
+                    "cancelled", "cancelled", mission_id=mission_id
+                )
+                self._active_two_wheel_mission_id = ""
+                self._active_two_wheel_target = None
+            return
+
+        if not mission_id:
+            self.get_logger().error(
+                f"[Mission RX] missing mission_id: {payload}"
+            )
+            return
+
+        target = self._two_wheel_target_from_payload(payload)
+        if target is None:
+            self._publish_two_wheel_mission_status(
+                "failed",
+                "parse_error",
+                reason=f"unable to infer target from payload: {payload}",
+                mission_id=mission_id,
+            )
+            return
+
+        with self._lock:
+            busy = (
+                self._direct_nav is not None
+                or self._direct_nav_request is not None
+            )
+
+        if busy:
+            self._publish_two_wheel_mission_status(
+                "failed",
+                "busy",
+                reason="navigation already active",
+                mission_id=mission_id,
+            )
+            return
+
+        self._active_two_wheel_mission_id = mission_id
+        self._active_two_wheel_target = target
+
+        points = payload.get("points", [])
+        dock = payload.get("dock", payload.get("goal"))
+        self.get_logger().info(
+            f"[Mission RX] id={mission_id} target={target} "
+            f"points={len(points) if isinstance(points, list) else '?'} "
+            f"dock={dock}"
+        )
+
+        self._publish_two_wheel_mission_status(
+            "accepted", "accepted", target=target
+        )
+
+        if not self._queue_navigation(target):
+            self._publish_two_wheel_mission_status(
+                "failed",
+                "queue_rejected",
+                reason=f"direct navigation rejected target={target}",
+                mission_id=mission_id,
+            )
+            self._active_two_wheel_mission_id = ""
+            self._active_two_wheel_target = None
 
     def _on_navigation_trigger(self, msg: Int32):
         self._queue_navigation(int(msg.data))
@@ -1858,6 +2023,17 @@ class NavBridge(Node):
             self._target_vx = self._target_wz = 0.0
             self.navigation_location_pub.publish(Int32(data=4))
             self.navigation_status_pub.publish(Int32(data=2))
+            if self._active_two_wheel_mission_id:
+                mission_id = self._active_two_wheel_mission_id
+                self._publish_two_wheel_mission_status(
+                    "completed", "completed", target=4
+                )
+                self.get_logger().info(
+                    f"[Mission TX] completed id={mission_id} target=4 "
+                    "(already at kitchen)"
+                )
+                self._active_two_wheel_mission_id = ""
+                self._active_two_wheel_target = None
             self.get_logger().info(
                 "already at kitchen; acknowledged redundant target=4 "
                 "without moving"
@@ -1901,9 +2077,33 @@ class NavBridge(Node):
             self._navigation_location = target
             self.navigation_location_pub.publish(Int32(data=target))
             self.navigation_status_pub.publish(Int32(data=2))
+            if self._active_two_wheel_mission_id:
+                mission_id = self._active_two_wheel_mission_id
+                self._publish_two_wheel_mission_status(
+                    "completed", "completed", target=target
+                )
+                self.get_logger().info(
+                    f"[Mission TX] completed id={mission_id} target={target}"
+                )
+                self._active_two_wheel_mission_id = ""
+                self._active_two_wheel_target = None
             self.get_logger().info(f"direct navigation complete target={target}")
         else:
             self.navigation_status_pub.publish(Int32(data=3))
+            if self._active_two_wheel_mission_id:
+                mission_id = self._active_two_wheel_mission_id
+                self._publish_two_wheel_mission_status(
+                    "failed",
+                    "execution_failed",
+                    reason=reason,
+                    target=target,
+                )
+                self.get_logger().error(
+                    f"[Mission TX] failed id={mission_id} target={target}: "
+                    f"{reason}"
+                )
+                self._active_two_wheel_mission_id = ""
+                self._active_two_wheel_target = None
             self.get_logger().error(
                 f"direct navigation failed target={target}: {reason}"
             )
@@ -2321,6 +2521,11 @@ class NavBridge(Node):
                     dish_prim = self.stage.GetPrimAtPath("/World/ServingDish")
                     if dish_prim.IsValid():
                         dish_body = UsdPhysics.RigidBodyAPI.Get(self.stage, dish_prim.GetPath())
+                        if dish_body:
+                            dish_body.GetKinematicEnabledAttr().Set(False)
+                            self.get_logger().info(
+                                "[FoodSpawn] Enabled dynamic physics for pizza dish"
+                            )
                 # Verify required prims exist on Stage for requested items
                 missing_prims = []
                 if pizza_requested and not self.stage.GetPrimAtPath("/World/ServingDish").IsValid():
