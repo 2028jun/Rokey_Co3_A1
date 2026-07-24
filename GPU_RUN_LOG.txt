@@ -1219,7 +1219,7 @@ Still broken / follow-up:
 - `HAND_TEST_RIG_MODE=legacy` and `/serving_robot/table_arrived`'s missing
   real publisher remain unchanged, as in every prior pass.
 
-## Pass 11 -- 2026-07-24 (GPU hardware, commit TBD)
+## Pass 11 -- 2026-07-24 (GPU hardware, commit bfcac9d)
 
 Prompted by the user testing pass 10's mechanism via the GUI themselves and
 reporting three concrete problems: (1) the character doesn't look like it
