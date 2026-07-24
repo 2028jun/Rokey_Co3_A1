@@ -3070,6 +3070,21 @@ class NavBridge(Node):
 
 
 def main():
+    crossing_pedestrian_module = None
+    if os.environ.get("NAV_CROSSING_PEDESTRIAN", "1") == "1":
+        try:
+            import crossing_pedestrian_actor as crossing_pedestrian_module
+
+            crossing_pedestrian_module.enable_extensions()
+            for _ in range(30):
+                simulation_app.update()
+        except Exception as exc:
+            crossing_pedestrian_module = None
+            print(
+                f"[crossing_pedestrian] extension setup warning: {exc}",
+                flush=True,
+            )
+
     stage = open_restaurant_and_robot()
     configure_joint_drives(stage)
     configure_wheel_contact_material(stage)
@@ -3103,6 +3118,21 @@ def main():
         f"{DIFFERENTIAL_HALF_TRACK:.3f}m",
         flush=True,
     )
+
+    crossing_pedestrian_controller = None
+    if crossing_pedestrian_module is not None:
+        try:
+            crossing_person = crossing_pedestrian_module.spawn(stage)
+            crossing_pedestrian_controller = (
+                crossing_pedestrian_module.CrossingPedestrianController(
+                    crossing_person
+                )
+            )
+        except Exception as exc:
+            print(
+                f"[crossing_pedestrian] actor setup warning: {exc}",
+                flush=True,
+            )
 
     reach_animator = None
     if os.environ.get("MOBILE_DEMO_HAND_TEST", "1") == "1":
@@ -3150,12 +3180,23 @@ def main():
                     obstacle_person_controller.update()
                 except Exception:
                     pass
+            if crossing_pedestrian_controller is not None:
+                try:
+                    crossing_pedestrian_controller.update()
+                except Exception as exc:
+                    print(
+                        f"[crossing_pedestrian] update warning: {exc}",
+                        flush=True,
+                    )
+                    crossing_pedestrian_controller = None
             try:
                 sim_time = timeline.get_current_time()
                 bridge.tick(float(sim_time))
             except Exception as exc:
                 print(f"[err] tick error: {exc}", flush=True)
     finally:
+        if crossing_pedestrian_controller is not None:
+            crossing_pedestrian_controller.shutdown()
         executor.shutdown()
         bridge.destroy_node()
         if rclpy.ok():
