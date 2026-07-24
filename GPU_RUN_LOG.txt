@@ -965,7 +965,7 @@ Still broken / follow-up:
 - `HAND_TEST_RIG_MODE=legacy` and `/serving_robot/table_arrived`'s missing
   real publisher are both unchanged, as in every prior pass.
 
-## Pass 9 -- 2026-07-24 (GPU hardware, commit pending)
+## Pass 9 -- 2026-07-24 (GPU hardware, commit 43f2598)
 
 Direction this pass (reviewer's explicit call, see VISION_TEST_GPU_PROMPT.txt
 at the start of this pass): discard passes 5-8's hand-authored rigid-arm
