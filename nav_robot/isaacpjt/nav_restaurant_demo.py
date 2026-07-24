@@ -24,10 +24,11 @@ WORKSPACE = Path(
 ).resolve()
 SERVING_WORKSPACE = WORKSPACE.parent / "serving_robot"
 
-_ros_bridge_lib = Path(
-    "/home/rokey/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/"
-    "exts/isaacsim.ros2.bridge/humble/lib"
+ISAAC_SIM_ROOT = os.environ.get(
+    "ISAAC_SIM_ROOT",
+    str(Path.home() / "dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release"),
 )
+_ros_bridge_lib = Path(ISAAC_SIM_ROOT) / "exts/isaacsim.ros2.bridge/humble/lib"
 os.environ.setdefault("ROS_DISTRO", "humble")
 os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
 os.environ["ROS_DOMAIN_ID"] = os.environ.get("NAV_ROBOT_ROS_DOMAIN_ID", "102")

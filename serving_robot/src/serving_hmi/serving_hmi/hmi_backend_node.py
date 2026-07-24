@@ -758,7 +758,6 @@ async def broadcast_loop():
 # Setup static files directory
 script_dir = os.path.dirname(os.path.abspath(__file__))
 candidate_paths = [
-    "/home/rokey/Rokey_Co3_A1/src/serving_hmi/web_ui",
     os.path.abspath(os.path.join(script_dir, "..", "web_ui")),
     os.path.abspath(os.path.join(script_dir, "..", "..", "..", "..", "src", "serving_hmi", "web_ui")),
 ]
