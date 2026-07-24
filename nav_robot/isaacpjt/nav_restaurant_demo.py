@@ -3071,7 +3071,10 @@ class NavBridge(Node):
 
 def main():
     crossing_pedestrian_module = None
-    if os.environ.get("NAV_CROSSING_PEDESTRIAN", "1") == "1":
+    if (
+        os.environ.get("NAV_CROSSING_PEDESTRIAN", "1") == "1"
+        or os.environ.get("NAV_TYPING_CUSTOMER", "1") == "1"
+    ):
         try:
             import crossing_pedestrian_actor as crossing_pedestrian_module
 
@@ -3119,8 +3122,31 @@ def main():
         flush=True,
     )
 
+    typing_customer_controller = None
+    if (
+        crossing_pedestrian_module is not None
+        and crossing_pedestrian_module.TYPING_ENABLED
+    ):
+        try:
+            typing_person = (
+                crossing_pedestrian_module.spawn_typing_customer(stage)
+            )
+            typing_customer_controller = (
+                crossing_pedestrian_module.TypingTopicController(
+                    typing_person
+                )
+            )
+        except Exception as exc:
+            print(
+                f"[typing_topic] actor setup warning: {exc}",
+                flush=True,
+            )
+
     crossing_pedestrian_controller = None
-    if crossing_pedestrian_module is not None:
+    if (
+        crossing_pedestrian_module is not None
+        and crossing_pedestrian_module.ENABLED
+    ):
         try:
             crossing_person = crossing_pedestrian_module.spawn(stage)
             crossing_pedestrian_controller = (
@@ -3180,6 +3206,16 @@ def main():
                     obstacle_person_controller.update()
                 except Exception:
                     pass
+            if typing_customer_controller is not None:
+                try:
+                    typing_customer_controller.update()
+                except Exception as exc:
+                    print(
+                        f"[typing_topic] update warning: {exc}",
+                        flush=True,
+                    )
+                    typing_customer_controller.shutdown()
+                    typing_customer_controller = None
             if crossing_pedestrian_controller is not None:
                 try:
                     crossing_pedestrian_controller.update()
@@ -3195,6 +3231,8 @@ def main():
             except Exception as exc:
                 print(f"[err] tick error: {exc}", flush=True)
     finally:
+        if typing_customer_controller is not None:
+            typing_customer_controller.shutdown()
         if crossing_pedestrian_controller is not None:
             crossing_pedestrian_controller.shutdown()
         executor.shutdown()
