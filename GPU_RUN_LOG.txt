@@ -1350,3 +1350,112 @@ Still broken / follow-up:
   pipeline during typing) is untouched this pass.
 - `HAND_TEST_RIG_MODE=legacy` and `/serving_robot/table_arrived`'s missing
   real publisher remain unchanged, as in every prior pass.
+
+## Pass 12 -- 2026-07-24 (GPU hardware, commit TBD)
+
+Continuation of the same session, per user direction after pass 11: leave
+the sit/stand rotation bug (2) as documented and open, and investigate the
+user's third complaint -- confirm whether the hand is actually detected by
+the real `hand_safety`/YOLO pipeline during `type_keyboard`.
+
+Tested:
+- Found `_find_hand_joint_world_positions()` (built pass 9/10, never
+  actually verified against the new actor_sdg character until now) was
+  silently broken in two independent ways, confirmed by direct debugging:
+  (a) `UsdSkel.BindingAPI(skelroot_prim).GetSkeletonRel().GetTargets()`
+  returns an empty list on the default biped asset even though a
+  `Skeleton`-typed prim IS present as a direct child (confirmed by dumping
+  every descendant prim's type) -- the binding is evidently established
+  through the AnimationGraph setup, not an explicit USD `skel:skeleton`
+  relationship, so the original code's `if not targets: return {}` always
+  silently short-circuited; (b) once fixed to find the `Skeleton` prim by
+  walking descendants directly, hit a second bug: `skel_query.
+  ComputeJointWorldTransforms(time)` throws `Boost.Python.ArgumentError`
+  immediately -- this API needs a `UsdGeomXformCache`, not a bare
+  `Usd.TimeCode`, and this bug had been latent and unreachable this whole
+  time because of bug (a)'s early return. Fixed both; also discovered
+  (dumping the full joint list) that this skeleton's joints go straight
+  from `L_Wrist`/`R_Wrist` to finger joints with no joint literally named
+  "hand" anywhere, unlike whatever rig `_find_hand_joint_world_positions`'s
+  original "hand"-only substring filter was written for -- broadened the
+  filter to match "wrist" too.
+- With that fixed, measured the real wrist joint's world position
+  projected through the table camera during `type_keyboard`: normalized
+  x in roughly [-0.20, 0.14], y in roughly [0.49, 0.97] (both wrists,
+  sampled across the full typing window). The currently configured
+  `TABLE_ROI_NORMALIZED` (`hand_safety/hand_safety/roi_intrusion.py`) is
+  x=[0.10, 0.32], y=[0.28, 0.52] -- no overlap. That ROI's own comments
+  already say it was measured for the OLD rigid-arm rig's reach position,
+  never re-measured for actor_sdg -- confirmed here that it is indeed
+  stale for the new mechanism.
+- Ran the real four-terminal-equivalent pipeline headlessly (Isaac Sim
+  with `HAND_TEST_RIG_MODE=actor_sdg`, `MOBILE_DEMO_ROS_CAMERA=1`,
+  `MOBILE_DEMO_CAPTURE_POSES=1`; `hand_safety`'s real `hand_detector_node`
+  built via colcon and run against the live `/serving_robot/table_camera/
+  color/image_raw` topic; `/serving_robot/table_arrived` published once
+  via the documented `ros2 topic pub --once --qos-durability
+  transient_local` gate). Sampled `/hand_detection/detections` directly
+  via an `rclpy` subscriber (not just `ros2 topic echo`, which hit an
+  unrelated stuck-daemon issue mid-session, fixed by `ros2 daemon
+  stop`/`start`) across two separate runs, both spanning at least one full
+  `type_keyboard` window each (confirmed by cross-referencing against the
+  live `CharacterBehavior` command-queue prints): 76 combined samples,
+  every single one `"count": 0, "detections": [], "roi_intrusion": false`.
+  Zero false negatives suppressed -- this is a real, consistent zero
+  across every sample, not a sparse/flaky miss.
+- Saved actual annotated frames from `/hand_detection/image` (fixing a
+  QoS reliability mismatch that made a naive subscriber receive nothing --
+  the publisher uses best-effort, a plain default-QoS subscription
+  doesn't connect). The frames show why: the table camera's fixed
+  real-world position and the actor_sdg character's stand position
+  (`STAND_XY`) put the character's leg immediately in front of and mostly
+  filling the camera's view -- the frame is dominated by an
+  out-of-focus/out-of-frame leg silhouette, with the character's
+  hands/upper body not usefully visible in this camera's framing at all
+  during typing, and the ROI box drawn over an empty area of the room
+  (a plant and some chairs) nowhere near the character. The overlay's own
+  "Hands: 0" counter (independent of the ROS message data) confirms the
+  same zero.
+
+Changed:
+- `isaacpjt/mobile_manipulator_demo.py`: fixed `_find_hand_joint_world_
+  positions()`'s two real bugs described above (Skeleton-prim lookup via
+  descendant search instead of the empty binding relationship; the
+  `ComputeJointWorldTransforms()` call signature) and broadened its name
+  filter to match "wrist" as well as "hand". This function now actually
+  works for the actor_sdg character for the first time since it was
+  written.
+
+Observed / answer to the user's complaint (3):
+- **Confirmed negative, with evidence, per the prompt's own instruction
+  not to assume a positive result:** the hand is NOT currently detected by
+  `hand_safety` during `type_keyboard` with the actor_sdg character. This
+  is not a YOLO failure or a `hand_safety` bug -- it's a real geometric
+  mismatch between the actor_sdg character's stand/camera position and
+  both (a) the fixed table camera's framing (the character's hands aren't
+  usefully in view at all from this camera at `STAND_XY`) and (b) the
+  ROI polygon (measured for the old rigid-arm rig's completely different
+  reach position, never updated for actor_sdg).
+
+Still broken / follow-up:
+- This is exactly the situation the existing prompt's goal 7 (adaptive
+  walk-in) already anticipated and was written to solve: for whichever
+  behavior doesn't bring the hand into `TABLE_ROI_NORMALIZED`, use
+  `actor_sdg_test_actor.py`'s existing `HAND_TEST_WALK_IN_BEFORE`/`_X`/`_Y`
+  mechanism to insert a `GoTo` before that behavior, using the (now
+  actually working) `_find_hand_joint_world_positions()` +
+  `_project_to_normalized()` measurements to find a stand position/camera
+  setup where the hand genuinely lands in frame and in the ROI. This pass
+  did not attempt that -- it was scoped to confirming detection status,
+  per the user's specific ask, not fixing it. Whoever picks this up next
+  should measure a corrected `HAND_TEST_WALK_IN_XY` (or reconsider the
+  table camera's own placement, which may need to move too, since the
+  character isn't usefully in frame at all right now) and re-run this same
+  measurement loop until the hand genuinely projects inside both the
+  camera's frame and the ROI, then re-confirm detection.
+- Bug (2) (sit/stand rotation drift) remains open exactly as pass 11 left
+  it -- not touched this pass, per user direction.
+- Bug (1) ("doesn't sit") remains believed-not-a-separate-bug per pass 11,
+  still not re-confirmed by eye.
+- `HAND_TEST_RIG_MODE=legacy` and `/serving_robot/table_arrived`'s missing
+  real publisher remain unchanged, as in every prior pass.

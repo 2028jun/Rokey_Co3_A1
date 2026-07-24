@@ -691,32 +691,55 @@ def capture_pose_frames(stage, reach_animator):
 
 def _find_hand_joint_world_positions(stage, skelroot_prim):
     """Return {joint_name: world_position} for every joint in skelroot_prim's
-    skeleton whose name contains "hand" (case-insensitive), computed at the
-    current timeline time. Used to measure where the actor_sdg character's
-    hand actually is during a behavior state, the same kind of true-geometry
-    measurement pass 8 did for the old rig's glove mesh -- except here there
-    is no dedicated glove prim, so the skeleton joint itself is the anchor.
+    skeleton whose name contains "hand" or "wrist" (case-insensitive),
+    computed at the current timeline time. Used to measure where the
+    actor_sdg character's hand actually is during a behavior state, the
+    same kind of true-geometry measurement pass 8 did for the old rig's
+    glove mesh -- except here there is no dedicated glove prim, so the
+    skeleton joint itself is the anchor.
+
+    Finds the Skeleton prim by walking skelroot_prim's own descendants
+    instead of `UsdSkel.BindingAPI(skelroot_prim).GetSkeletonRel()`: on the
+    default biped asset (`isaacsim.replicator.agent.core`'s
+    `load_character_usd_to_stage()`), that relationship's targets list is
+    empty even though a `Skeleton`-typed prim is directly present as a
+    child (confirmed pass 11) -- likely bound via the AnimationGraph setup
+    rather than an explicit `skel:skeleton` USD relationship. Matching
+    "wrist" as well as "hand" matters for the same reason: this skeleton's
+    joint names go straight from `L_Wrist`/`R_Wrist` to finger joints, with
+    no joint literally named "Hand" anywhere (confirmed pass 11 by dumping
+    the full joint list) -- the old rig apparently had one, hence the
+    original hand-only filter silently returning nothing for this rig.
     """
     from pxr import UsdSkel
 
-    skel_binding = UsdSkel.BindingAPI(skelroot_prim)
-    skeleton_rel = skel_binding.GetSkeletonRel()
-    targets = skeleton_rel.GetTargets()
-    if not targets:
+    skeleton_prim = None
+    for prim in Usd.PrimRange(skelroot_prim):
+        if prim.GetTypeName() == "Skeleton":
+            skeleton_prim = prim
+            break
+    if skeleton_prim is None:
         return {}
-    skeleton = UsdSkel.Skeleton(stage.GetPrimAtPath(targets[0]))
+    skeleton = UsdSkel.Skeleton(skeleton_prim)
     cache = UsdSkel.Cache()
     skel_query = cache.GetSkelQuery(skeleton)
     if not skel_query:
         return {}
     joint_order = skel_query.GetJointOrder()
     time = Usd.TimeCode(omni.timeline.get_timeline_interface().get_current_time() * stage.GetTimeCodesPerSecond())
-    world_transforms = skel_query.ComputeJointWorldTransforms(time)
+    # ComputeJointWorldTransforms() takes a UsdGeomXformCache, not a bare
+    # TimeCode (confirmed pass 11 -- the original bare-TimeCode call
+    # crashes the whole process with Boost.Python.ArgumentError the
+    # moment execution actually reaches it; it never had before, since the
+    # skeleton-lookup fix above is what first let this line run at all).
+    joint_xform_cache = UsdGeom.XformCache(time)
+    world_transforms = skel_query.ComputeJointWorldTransforms(joint_xform_cache)
     if world_transforms is None:
         return {}
     results = {}
     for name, xform in zip(joint_order, world_transforms):
-        if "hand" in str(name).lower():
+        name_lower = str(name).lower()
+        if "hand" in name_lower or "wrist" in name_lower:
             matrix = Gf.Matrix4d(xform)
             results[str(name)] = matrix.ExtractTranslation()
     return results
