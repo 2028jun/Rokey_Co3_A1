@@ -141,6 +141,29 @@ def generate_launch_description():
                     "autostart": autostart,
                 }.items(),
             ),
+            # Independent safety layer.  Owns its own lifecycle manager
+            # because it is not part of nav2_bringup's navigation_launch.py
+            # lifecycle group; see nav2_params.yaml's collision_monitor
+            # block for why it sits after velocity_smoother and gates
+            # "cmd_vel" -> "cmd_vel_safe".
+            Node(
+                package="nav2_collision_monitor",
+                executable="collision_monitor",
+                name="collision_monitor",
+                output="screen",
+                parameters=[navigation_params],
+            ),
+            Node(
+                package="nav2_lifecycle_manager",
+                executable="lifecycle_manager",
+                name="lifecycle_manager_collision_monitor",
+                output="screen",
+                parameters=[
+                    {"use_sim_time": use_sim_time},
+                    {"autostart": autostart},
+                    {"node_names": ["collision_monitor"]},
+                ],
+            ),
             Node(
                 condition=IfCondition(rviz),
                 package="rviz2",

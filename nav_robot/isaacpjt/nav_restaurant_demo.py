@@ -268,6 +268,19 @@ LIDAR_PERIOD_SEC = 0.10
 LIDAR_SENSOR_FORWARD = 0.48
 LIDAR_SENSOR_HEIGHT = 0.45
 
+# Robot-local safety rectangles for _direct_nav's obstacle check (mission
+# driving never touches ROS cmd_vel, so it cannot be protected by
+# nav2_collision_monitor -- this mirrors that node's stop/slowdown polygons
+# from nav2_params.yaml so the two stay in sync).  Unlike the old
+# front_angle=15deg cone, these cover the robot's sides and rear too.
+OBSTACLE_STOP_FRONT = 0.55
+OBSTACLE_STOP_BACK = -0.35
+OBSTACLE_STOP_HALF_WIDTH = 0.50
+OBSTACLE_SLOWDOWN_FRONT = 1.20
+OBSTACLE_SLOWDOWN_BACK = -0.45
+OBSTACLE_SLOWDOWN_HALF_WIDTH = 0.70
+OBSTACLE_SLOWDOWN_RATIO = 0.3
+
 _front_lidar_render_product = None
 _front_lidar_writer = None
 _embedded_lidar_render_product = None
@@ -1160,7 +1173,13 @@ class NavBridge(Node):
         self.nav_scan_pub = self.create_publisher(LaserScan, "/nav_robot/scan", sensor_qos)
         self.two_wheel_scan_pub = self.create_publisher(LaserScan, "/two_wheel/scan_raw", sensor_qos)
         self.create_subscription(Twist, "/nav_robot/cmd_vel", self._on_cmd_vel, qos)
-        self.create_subscription(Twist, "cmd_vel", self._on_cmd_vel, qos)
+        # nav2_collision_monitor sits between the controller/velocity_smoother
+        # output and the robot: it re-publishes "cmd_vel" as "cmd_vel_safe"
+        # after gating it against the stop/slowdown polygons in
+        # nav2_params.yaml.  Listening here (not on raw "cmd_vel") means both
+        # Nav2's planned driving and rail_navigator's direct backup commands
+        # (which also publish to "cmd_vel") get the same safety gate.
+        self.create_subscription(Twist, "cmd_vel_safe", self._on_cmd_vel, qos)
         self.create_subscription(
             PoseStamped, "/nav_robot/teleport", self._on_teleport, qos
         )
@@ -1919,44 +1938,48 @@ class NavBridge(Node):
                     self._clear_obstacle_state()
                     return
 
-            # Start reacting earlier at the 0.50 m/s aisle cruise speed.
-            slow_distance = 1.70
-            stop_distance = 0.75
-            resume_distance = 1.05
-            front_angle = math.radians(15.0)
-
-            valid_ranges = []
+            # Robot-local (not just forward-cone) safety check: classify each
+            # finite hit by its position relative to the robot center, not
+            # just its bearing.  OBSTACLE_STOP_*/OBSTACLE_SLOWDOWN_* mirror
+            # nav2_params.yaml's collision_monitor stop/slowdown polygons, so
+            # a person approaching from the side or rear is caught the same
+            # way one approaching head-on is.
+            stop_hits = []
+            slowdown_hits = []
             for idx, distance in enumerate(ranges):
-                angle = angle_min + idx * angle_increment
-                norm_angle = math.atan2(math.sin(angle), math.cos(angle))
-                if abs(norm_angle) > front_angle:
-                    continue
                 if not math.isfinite(distance):
                     continue
-                if range_min <= distance <= range_max:
-                    valid_ranges.append(distance)
+                if not (range_min <= distance <= range_max):
+                    continue
+                angle = angle_min + idx * angle_increment
+                lx = LIDAR_SENSOR_FORWARD + distance * math.cos(angle)
+                ly = distance * math.sin(angle)
+                if (
+                    OBSTACLE_SLOWDOWN_BACK <= lx <= OBSTACLE_SLOWDOWN_FRONT
+                    and abs(ly) <= OBSTACLE_SLOWDOWN_HALF_WIDTH
+                ):
+                    slowdown_hits.append(distance)
+                    if (
+                        OBSTACLE_STOP_BACK <= lx <= OBSTACLE_STOP_FRONT
+                        and abs(ly) <= OBSTACLE_STOP_HALF_WIDTH
+                    ):
+                        stop_hits.append(distance)
 
-            if not valid_ranges:
-                nearest = float("inf")
-                close_points = []
-            else:
-                nearest = min(valid_ranges)
-                close_points = [d for d in valid_ranges if d <= stop_distance]
+            nearest = min(slowdown_hits) if slowdown_hits else float("inf")
+            close_points = stop_hits
 
             now = time.monotonic()
 
             if not self._obstacle_stop:
-                if len(close_points) >= 3 and nearest <= stop_distance:
+                if len(close_points) >= 3:
                     self._start_obstacle_stop(nearest)
-                elif nearest < slow_distance:
-                    ratio = (nearest - stop_distance) / (slow_distance - stop_distance)
-                    ratio = float(np.clip(ratio, 0.0, 1.0))
-                    self._obstacle_scale = max(0.03, ratio * ratio)
+                elif slowdown_hits:
+                    self._obstacle_scale = OBSTACLE_SLOWDOWN_RATIO
                 else:
                     self._obstacle_scale = 1.0
             else:
                 self._obstacle_scale = 0.0
-                if nearest >= resume_distance:
+                if not slowdown_hits:
                     if self._clearance_start is None:
                         self._clearance_start = now
                     elif now - self._clearance_start >= 0.5:
@@ -1964,7 +1987,7 @@ class NavBridge(Node):
                 else:
                     self._clearance_start = None
 
-            is_decel_or_stop = (nearest < slow_distance) or self._obstacle_stop
+            is_decel_or_stop = bool(slowdown_hits) or self._obstacle_stop
             if is_decel_or_stop != getattr(self, "_last_decel_event_state", False):
                 self._last_decel_event_state = is_decel_or_stop
                 self._publish_obstacle_event(is_decel_or_stop)
@@ -1986,7 +2009,7 @@ class NavBridge(Node):
         self._target_vx = 0.0
         self._target_wz = 0.0
         self.get_logger().warning(
-            f"전방 장애물(사람) 최근접 감지: distance={distance:.2f}m <= {1.0}m, 주행 정지"
+            f"주변 장애물(사람) 정지영역 진입: distance={distance:.2f}m, 주행 정지"
         )
 
     def _finish_obstacle_stop(self, distance: float):

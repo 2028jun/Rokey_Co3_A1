@@ -139,7 +139,7 @@ controller_server:
       use_collision_detection: true
       max_allowed_time_to_collision_up_to_target: 1.4
       use_regulated_linear_velocity_scaling: true
-      use_cost_regulated_linear_velocity_scaling: false
+      use_cost_regulated_linear_velocity_scaling: true
       regulated_linear_scaling_min_radius: 1.6
       regulated_linear_scaling_min_speed: 0.15
       use_rotate_to_heading: false
@@ -302,3 +302,46 @@ velocity_smoother:
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
     velocity_timeout: 1.0
+
+# Independent safety layer: watches the live /scan against fixed polygons
+# around the robot, regardless of what path the controller is following.
+# Sits after velocity_smoother -- it re-publishes "cmd_vel" (from the
+# controller/smoother AND rail_navigator's direct backup commands) as
+# "cmd_vel_safe", which is what the Isaac bridge actually subscribes to.
+# This is what catches a person crossing in from the side, which
+# RegulatedPurePursuitController's path-projected collision check and
+# cost-regulated speed scaling alone do not reliably cover.
+collision_monitor:
+  ros__parameters:
+    use_sim_time: true
+    base_frame_id: "ridgeback_base_link"
+    odom_frame_id: "odom"
+    cmd_vel_in_topic: "cmd_vel"
+    cmd_vel_out_topic: "cmd_vel_safe"
+    transform_tolerance: 0.5
+    source_timeout: 5.0
+    base_shift_correction: true
+    stop_pub_timeout: 2.0
+    polygons: ["stop_zone", "slowdown_zone"]
+    stop_zone:
+      type: "polygon"
+      action_type: "stop"
+      points: [0.55, 0.50, 0.55, -0.50, -0.35, -0.50, -0.35, 0.50]
+      max_points: 3
+      visualize: true
+      polygon_pub_topic: "polygon_stop"
+      enabled: true
+    slowdown_zone:
+      type: "polygon"
+      action_type: "slowdown"
+      points: [1.20, 0.70, 1.20, -0.70, -0.45, -0.70, -0.45, 0.70]
+      slowdown_ratio: 0.3
+      max_points: 3
+      visualize: true
+      polygon_pub_topic: "polygon_slowdown"
+      enabled: true
+    observation_sources: ["scan"]
+    scan:
+      type: "scan"
+      topic: "/scan"
+      enabled: true
