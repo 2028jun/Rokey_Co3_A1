@@ -10,41 +10,14 @@ import numpy as np
 # Order: far-left, far-right, near-right, near-left.
 # Keeping these values normalized makes the ROI independent of resolution.
 #
-# near-right pulled in from (0.731, 0.629) to (0.586, 0.629): the RG2
-# gripper's own visual meshes sit right at the table's near-right corner in
-# this camera's frame and were being misdetected by YOLO as two "hand"
-# objects, so roi_intrusion read true continuously even at rest (verified
-# on hardware via /hand_detection/detections: a consistent false-positive
-# "hand" at bbox_xyxy ~[786-831, 556-727] px at 1280x960). Repainting the
-# gripper matte black was tried first per a team member's suggestion, but
-# on this Isaac Sim build (5.1.0-rc.19) material bindings authored on an
-# already-populated/instanced stage don't reach the render even when bound
-# on the correct instance root (same class of late-edit-not-reaching-Hydra
-# problem as the UsdSkel joint rotation documented in
-# hand_intrusion_test_actor.py) -- see GPU_RUN_LOG.txt pass 3 for the full
-# investigation. That version covered the reach position of pass 1-5's
-# seat/target (YOLO detected the hand moving through x~535-684, y~236-489).
-#
-# Pass 6/7 later moved the test actor to a standing position behind the
-# customer-side chairs with TABLE_HAND_TARGET on the table's south edge (see
-# hand_intrusion_test_actor.py), which moves the reaching hand to a
-# completely different part of the frame -- but nobody re-measured this
-# polygon against that new position, so roi_intrusion silently never fired
-# for two passes (confirmed this pass: 0 ROI-confirmed detections across
-# 16 real reach cycles on hardware, even though the wrist lands within
-# 1e-16 m of TABLE_HAND_TARGET -- the reach itself was never broken). Directly
-# measured the new hand position by projecting the reach-arm glove mesh's
-# true (non-orphaned-point) world bounding box through this camera's actual
-# intrinsics/extrinsics at full reach: normalized x=[0.164,0.262],
-# y=[0.332,0.433] -- nowhere near the old polygon's x=[0.379,0.586] range.
-# Replaced with a rectangle around that measurement plus margin for
-# detection-box slack; still clear of the gripper false-positive region
-# above (x=[0.614,0.649], y=[0.579,0.757]).
+# Match origin/woduq's canonical tabletop polygon exactly. In particular,
+# keep the near-right corner at x=0.731 instead of the later vision-test
+# value x=0.586, which visibly cut off the right-hand side of the table.
 TABLE_ROI_NORMALIZED = (
-    (0.10, 0.28),
-    (0.32, 0.28),
-    (0.32, 0.52),
-    (0.10, 0.52),
+    (0.379, 0.310),
+    (0.547, 0.286),
+    (0.731, 0.629),
+    (0.438, 0.732),
 )
 
 

@@ -21,7 +21,7 @@ _ros_bridge_lib = Path(
 if os.environ.get("MOBILE_DEMO_ROS_CAMERA", "1") == "1":
     os.environ.setdefault("ROS_DISTRO", "humble")
     os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
-    os.environ.setdefault("ROS_DOMAIN_ID", "102")
+    os.environ.setdefault("ROS_DOMAIN_ID", "101")
     _ld_paths = [path for path in os.environ.get("LD_LIBRARY_PATH", "").split(":") if path]
     _python_paths = [
         path
@@ -489,20 +489,6 @@ def connect_table_camera_ros2(stage):
     )
 
 
-def open_table_camera_preview():
-    if HEADLESS:
-        return
-    create_viewport_for_camera(
-        "Table Camera",
-        TABLE_CAMERA_PATH,
-        width=1280,
-        height=960,
-        position_x=760,
-        position_y=80,
-    )
-    print("[table camera] preview viewport opened", flush=True)
-
-
 def _define_lookat_camera(stage, path, eye, target, up):
     """Define a plain UsdGeom.Camera at `path` looking from `eye` at `target`.
 
@@ -842,6 +828,7 @@ def capture_actor_sdg_frames(stage, person_prim):
 
     def _capture(label):
         actor_sdg._patch_sit_command_stand_rotation()
+        actor_sdg._patch_timing_template_position_anchor()
         _update_tracking_camera()
         _render_settle(3)
         for view_name in ("tracking", "table"):
@@ -859,6 +846,17 @@ def capture_actor_sdg_frames(stage, person_prim):
             f"rot={ag_transform[1] if ag_transform else None}",
             flush=True,
         )
+        robot_base_prim = stage.GetPrimAtPath(
+            "/World/ServingRobot/Robot/ridgeback_base_link/ridgeback_base_link"
+        )
+        if robot_base_prim.IsValid():
+            robot_matrix = xform_cache.GetLocalToWorldTransform(robot_base_prim)
+            print(
+                f"[capture]   robot base world pos={tuple(round(v, 3) for v in robot_matrix.ExtractTranslation())} "
+                f"rot_axis={tuple(round(v, 3) for v in robot_matrix.ExtractRotation().GetAxis())} "
+                f"rot_angle={round(robot_matrix.ExtractRotation().GetAngle(), 2)}",
+                flush=True,
+            )
 
         sm = ScriptManager.get_instance()
         for scripts in sm._prim_to_scripts.values():
@@ -1219,12 +1217,13 @@ def main():
     configure_physics_stability(stage, articulation_path)
 
     reach_animator = None
+    typing_controller = None
     person_prim = None
     if hand_test_enabled and HAND_TEST_RIG_MODE not in ("rigid_arm", "legacy"):
         person_prim = actor_sdg.spawn_and_configure_actor(stage)
+        typing_controller = actor_sdg.TypingTopicController(person_prim)
 
     articulation, dof_names = initialize_robot(articulation_path)
-    open_table_camera_preview()
 
     if hand_test_enabled and HAND_TEST_RIG_MODE in ("rigid_arm", "legacy"):
         person_prim = hand_test.spawn_seated_person(stage)
@@ -1241,20 +1240,30 @@ def main():
             capture_pose_frames(stage, reach_animator)
         else:
             capture_actor_sdg_frames(stage, person_prim)
+        if typing_controller is not None:
+            typing_controller.shutdown()
         simulation_app.close()
         return
 
     if os.environ.get("MOBILE_DEMO_EXIT_AFTER_READY", "0") == "1":
+        if typing_controller is not None:
+            typing_controller.shutdown()
         simulation_app.close()
         return
 
-    while simulation_app.is_running():
-        simulation_app.update()
-        if reach_animator is not None:
-            reach_animator.update()
-        # Keep the GUI event loop responsive without throttling it to the old
-        # uneven 16 ms cadence.
-        time.sleep(0.010)
+    try:
+        while simulation_app.is_running():
+            simulation_app.update()
+            if reach_animator is not None:
+                reach_animator.update()
+            if typing_controller is not None:
+                typing_controller.update()
+            # Keep the GUI event loop responsive without throttling it to the old
+            # uneven 16 ms cadence.
+            time.sleep(0.010)
+    finally:
+        if typing_controller is not None:
+            typing_controller.shutdown()
 
 
 try:

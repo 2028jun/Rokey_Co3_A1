@@ -77,6 +77,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 import carb
@@ -91,7 +92,7 @@ PERSON_PRIM_PATH = "/World/Characters/Customer"
 # table's +X (east) side, closer to the fixed table camera's mast (see
 # mobile_manipulator_demo.py's attach_fixed_table_depth_camera).
 CHAIR_PRIM_PATH = os.environ.get(
-    "HAND_TEST_CHAIR_PATH", "/World/Dining/TableSet_00/Chair_01_Visual"
+    "HAND_TEST_CHAIR_PATH", "/World/Dining/TableSet_00/Chair_00_Visual"
 )
 SIT_DURATION_SECONDS = float(os.environ.get("HAND_TEST_SIT_SECONDS", "3.0"))
 
@@ -101,10 +102,20 @@ SIT_DURATION_SECONDS = float(os.environ.get("HAND_TEST_SIT_SECONDS", "3.0"))
 # (typing/push_button always play here unless HAND_TEST_WALK_IN_BEFORE
 # below relocates one of them).
 STAND_XY = (
-    float(os.environ.get("HAND_TEST_STAND_X", "-2.70")),
-    float(os.environ.get("HAND_TEST_STAND_Y", "-3.60")),
+    # Chair_00 is the seat farther from the robot parked on the table's
+    # east side. Keep the same table-facing Y offset used at Chair_01.
+    float(os.environ.get("HAND_TEST_STAND_X", "-3.70")),
+    # 50 cm closer to TableSet_00 than the original -3.60 position. The
+    # first 25 cm adjustment made the hand detectable but still marginal,
+    # so move the same distance closer once more.
+    float(os.environ.get("HAND_TEST_STAND_Y", "-3.10")),
 )
-STAND_YAW_DEGREES = float(os.environ.get("HAND_TEST_STAND_YAW", "0.0"))
+# Chair_01 is on the table's south side. GPU rendering confirmed that the
+# Actor SDG GoTo command faces away from TableSet_00 at rotation=0 and
+# toward its tabletop at rotation=180. This is the GoTo command's rotation
+# convention; do not replace it with a manually constructed quaternion.
+STAND_YAW_DEGREES = float(os.environ.get("HAND_TEST_STAND_YAW", "180.0"))
+STAND_Z = float(os.environ.get("HAND_TEST_STAND_Z", "0.0"))
 
 # Adaptive walk-in (goal 3): if measurement (projecting the animated hand
 # through the real table camera, the same technique pass 8 used) shows
@@ -128,7 +139,12 @@ TYPE_KEYBOARD_ANIM = os.environ.get(
     "HAND_TEST_TYPE_KEYBOARD_ANIM", str(_ASSETS_DIR / "type_keyboard.skelanim.usd")
 )
 
-COMMAND_FILE_PATH = os.environ.get("HAND_TEST_COMMAND_FILE", "/tmp/actor_sdg_commands.txt")
+TYPING_TRIGGER_TOPIC = os.environ.get(
+    "HAND_TEST_TYPING_TOPIC", "/hand_test/type_keyboard"
+)
+TYPING_DURATION_SECONDS = float(
+    os.environ.get("HAND_TEST_TYPING_SECONDS", "10.0")
+)
 
 _patched_sit_class_ids: set[int] = set()
 
@@ -266,6 +282,91 @@ def _patch_sit_command_stand_rotation():
         print(f"[actor_sdg] patched Sit.update() on module(s): {patched_now}", flush=True)
 
 
+_patched_timing_class_ids: set[int] = set()
+
+
+def _patch_timing_template_position_anchor():
+    """Patch every live `TimingTemplate` class (used by `type_keyboard`/
+    `push_button`) to hold its position/rotation fixed for its whole
+    duration, the same way `Sit`'s "sit" phase does.
+
+    Confirmed by testing (GPU_RUN_LOG.txt pass 13): with `Sit` removed
+    from the command loop (per user direction, to isolate the typing/
+    push_button poses from the still-open Sit rotation-drift bug),
+    `TimingTemplate.update()` -- which drives both `type_keyboard` and
+    `push_button` -- never calls `set_world_transform()` at all. Nothing
+    in it anchors the character's position/rotation, unlike `Sit`. Since
+    the AnimationGraph's own root motion isn't otherwise reset between
+    cycles (there is no more `Sit` to incidentally do that), whatever
+    residual position/rotation error the framework's own auto-appended
+    loop-closing `GoTo` leaves behind (it does not return the character
+    to an exact clean state -- a real, separate imprecision) carries
+    straight into the next `type_keyboard`/`push_button` and is never
+    corrected, compounding worse each loop: measured Z sinking in
+    discrete steps at every loop restart (-0.04 -> -0.15 -> -0.29 ->
+    -0.45 m over 4 cycles) until the character ends up on/through the
+    floor.
+
+    Fix: begin the command list with an explicit GoTo so Actor SDG itself
+    establishes its correctly axis-adjusted table-facing rotation. Capture
+    that rotation and current X/Y at setup, reset Z to the known floor
+    height, and re-apply the clean transform every frame. Constructing a
+    quaternion here is deliberately avoided: GPU rendering confirmed that
+    doing so discards Actor SDG's internal character-axis correction and
+    visually lays the biped on its side.
+    """
+    from omni.anim.people.scripts.utils import Utils
+
+    global _patched_timing_class_ids
+    patched_now = []
+    for name, module in list(sys.modules.items()):
+        if module is None or not name.endswith("custom_command.command_templates"):
+            continue
+        timing_cls = getattr(module, "TimingTemplate", None)
+        if not isinstance(timing_cls, type):
+            continue
+        if id(timing_cls) in _patched_timing_class_ids:
+            continue
+
+        original_setup = timing_cls.setup
+        original_update = timing_cls.update
+
+        def _set_clean_anchor(self):
+            current_pos, current_rot = Utils.get_character_transform(
+                self.character
+            )
+            self._char_anchor_pos = carb.Float3(
+                current_pos[0], current_pos[1], STAND_Z
+            )
+            self._char_anchor_rot = current_rot
+            self.character.set_world_transform(
+                self._char_anchor_pos, self._char_anchor_rot
+            )
+
+        def _patched_setup(self, _original_setup=original_setup):
+            _original_setup(self)
+            _set_clean_anchor(self)
+
+        def _patched_update(self, dt, _original_update=original_update):
+            # The mangled TimingTemplate module can appear after the first
+            # command instance has already run setup(). Initialize lazily
+            # as well so patching that live first action cannot leave it
+            # without anchor attributes.
+            if not hasattr(self, "_char_anchor_pos"):
+                _set_clean_anchor(self)
+            result = _original_update(self, dt)
+            self.character.set_world_transform(self._char_anchor_pos, self._char_anchor_rot)
+            return result
+
+        timing_cls.setup = _patched_setup
+        timing_cls.update = _patched_update
+        _patched_timing_class_ids.add(id(timing_cls))
+        patched_now.append(name)
+
+    if patched_now:
+        print(f"[actor_sdg] patched TimingTemplate position anchor on module(s): {patched_now}", flush=True)
+
+
 def enable_extensions():
     """Enable omni.anim.people/isaacsim.replicator.agent.core.
 
@@ -311,16 +412,6 @@ def _register_custom_commands(ccm):
     from omni.anim.people.scripts.custom_command.defines import CustomCommand, CustomCommandTemplate
 
     existing = set(ccm.get_all_custom_command_names())
-    if "push_button" not in existing:
-        ccm._commands.append(
-            CustomCommand(
-                anim_path=PUSH_BUTTON_ANIM,
-                name="push_button",
-                template=CustomCommandTemplate.TIMING,
-                min_random_time=SIT_DURATION_SECONDS,
-                max_random_time=SIT_DURATION_SECONDS,
-            )
-        )
     if "type_keyboard" not in existing:
         ccm._commands.append(
             CustomCommand(
@@ -333,44 +424,13 @@ def _register_custom_commands(ccm):
         )
 
 
-def _build_command_lines(character_name: str) -> list[str]:
-    def sit():
-        return f"{character_name} Sit {CHAIR_PRIM_PATH} {SIT_DURATION_SECONDS}"
-
-    def goto_walk_in():
-        return f"{character_name} GoTo {WALK_IN_XY[0]} {WALK_IN_XY[1]} 0 _"
-
-    def goto_stand():
-        return f"{character_name} GoTo {STAND_XY[0]} {STAND_XY[1]} {STAND_YAW_DEGREES}"
-
-    lines = []
-    if WALK_IN_BEFORE == "type_keyboard":
-        lines.append(goto_walk_in())
-    lines.append(f"{character_name} type_keyboard")
-    if WALK_IN_BEFORE == "type_keyboard":
-        lines.append(goto_stand())
-    lines.append(sit())
-    if WALK_IN_BEFORE == "push_button":
-        lines.append(goto_walk_in())
-    lines.append(f"{character_name} push_button")
-    if WALK_IN_BEFORE == "push_button":
-        lines.append(goto_stand())
-    lines.append(sit())
-    return lines
-
-
-def _write_command_file(character_name: str) -> str:
-    lines = _build_command_lines(character_name)
-    with open(COMMAND_FILE_PATH, "w") as f:
-        f.write("\n".join(lines) + "\n")
-    print(f"[actor_sdg] wrote command file {COMMAND_FILE_PATH}:\n  " + "\n  ".join(lines), flush=True)
-    return COMMAND_FILE_PATH
-
-
 def spawn_and_configure_actor(stage):
-    """Spawn a visible character, wire it to the sit/type/push cycle, and
-    return its prim. Call once; the character then drives itself via
-    omni.anim.people's BehaviorScript once the timeline is playing.
+    """Spawn a visible character with a typing-capable AnimationGraph.
+
+    Runtime actions are driven directly by TypingTopicController. Do not
+    attach CharacterBehavior or a command file here: even a one-shot GoTo
+    leaves root rotation from its Walk->None transition in the graph and
+    can make the character start IDLE lying on the floor.
     """
     enable_extensions()
     app = omni.kit.app.get_app()
@@ -378,17 +438,16 @@ def spawn_and_configure_actor(stage):
         app.update()
 
     _patch_sit_command_stand_rotation()
+    _patch_timing_template_position_anchor()
 
     from omni.anim.people.python_ext import get_instance as get_people_instance
     from omni.anim.people.settings import PeopleSettings
     from isaacsim.replicator.agent.core.stage_util import CharacterUtil
-    from isaacsim.replicator.agent.core.settings import AssetPaths, BehaviorScriptPaths
+    from isaacsim.replicator.agent.core.settings import AssetPaths
 
     settings = carb.settings.get_settings()
     settings.set(PeopleSettings.NAVMESH_ENABLED, False)
     settings.set(PeopleSettings.DYNAMIC_AVOIDANCE_ENABLED, False)
-    settings.set_string(PeopleSettings.NUMBER_OF_LOOP, "inf")
-
     people_instance = get_people_instance()
     ccm = people_instance.get_custom_command_manager()
     _register_custom_commands(ccm)
@@ -402,7 +461,7 @@ def spawn_and_configure_actor(stage):
         raise RuntimeError("default biped animation graph missing after load_default_biped_to_stage()")
 
     char_asset_path = AssetPaths.default_biped_asset_path()
-    stand_position = Gf.Vec3d(STAND_XY[0], STAND_XY[1], 0.0)
+    stand_position = Gf.Vec3d(STAND_XY[0], STAND_XY[1], STAND_Z)
     char_prim = CharacterUtil.load_character_usd_to_stage(
         char_asset_path, stand_position, STAND_YAW_DEGREES, "Customer"
     )
@@ -413,34 +472,19 @@ def spawn_and_configure_actor(stage):
     if skelroot is None:
         raise RuntimeError(f"no SkelRoot found under spawned character {char_prim.GetPath()}")
 
-    # CharacterBehavior.on_init() (which reads these settings via
-    # renew_character_state()) fires at attach time regardless of the
-    # timeline's play state, and on_play() only fires on a later
-    # stopped->playing TRANSITION -- if the timeline happens to already be
-    # playing when this character attaches (true in
-    # mobile_manipulator_demo.py, where initialize_robot() plays earlier
-    # for the robot's PhysX handles), on_play() never fires again for this
-    # instance. So the command-file settings MUST already be correct
-    # before setup_python_scripts_to_character() attaches the script below
-    # -- setting them afterward is a real, confirmed-by-testing bug (the
-    # character finds an empty command_path and self.character stays None
-    # forever, since init_character() never gets a chance to re-run with
-    # the right settings).
     character_name = char_prim.GetName()
-    cmd_file = _write_command_file(character_name)
-    settings.set_string(PeopleSettings.COMMAND_FILE_PATH, cmd_file)
-
     CharacterUtil.setup_animation_graph_to_character([skelroot], anim_graph_prim)
-    CharacterUtil.setup_python_scripts_to_character([skelroot], BehaviorScriptPaths.behavior_script_path())
     for _ in range(10):
         app.update()
 
-    # The Sit command module (mangled name, see _patch_sit_command_stand_
-    # rotation()'s docstring) is only importable by Kit's extension loader
-    # once a Sit command is actually parsed/instantiated, which may not
-    # have happened yet even after the script attaches -- this call is
-    # cheap/idempotent, call it again from the capture loop to catch it.
+    # The Sit/TimingTemplate command modules (mangled names, see
+    # _patch_sit_command_stand_rotation()'s docstring) are only importable
+    # by Kit's extension loader once that command is actually parsed/
+    # instantiated, which may not have happened yet even after the script
+    # attaches -- these calls are cheap/idempotent, call them again from
+    # the capture loop to catch it.
     _patch_sit_command_stand_rotation()
+    _patch_timing_template_position_anchor()
 
     print(
         f"[actor_sdg] spawned character={char_prim.GetPath()} name={character_name} "
@@ -448,3 +492,150 @@ def spawn_and_configure_actor(stage):
         flush=True,
     )
     return char_prim
+
+
+class TypingTopicController:
+    """Run one ten-second typing action for each ROS Empty trigger.
+
+    The callback only records a pending request. AnimationGraph access and
+    transform writes stay on Isaac Sim's main update thread via update().
+    Requests received while typing are ignored.
+    """
+
+    def __init__(self, person_prim):
+        if TYPING_DURATION_SECONDS <= 0.0:
+            raise ValueError("HAND_TEST_TYPING_SECONDS must be greater than zero")
+
+        import rclpy
+        from std_msgs.msg import Empty
+
+        self._rclpy = rclpy
+        self._owns_rclpy_context = not rclpy.ok()
+        if self._owns_rclpy_context:
+            rclpy.init(args=[])
+
+        self._node = rclpy.create_node("hand_test_typing_controller")
+        self._subscription = self._node.create_subscription(
+            Empty, TYPING_TRIGGER_TOPIC, self._on_trigger, 10
+        )
+        self._pending = False
+        self._active = False
+        self._end_time = 0.0
+        self._anchor_pos = None
+        self._anchor_rot = None
+        self._character = None
+        self._home_ready = False
+        self._shutdown = False
+
+        self._skelroot_path = None
+        from pxr import Usd
+
+        for prim in Usd.PrimRange(person_prim):
+            if prim.GetTypeName() == "SkelRoot":
+                self._skelroot_path = str(prim.GetPath())
+                break
+        if self._skelroot_path is None:
+            raise RuntimeError(
+                f"no SkelRoot found under {person_prim.GetPath()}"
+            )
+
+        print(
+            f"[typing_topic] waiting on {TYPING_TRIGGER_TOPIC} "
+            f"(std_msgs/msg/Empty, duration={TYPING_DURATION_SECONDS:.1f}s)",
+            flush=True,
+        )
+
+    def _on_trigger(self, _message) -> None:
+        if self._active or self._pending:
+            print("[typing_topic] trigger ignored: typing already active", flush=True)
+            return
+        self._pending = True
+        print("[typing_topic] trigger received", flush=True)
+
+    def _get_character(self):
+        if self._character is None:
+            import omni.anim.graph.core as ag
+
+            self._character = ag.get_character(self._skelroot_path)
+        return self._character
+
+    def _start_typing(self, now: float) -> bool:
+        character = self._get_character()
+        if character is None or not self._home_ready:
+            return False
+
+        character.set_world_transform(self._anchor_pos, self._anchor_rot)
+        character.set_variable("Action", "type_keyboard")
+        self._active = True
+        self._pending = False
+        self._end_time = now + TYPING_DURATION_SECONDS
+        print(
+            f"[typing_topic] typing started for "
+            f"{TYPING_DURATION_SECONDS:.1f}s",
+            flush=True,
+        )
+        return True
+
+    def _stop_typing(self) -> None:
+        character = self._get_character()
+        if character is not None:
+            character.set_variable("Action", "None")
+            character.set_world_transform(
+                self._anchor_pos, self._anchor_rot
+            )
+        self._active = False
+        print("[typing_topic] typing finished; returned to idle", flush=True)
+
+    def update(self) -> None:
+        if self._shutdown:
+            return
+        self._rclpy.spin_once(self._node, timeout_sec=0.0)
+        character = self._get_character()
+        if character is None:
+            return
+        if not self._home_ready:
+            from omni.anim.people.scripts.utils import Utils
+
+            current_pos, current_rot = Utils.get_character_transform(
+                character
+            )
+            self._anchor_pos = carb.Float3(
+                STAND_XY[0], STAND_XY[1], STAND_Z
+            )
+            self._anchor_rot = current_rot
+            character.set_variable("Action", "None")
+            character.set_world_transform(
+                self._anchor_pos, self._anchor_rot
+            )
+            self._home_ready = True
+            print(
+                f"[typing_topic] idle home pose locked at "
+                f"{tuple(self._anchor_pos)}",
+                flush=True,
+            )
+
+        now = time.monotonic()
+        if self._pending and not self._active:
+            self._start_typing(now)
+        if not self._active:
+            character.set_world_transform(
+                self._anchor_pos, self._anchor_rot
+            )
+            return
+        if now >= self._end_time:
+            self._stop_typing()
+            return
+
+        character.set_world_transform(
+            self._anchor_pos, self._anchor_rot
+        )
+
+    def shutdown(self) -> None:
+        if self._shutdown:
+            return
+        if self._active:
+            self._stop_typing()
+        self._node.destroy_node()
+        if self._owns_rclpy_context and self._rclpy.ok():
+            self._rclpy.shutdown()
+        self._shutdown = True

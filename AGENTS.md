@@ -4,4 +4,4 @@
 - Target ROS version: ROS 2 Humble on Ubuntu Jammy (`ros-humble-ros-base` `0.10.0`, `rclpy` `3.3.21`).
 - Use APIs and import paths compatible with Isaac Sim 5.1 and ROS 2 Humble. Do not assume signatures or APIs from another Isaac Sim or ROS distribution.
 - When an Isaac Sim API signature is uncertain, check the locally installed Isaac Sim 5.1 source or bindings under `/home/rokey/dev_ws/isaac_sim/isaacsim` before editing code.
-- ROS communication for this workspace uses `ROS_DOMAIN_ID=102` unless the user explicitly requests a different domain.
+- ROS communication for this workspace uses `ROS_DOMAIN_ID=101` unless the user explicitly requests a different domain.

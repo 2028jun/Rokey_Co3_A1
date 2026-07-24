@@ -5,7 +5,7 @@ ISAAC_ROOT="${ISAAC_SIM_ROOT:-/home/rokey/dev_ws/isaac_sim/isaacsim/_build/linux
 ROS2_LIB="${ISAAC_ROOT}/exts/isaacsim.ros2.bridge/humble/lib"
 
 export ROS_DISTRO=humble
-export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-102}"
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-101}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:${ROS2_LIB}"
 

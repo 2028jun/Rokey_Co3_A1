@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Run the existing M0609 USD with ROS 2 joint state/command OmniGraph.
 
-Target: Isaac Sim 5.1.0-rc.19, ROS 2 Humble, ROS_DOMAIN_ID=102.
+Target: Isaac Sim 5.1.0-rc.19, ROS 2 Humble, ROS_DOMAIN_ID=101.
 Run this file with Isaac Sim's python.sh, not the system Python.
 """
 
 import os
 
-os.environ.setdefault('ROS_DOMAIN_ID', '102')
+os.environ.setdefault('ROS_DOMAIN_ID', '101')
 os.environ.setdefault('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp')
 
 from isaacsim import SimulationApp

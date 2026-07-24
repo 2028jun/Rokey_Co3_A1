@@ -2,7 +2,7 @@
 
 Paste this entire document into a coding-agent session on the GPU machine.
 Target: Isaac Sim 5.1.0-rc.19, ROS 2 Humble, RTX 5080, branch `vision-test`,
-`ROS_DOMAIN_ID=102` (matches `AGENTS.md`).
+`ROS_DOMAIN_ID=101` (matches `AGENTS.md`).
 
 This prompt is self-contained: reading it plus `AGENTS.md`, `GPU_RUN_LOG.txt`,
 `ANIM_SPIKE_RESULTS.txt`, and `isaacpjt/actor_sdg_test_actor.py` is enough to
