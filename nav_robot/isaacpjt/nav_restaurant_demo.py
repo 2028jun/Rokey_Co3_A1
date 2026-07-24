@@ -2106,6 +2106,44 @@ class NavBridge(Node):
             if target == 4
             else build_table_route(target, x, y)
         )
+
+        # Normalize only the first kitchen translation after park-out.
+        # Park-out already rotates the chassis toward the aisle.  Converting
+        # every negative-speed stage changed later, already-proven corner
+        # behavior.  Restrict the conversion to the first kitchen axis stage
+        # and its immediately preceding pivot; leave every later corner and
+        # translation exactly as build_kitchen_route() authored them.
+        stages = [dict(stage) for stage in stages]
+        if target == 4:
+            first_axis_index = next(
+                (
+                    index
+                    for index, stage in enumerate(stages)
+                    if stage.get("kind") in ("axis_x", "axis_y")
+                ),
+                None,
+            )
+            if first_axis_index is not None:
+                first_axis = stages[first_axis_index]
+                if float(first_axis.get("speed", 0.0)) < 0.0:
+                    forward_yaw = self._angle_error(
+                        float(first_axis["yaw"]) + math.pi, 0.0
+                    )
+                    first_axis["speed"] = abs(float(first_axis["speed"]))
+                    first_axis["yaw"] = forward_yaw
+
+                    if (
+                        first_axis_index > 0
+                        and stages[first_axis_index - 1].get("kind") == "pivot"
+                    ):
+                        stages[first_axis_index - 1]["yaw"] = forward_yaw
+
+                    self.get_logger().info(
+                        "normalized first kitchen segment for forward travel: "
+                        f"axis_index={first_axis_index} "
+                        f"yaw={math.degrees(forward_yaw):.1f}deg"
+                    )
+
         self._direct_nav = {
             "mode": "axis_route",
             "target": target,
