@@ -4,11 +4,14 @@
 
 ```text
 Rokey_Co3_A1/
-├── serving_robot/     # Serving Robot ROS 2, Isaac Sim & HMI Web Dashboard
-│   ├── isaacpjt/     # Isaac Sim 5.1 Standalone Python Scripts
-│   ├── src/          # ROS 2 Workspace Packages (serving_hmi, etc.)
-│   └── run_hmi.sh    # HMI Web Dashboard Runner
-├── hand_safety/       # Canonical Hand Detection & Safety ROS 2 Package
+├── nav_robot/          # Isaac Sim standalone bridge (nav_restaurant_demo.py) — /scan, /odom, TF,
+│                       #   direct_nav mission driving (park-out, kitchen route, table docking),
+│                       #   CrossingPedestrian / TypingCustomer test actors
+├── nav_robot5/         # two_wheel_rails ROS 2 package — Nav2 stack, nav2_collision_monitor,
+│                       #   topic_bridge, routes.yaml (map-frame dock/spine coordinates), maps/
+├── serving_robot/      # HMI web dashboard sources (src/serving_hmi) & run_hmi.sh
+├── src/                # serving_robot_manager, serving_robot_interfaces, map_gen, hand_safety (ignored copy)
+├── hand_safety/        # Canonical Hand Detection & Safety ROS 2 Package
 ├── .gitignore
 └── README.md
 ```
@@ -16,110 +19,64 @@ Rokey_Co3_A1/
 `src/hand_safety` is a legacy duplicate and contains `COLCON_IGNORE`.
 Build the canonical root-level `hand_safety` package only.
 
-## Vision-integrated ROS startup
+Isaac Sim's install path is configurable via `ISAAC_SIM_ROOT` (defaults to
+`~/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release`); set it if your
+Isaac Sim lives elsewhere.
 
-```bash
-source /opt/ros/humble/setup.bash
-export ROS_DOMAIN_ID=102
-colcon build --symlink-install --packages-select \
-  serving_robot_interfaces serving_robot_manager hand_safety
-source install/setup.bash
-ros2 launch serving_robot_manager vision_manager.launch.py
-```
+## Quick Start (3-terminal integration test)
 
-The Isaac Sim process publishes `/camera/color/image_raw`. The detector
-publishes `/hand_safety/intrusion`, and Manager gates inference with the
-latched `/serving_robot/table_arrived` state.
-The same launch starts `direct_nav_server_node`, which owns the ROS Humble
-custom services and forwards them to Isaac's built-in axis-route controller.
-
-## Quick Start (HMI Web Dashboard)
-
-```bash
-# Run HMI Web Dashboard
-./run_hmi.sh
-# Open Browser: http://localhost:8000
-```
-
-## 🚀 4-Terminal Hand Detection & Integrated Testing Guide
-
-### Terminal 1 — Isaac Sim (손 검출 고정위치 & 장애물 정지 테스트)
-> 이 터미널에서는 `/opt/ros/humble/setup.bash`를 source하지 마십시오.
-
+**Terminal 1 — Isaac Sim**
 ```bash
 cd /home/rokey/cobot3_ws/nav_robot
-
 export NAV_ROBOT_ROS_DOMAIN_ID=102
 export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$HOME/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/exts/isaacsim.ros2.bridge/humble/lib"
-
-export MOBILE_DEMO_HAND_TEST=1
-export HAND_TEST_FIXED_REACH=1
-export HAND_TEST_TARGET_X=-2.75
-export HAND_TEST_TARGET_Y=-2.20
-export HAND_TEST_TABLE_CLEARANCE_Z=0.06
-export MOBILE_DEMO_OBSTACLE_TEST=1
-
 /home/rokey/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/python.sh \
   isaacpjt/nav_restaurant_demo.py
 ```
+Wait for `[typing_topic] waiting on /hand_test/type_keyboard ...` in the log
+before using the HMI test buttons below.
 
-**정상 로그 확인**:
-- `[ros] embedded D455 RGB/depth 1280x960 and /clock connected`
-- `[hand_test] fixed at table hand-detection target`
-- `[vision-safety] dark material bound to all M0609 arm visuals`
-
----
-
-### Terminal 2 — 주행 어댑터 + Manager + 손 검출
-
+**Terminal 2 — Manager + Nav2 + collision_monitor + hand_safety**
 ```bash
 cd /home/rokey/cobot3_ws
-
 source /opt/ros/humble/setup.bash
 export ROS_DOMAIN_ID=102
-export ROS_LOCALHOST_ONLY=0
-
-PYTHONNOUSERSITE=1 colcon build --symlink-install --packages-select \
-  serving_robot_interfaces serving_robot_manager hand_safety serving_hmi
+colcon build --symlink-install --packages-select \
+  serving_robot_interfaces serving_robot_manager hand_safety serving_hmi two_wheel_rails
 source install/setup.bash
-
-# 검출 화면 디버그 테스트 모드
-ros2 launch serving_robot_manager vision_manager.launch.py \
-  vision_debug:=true
+ros2 launch serving_robot_manager vision_manager_nav2.launch.py \
+  vision_debug:=true use_sim_time:=true autostart:=true rviz:=true
 ```
+This single launch starts `direct_nav_server_node`, `manager_node`,
+`hand_detector_node`, the Nav2 stack (AMCL/controller/planner/bt_navigator),
+and `nav2_collision_monitor` (stop/slowdown safety zones, gates `cmd_vel` →
+`cmd_vel_safe`, which is what Isaac's NavBridge actually drives on).
 
-> **주의**: 이 launch 파일이 `direct_nav_server_node`, `manager_node`, `hand_detector_node`를 모두 실행하므로 별도로 또 실행하면 안 됩니다.
-> 성능 측정 시에는 `vision_debug:=false`로 실행하십시오.
-
----
-
-### Terminal 3 — 손 검출 실시간 디버그 화면 (rqt_image_view & 파라미터)
-
-```bash
-source /opt/ros/humble/setup.bash
-source /home/rokey/cobot3_ws/install/setup.bash
-
-export ROS_DOMAIN_ID=102
-
-ros2 run rqt_image_view rqt_image_view \
-  /hand_detection/image
-```
-
-**현재 검출 설정 확인 명령**:
-```bash
-ros2 param get /hand_detector_node confidence
-ros2 param get /hand_detector_node image_size
-ros2 param get /hand_detector_node half
-```
-- 정상 설정값: `confidence: 0.70`, `image_size: 1280`, `half: False`
-
----
-
-### Terminal 4 — 주문 Web HMI 대시보드
-
+**Terminal 3 — HMI Web Dashboard**
 ```bash
 cd /home/rokey/cobot3_ws
 export ROS_DOMAIN_ID=102
 ./run_hmi.sh
 ```
-* 웹 브라우저 접속: `http://localhost:8000`
+Open browser: `http://localhost:8000`
+
+## HMI test controls
+
+- **사람 스폰/제거** buttons drive `CrossingPedestrian`, a walking test
+  actor with a LiDAR-visible collider (contact-filtered so it doesn't push
+  the robot).
+- **타이핑 시작** button triggers `TypingCustomer`'s one-shot typing
+  animation via `/hand_test/type_keyboard`, exercised by `hand_safety`'s
+  ROI-intrusion detector.
+- The robot map panel draws the live stop/slowdown safety zones (mirrors
+  `nav2_collision_monitor`'s polygons in `nav2_params.yaml` and
+  `nav_restaurant_demo.py`'s `OBSTACLE_STOP_*`/`OBSTACLE_SLOWDOWN_*` — keep
+  all three in sync when retuning).
+
+## SLAM map generation
+
+`src/map_gen` is a one-shot `slam_toolbox` mapping mode that reuses Isaac's
+existing `/scan`/`/odom`/TF instead of a separate bridge. Run it standalone
+(never alongside the launch above — both drive `cmd_vel`). See
+[src/map_gen/README.md](src/map_gen/README.md) for the full workflow and
+how to swap a generated map into `nav_robot5/src/two_wheel_rails/maps/`.
