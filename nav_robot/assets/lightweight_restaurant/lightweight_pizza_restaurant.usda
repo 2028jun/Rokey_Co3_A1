@@ -99,7 +99,7 @@ def Xform "World"
         uniform token[] xformOpOrder = ["xformOp:translate"]
 
         def Xform "Asset" (
-            prepend references = @../../../assets/Lightwheel_Kitchen/Collected_KitchenRoom/KitchenRoom.usd@
+            prepend references = @./Collected_KitchenRoom/KitchenRoom.usd@
         )
         {
             over "Kitchen_Light" (

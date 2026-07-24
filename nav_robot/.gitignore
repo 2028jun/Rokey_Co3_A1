@@ -16,3 +16,6 @@ external/
 assets/Lightwheel_Kitchen/Collected_KitchenRoom/
 dist/Lightwheel_Kitchen_runtime*.tar.zst
 dist/Lightwheel_Kitchen_runtime*.tar.zst.sha256
+
+# Kitchen runtime colocated next to lightweight restaurant USDA (local only; >100MB files).
+assets/lightweight_restaurant/Collected_KitchenRoom/
