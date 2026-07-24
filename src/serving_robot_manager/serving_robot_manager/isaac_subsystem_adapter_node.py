@@ -78,29 +78,24 @@ class IsaacSubsystemAdapterNode(Node):
             return response
 
         self.get_logger().info(f"Arm command={command} started")
-        with self._arm_cond:
-            self._arm_last_status = 0
-            self._arm_trigger_pub.publish(Int32(data=command))
-            self.get_logger().info(f"Forwarded arm command={command} to /arm/trigger, waiting for status transition...")
 
-            start_time = time.monotonic()
-            timeout_sec = 60.0
-            while time.monotonic() - start_time < timeout_sec:
-                if self._arm_last_status == 2:  # 2 = COMPLETED
-                    self.get_logger().info(f"Food status transition -> COMPLETED (Arm command={command} succeeded)")
-                    response.success = True
-                    return response
-                elif self._arm_last_status == 3:  # 3 = FAILED
-                    self.get_logger().error(f"Arm status transition -> FAILED (Arm command={command})")
-                    response.success = False
-                    return response
-
-                remaining = timeout_sec - (time.monotonic() - start_time)
-                if remaining <= 0 or not self._arm_cond.wait(timeout=min(1.0, remaining)):
-                    pass
-
-        self.get_logger().error(f"Arm command={command} timed out after {timeout_sec}s (last_status={self._arm_last_status})")
-        response.success = False
+        # Arm service is acceptance-only. Manager separately observes
+        # /arm/status WORKING -> COMPLETED/FAILED for actual task completion.
+        # Waiting here duplicates that responsibility and caused long integrated
+        # serving commands (pizza -> soda -> cutlery) to fail at the adapter's
+        # fixed 60 second timeout while Isaac was still operating normally.
+        self._arm_trigger_pub.publish(Int32(data=command))
+        if command in (98, 99):
+            self.get_logger().info(
+                f"Forwarded arm safety command={command} to /arm/trigger; "
+                "returning acceptance immediately"
+            )
+        else:
+            self.get_logger().info(
+                f"Forwarded arm command={command} to /arm/trigger; "
+                "returning acceptance immediately"
+            )
+        response.success = True
         return response
 
     def _on_spawn_command(self, request: TaskCommand.Request, response: TaskCommand.Response) -> TaskCommand.Response:

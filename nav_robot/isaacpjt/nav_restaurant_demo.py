@@ -1513,6 +1513,68 @@ class NavBridge(Node):
             )
             return
 
+        # Relative park-out mission: reverse, then rotate 180 degrees.
+        if kind == "drive_distance":
+            try:
+                distance = abs(float(payload.get("distance", 0.0)))
+                speed = abs(float(payload.get("speed", 0.12)))
+            except (TypeError, ValueError):
+                distance = 0.0
+                speed = 0.0
+
+            if distance <= 0.0 or speed <= 0.0:
+                self._publish_two_wheel_mission_status(
+                    "failed",
+                    "parse_error",
+                    reason=f"invalid drive_distance payload: {payload}",
+                    mission_id=mission_id,
+                )
+                return
+
+            with self._lock:
+                busy = (
+                    self._direct_nav is not None
+                    or self._direct_nav_request is not None
+                )
+                if not busy:
+                    self._active_two_wheel_mission_id = mission_id
+                    self._active_two_wheel_target = None
+                    self._direct_nav = dict(
+                        mode="park_out",
+                        target=None,
+                        phase="init",
+                        distance=distance,
+                        speed=min(speed, 0.20),
+                        stage_start=time.monotonic(),
+                        last_log=0.0,
+                    )
+                    self._target_vx = 0.0
+                    self._target_wz = 0.0
+                    self._cmd_vx = 0.0
+                    self._cmd_wz = 0.0
+
+            if busy:
+                self._publish_two_wheel_mission_status(
+                    "failed",
+                    "busy",
+                    reason="navigation already active",
+                    mission_id=mission_id,
+                )
+                return
+
+            self._publish_two_wheel_mission_status(
+                "accepted",
+                "park_out_backoff",
+                distance=distance,
+                align_opposite=True,
+                mission_id=mission_id,
+            )
+            self.get_logger().info(
+                f"[Mission RX] park-out id={mission_id} "
+                f"reverse={distance:.2f}m then align opposite"
+            )
+            return
+
         target = self._two_wheel_target_from_payload(payload)
         if target is None:
             self._publish_two_wheel_mission_status(
@@ -2062,6 +2124,41 @@ class NavBridge(Node):
             f"{math.degrees(yaw):.1f}deg)"
         )
 
+    def _finish_park_out(self, success, reason=""):
+        mission = self._direct_nav
+        if mission is None or mission.get("mode") != "park_out":
+            return
+        mission_id = self._active_two_wheel_mission_id
+        self._direct_nav = None
+        self._cmd_vx = self._cmd_wz = 0.0
+        self._target_vx = self._target_wz = 0.0
+        self._obstacle_stop = False
+        self._obstacle_stop_started = None
+        self._clearance_start = None
+
+        if mission_id:
+            if success:
+                self._publish_two_wheel_mission_status(
+                    "completed",
+                    "park_out_aligned",
+                    mission_id=mission_id,
+                )
+                self.get_logger().info(
+                    f"[Mission TX] park-out completed id={mission_id}"
+                )
+            else:
+                self._publish_two_wheel_mission_status(
+                    "failed",
+                    "execution_failed",
+                    reason=reason,
+                    mission_id=mission_id,
+                )
+                self.get_logger().error(
+                    f"[Mission TX] park-out failed id={mission_id}: {reason}"
+                )
+        self._active_two_wheel_mission_id = ""
+        self._active_two_wheel_target = None
+
     def _finish_direct_navigation(self, success, reason=""):
         mission = self._direct_nav
         if mission is None:
@@ -2114,6 +2211,97 @@ class NavBridge(Node):
             return None
         if self._navigation_paused or self._obstacle_stop:
             return 0.0, 0.0
+
+        if mission["mode"] == "park_out":
+            now = time.monotonic()
+            phase = mission.get("phase", "init")
+
+            if phase == "init":
+                mission["start_x"] = float(x)
+                mission["start_y"] = float(y)
+                mission["start_yaw"] = float(yaw)
+                mission["target_yaw"] = self._angle_error(
+                    float(yaw) + math.pi, 0.0
+                )
+                mission["phase"] = "backoff"
+                mission["stage_start"] = now
+                mission["last_log"] = 0.0
+                self.get_logger().info(
+                    "park-out started: reverse "
+                    f"{mission['distance']:.2f}m, then align "
+                    f"{math.degrees(mission['target_yaw']):.1f}deg"
+                )
+                return 0.0, 0.0
+
+            if phase == "backoff":
+                start_yaw = mission["start_yaw"]
+                dx = x - mission["start_x"]
+                dy = y - mission["start_y"]
+                progress = -(
+                    dx * math.cos(start_yaw)
+                    + dy * math.sin(start_yaw)
+                )
+                remaining = mission["distance"] - progress
+                yaw_error = self._angle_error(start_yaw, yaw)
+                done = remaining <= 0.025
+                vx = 0.0 if done else -min(
+                    mission["speed"],
+                    max(0.045, remaining * 0.8),
+                )
+                wz = 0.0 if done else float(
+                    np.clip(1.6 * yaw_error, -0.25, 0.25)
+                )
+                detail = (
+                    f"progress={progress:.3f}/{mission['distance']:.3f}m "
+                    f"yaw_error={math.degrees(yaw_error):.1f}deg"
+                )
+                timeout = max(
+                    12.0,
+                    mission["distance"] / max(mission["speed"], 0.05) + 8.0,
+                )
+                if done:
+                    mission["phase"] = "align_opposite"
+                    mission["stage_start"] = now
+                    mission["last_log"] = 0.0
+                    self.get_logger().info(
+                        "park-out reverse complete; aligning opposite direction"
+                    )
+                    return 0.0, 0.0
+
+            else:
+                yaw_error = self._angle_error(mission["target_yaw"], yaw)
+                done = abs(yaw_error) < math.radians(2.5)
+                vx = 0.0
+                wz = 0.0
+                if not done:
+                    wz = float(np.clip(1.8 * yaw_error, -0.65, 0.65))
+                    if abs(wz) < 0.18:
+                        wz = math.copysign(0.18, yaw_error)
+                detail = (
+                    f"target_yaw={math.degrees(mission['target_yaw']):.1f}deg "
+                    f"yaw_error={math.degrees(yaw_error):.1f}deg"
+                )
+                timeout = 25.0
+                if done:
+                    self._finish_park_out(True)
+                    return 0.0, 0.0
+
+            if now - mission["last_log"] >= 0.5:
+                mission["last_log"] = now
+                self.get_logger().info(
+                    f"park-out phase={mission['phase']} "
+                    f"pose=({x:.2f},{y:.2f},{math.degrees(yaw):.1f}deg) "
+                    f"{detail}"
+                )
+
+            if now - mission["stage_start"] > timeout:
+                self._finish_park_out(
+                    False, f"{mission['phase']} timeout; {detail}"
+                )
+                return 0.0, 0.0
+
+            return vx, wz
+
         if mission["mode"] == "legacy_table":
             return self._update_legacy_table_navigation(mission, x, y, yaw)
 

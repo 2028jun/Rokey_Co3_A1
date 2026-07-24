@@ -223,6 +223,12 @@ class SimplifiedPathNavigator:
         self._control_pose: tuple[float, float, float] | None = None
         self._control_twist: tuple[float, float] | None = None
 
+        # Cache navigation readiness before the first Manager command arrives.
+        # The former implementation only checked these inputs inside navigate_to(),
+        # which made the first order absorb several seconds of Nav2 startup delay.
+        self._inputs_ready = False
+        self._readiness_logged = False
+
         self._costmap: OccupancyGrid | None = None
         self._costmap_sub = nav.create_subscription(
             OccupancyGrid,
@@ -264,6 +270,36 @@ class SimplifiedPathNavigator:
         self._pub_l_cand_y = nav.create_publisher(NavPath, "/orthogonal_path/l_candidate_y_first", path_qos)
         self._pub_selected = nav.create_publisher(NavPath, "/orthogonal_path/selected", path_qos)
         self._pub_dock_approach = nav.create_publisher(NavPath, "/orthogonal_path/dock_approach", path_qos)
+
+        # Run from the node's existing executor. No extra spin thread is created.
+        # Once all inputs are ready, the timer cancels itself.
+        self._input_warmup_timer = nav.create_timer(
+            0.2, self._warm_navigation_inputs
+        )
+
+    def _warm_navigation_inputs(self) -> None:
+        if self._inputs_ready:
+            return
+
+        if self._costmap is None or self._control_pose is None:
+            return
+
+        map_pose = self._map_pose()
+        if map_pose is None:
+            return
+
+        self._inputs_ready = True
+        if not self._readiness_logged:
+            self._readiness_logged = True
+            print(
+                "[auto] navigation inputs prewarmed: "
+                "costmap=OK raw_odom=OK map_pose=OK",
+                flush=True,
+            )
+
+        timer = getattr(self, "_input_warmup_timer", None)
+        if timer is not None:
+            timer.cancel()
 
     def _on_costmap(self, msg: OccupancyGrid) -> None:
         self._costmap = msg
@@ -363,12 +399,22 @@ class SimplifiedPathNavigator:
             }
         )
         timeout = abs(float(distance_m)) / max(abs(float(speed_mps)), 0.05) + 8.0
+        # park-out includes reverse plus opposite-heading alignment in Isaac.
+        # The old timeout covered only the straight-line motion and cancelled
+        # the mission during the 180-degree pivot.
+        if label == "park_out":
+            timeout += 30.0
         ok, _reason = self._wait_for_mission_completion(
             mission_id, timeout, label
         )
         return ok
 
     def _wait_for_navigation_inputs(self, timeout_sec: float = 8.0) -> bool:
+        # Fast path for normal operation: startup readiness was already cached
+        # by _warm_navigation_inputs before the order arrived.
+        if self._inputs_ready:
+            return True
+
         started = time.monotonic()
         last_log = 0.0
 
@@ -381,10 +427,14 @@ class SimplifiedPathNavigator:
             if costmap_ready and raw_odom_ready:
                 map_pose = self._map_pose()
                 if map_pose is not None:
+                    self._inputs_ready = True
                     print(
                         "[auto] navigation inputs ready: costmap=OK raw_odom=OK map_pose=OK",
                         flush=True,
                     )
+                    timer = getattr(self, "_input_warmup_timer", None)
+                    if timer is not None:
+                        timer.cancel()
                     return True
 
             now = time.monotonic()
