@@ -57,7 +57,7 @@ PERSON_COLLIDER_CENTER_Z = float(
 # tabletop.  The controller holds this exact pose before, during, and after
 # the animation so root motion cannot sink or rotate the character.
 TYPING_PERSON_NAME = "TypingCustomer"
-TYPING_X = float(os.environ.get("HAND_TEST_STAND_X", "-3.70"))
+TYPING_X = float(os.environ.get("HAND_TEST_STAND_X", "-2.80383"))
 TYPING_Y = float(os.environ.get("HAND_TEST_STAND_Y", "-3.10"))
 TYPING_Z = float(os.environ.get("HAND_TEST_STAND_Z", "0.0"))
 TYPING_YAW_DEGREES = float(

@@ -22,6 +22,13 @@ class RestaurantMap {
         this.kitchenZone = { x: 0.0, y: 4.5, label: "Lightwheel Kitchen" };
         this.robotPose = { x: -1.82, y: -2.20, yaw: 0.0 };
         this.activeTargetTable = 1;
+
+        // Robot-local (forward=+x) safety zones.  Kept in sync with the
+        // collision_monitor polygons in nav2_params.yaml and the
+        // OBSTACLE_STOP_*/OBSTACLE_SLOWDOWN_* constants in
+        // nav_restaurant_demo.py -- update all three together.
+        this.stopZone = { front: 0.55, back: -0.35, halfWidth: 0.50 };
+        this.slowdownZone = { front: 1.20, back: -0.45, halfWidth: 0.70 };
         
         this.init();
     }
@@ -165,6 +172,26 @@ class RestaurantMap {
         ctx.translate(rPos.x, rPos.y);
         ctx.rotate(-this.robotPose.yaw);
 
+        // Safety zones (drawn under the robot body, local +x = forward,
+        // matching the heading dot below).
+        const drawZone = (zone, fillStyle, strokeStyle, dash) => {
+            const zx = zone.back * this.scale;
+            const zy = -zone.halfWidth * this.scale;
+            const zw = (zone.front - zone.back) * this.scale;
+            const zh = 2 * zone.halfWidth * this.scale;
+            ctx.fillStyle = fillStyle;
+            ctx.strokeStyle = strokeStyle;
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash(dash || []);
+            ctx.beginPath();
+            ctx.roundRect(zx, zy, zw, zh, 6);
+            ctx.fill();
+            ctx.stroke();
+            ctx.setLineDash([]);
+        };
+        drawZone(this.slowdownZone, "rgba(245, 158, 11, 0.12)", "rgba(245, 158, 11, 0.65)", [5, 4]);
+        drawZone(this.stopZone, "rgba(239, 68, 68, 0.18)", "rgba(239, 68, 68, 0.75)");
+
         // Ridgeback base body
         ctx.fillStyle = "#6366f1";
         ctx.strokeStyle = "#a855f7";
@@ -219,6 +246,23 @@ class RestaurantMap {
             ctx.textAlign = "center";
             ctx.fillText("⚠️ PERSON (STOPPED)", oPos.x, oPos.y - 22);
         }
+
+        // 9. Safety zone legend (fixed, unrotated corner overlay)
+        const legendX = 10;
+        let legendY = this.canvas.height - 34;
+        ctx.font = "10px Outfit";
+        ctx.textAlign = "left";
+
+        ctx.fillStyle = "rgba(239, 68, 68, 0.75)";
+        ctx.fillRect(legendX, legendY - 8, 12, 12);
+        ctx.fillStyle = "#f1f5f9";
+        ctx.fillText("Stop zone", legendX + 18, legendY + 1);
+
+        legendY += 18;
+        ctx.fillStyle = "rgba(245, 158, 11, 0.65)";
+        ctx.fillRect(legendX, legendY - 8, 12, 12);
+        ctx.fillStyle = "#f1f5f9";
+        ctx.fillText("Slowdown zone", legendX + 18, legendY + 1);
     }
 
     setObstaclePerson(active, x = 0.0, y = 2.8) {
