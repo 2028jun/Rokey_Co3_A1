@@ -1150,12 +1150,17 @@ class NavBridge(Node):
         )
         self.scan_pub = self.create_publisher(LaserScan, "/scan", sensor_qos)
         self.nav_scan_pub = self.create_publisher(LaserScan, "/nav_robot/scan", sensor_qos)
+        self.two_wheel_scan_pub = self.create_publisher(LaserScan, "/two_wheel/scan_raw", sensor_qos)
         self.create_subscription(Twist, "/nav_robot/cmd_vel", self._on_cmd_vel, qos)
         self.create_subscription(Twist, "cmd_vel", self._on_cmd_vel, qos)
         self.create_subscription(
             PoseStamped, "/nav_robot/teleport", self._on_teleport, qos
         )
+        self.create_subscription(
+            PoseStamped, "/two_wheel/teleport", self._on_teleport, qos
+        )
         self.odom_pub = self.create_publisher(Odometry, "/nav_robot/odom", qos)
+        self.two_wheel_odom_pub = self.create_publisher(Odometry, "/two_wheel/odom_raw", qos)
         self.obstacle_pub = self.create_publisher(String, "/serving_robot/obstacle_event", qos)
         self.tf_broadcaster = TransformBroadcaster(self)
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
@@ -1595,6 +1600,7 @@ class NavBridge(Node):
 
         self.scan_pub.publish(scan)
         self.nav_scan_pub.publish(scan)
+        self.two_wheel_scan_pub.publish(scan)
 
         self._process_obstacle_ranges(
             obstacle_ranges,
@@ -2633,6 +2639,7 @@ class NavBridge(Node):
         odom.twist.twist.linear.x = vx
         odom.twist.twist.angular.z = wz
         self.odom_pub.publish(odom)
+        self.two_wheel_odom_pub.publish(odom)
 
         tf = TransformStamped()
         # /clock reaches this Python node about 0.067 s after the RTX scan has

@@ -16,6 +16,10 @@ setup(
         (os.path.join("share", package_name, "launch"), glob("launch/*.py")),
         (os.path.join("share", package_name, "rviz"), glob("rviz/*")),
         (os.path.join("share", package_name, "urdf"), glob("urdf/*")),
+        (
+            os.path.join("share", package_name, "maps", "restaurant"),
+            glob("maps/restaurant/*"),
+        ),
     ],
     install_requires=["setuptools", "PyYAML"],
     zip_safe=True,
@@ -28,6 +32,8 @@ setup(
             "rail_mission = two_wheel_rails.rail_mission:main",
             "autonomous_mission = two_wheel_rails.autonomous_mission:main",
             "topic_bridge = two_wheel_rails.topic_bridge:main",
+            "navigation_subsystem = two_wheel_rails.navigation_subsystem_node:main",
+            "navigation_initialize = two_wheel_rails.navigation_initialize:main",
         ],
     },
 )

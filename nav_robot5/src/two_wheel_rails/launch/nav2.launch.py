@@ -20,9 +20,10 @@ def _workspace_root() -> str:
     )
 
 
-def _default_map() -> str:
+def _default_map(pkg_share: str) -> str:
     root = _workspace_root()
     for path in (
+        os.path.join(pkg_share, "maps", "restaurant", "map.yaml"),
         os.path.join(os.getcwd(), "maps", "restaurant", "map.yaml"),
         os.path.join(root, "maps", "restaurant", "map.yaml"),
     ):
@@ -36,7 +37,7 @@ def generate_launch_description():
     nav2_bringup_dir = get_package_share_directory("nav2_bringup")
     nav2_bt_dir = get_package_share_directory("nav2_bt_navigator")
 
-    default_map = _default_map()
+    default_map = _default_map(pkg_share)
     default_params = os.path.join(pkg_share, "config", "nav2_params.yaml")
     default_rviz = os.path.join(pkg_share, "rviz", "nav2.rviz")
     robot_urdf = os.path.join(pkg_share, "urdf", "two_wheel_robot.urdf")

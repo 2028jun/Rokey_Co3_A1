@@ -11,7 +11,7 @@ corner_replan_attempts: 3
 rotation_clearance_radius_m: 0.45
 
 # Docking
-dock_approach_distance_m: 0.60
+dock_approach_distance_m: 0.65
 dock_step_distance_m: 0.08
 dock_max_linear_speed_mps: 0.10
 dock_min_linear_speed_mps: 0.02

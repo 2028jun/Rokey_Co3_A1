@@ -144,6 +144,16 @@ def resolve_map_xy(
     return xy if xy is not None else (tracker.xy if tracker else None)
 
 
+def _safe_spin_once(node: BasicNavigator, timeout_sec: float = 0.05) -> None:
+    try:
+        rclpy.spin_once(node, timeout_sec=timeout_sec)
+    except ValueError as exc:
+        if "generator already executing" in str(exc):
+            time.sleep(timeout_sec)
+        else:
+            raise
+
+
 def wait_for_existing_localization(
     nav: BasicNavigator,
     tf_buffer: Buffer,
@@ -152,7 +162,7 @@ def wait_for_existing_localization(
 ) -> tuple[float, float, float] | None:
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
-        rclpy.spin_once(nav, timeout_sec=0.1)
+        _safe_spin_once(nav, timeout_sec=0.1)
         xy = resolve_map_xy(nav, tf_buffer, tracker)
         yaw = resolve_map_yaw(nav, tf_buffer, tracker)
         if xy is not None and yaw is not None:
@@ -171,7 +181,7 @@ def wait_for_clock(nav: BasicNavigator, timeout_sec: float = 90.0) -> bool:
     deadline = time.monotonic() + timeout_sec
     try:
         while time.monotonic() < deadline:
-            rclpy.spin_once(nav, timeout_sec=0.1)
+            _safe_spin_once(nav, timeout_sec=0.1)
             if received["ok"]:
                 return True
         return False
@@ -192,7 +202,7 @@ def publish_initial_pose(
     for _ in range(repeats):
         msg.header.stamp = nav.get_clock().now().to_msg()
         nav.initial_pose_pub.publish(msg)
-        rclpy.spin_once(nav, timeout_sec=0.05)
+        _safe_spin_once(nav, timeout_sec=0.05)
         time.sleep(0.08)
 
 
@@ -202,12 +212,12 @@ def teleport_to_spawn(nav: BasicNavigator, x: float, y: float, yaw: float) -> No
     for _ in range(5):
         msg.header.stamp = nav.get_clock().now().to_msg()
         pub.publish(msg)
-        rclpy.spin_once(nav, timeout_sec=0.05)
+        _safe_spin_once(nav, timeout_sec=0.05)
         time.sleep(0.05)
     nav.destroy_publisher(pub)
     deadline = time.monotonic() + 1.2
     while time.monotonic() < deadline:
-        rclpy.spin_once(nav, timeout_sec=0.05)
+        _safe_spin_once(nav, timeout_sec=0.05)
 
 
 def reinitialize_amcl(nav: BasicNavigator) -> None:
@@ -215,7 +225,11 @@ def reinitialize_amcl(nav: BasicNavigator) -> None:
     if not client.wait_for_service(timeout_sec=2.0):
         return
     future = client.call_async(Empty.Request())
-    rclpy.spin_until_future_complete(nav, future, timeout_sec=5.0)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if future.done():
+            return
+        _safe_spin_once(nav, timeout_sec=0.1)
 
 
 def sync_spawn(
@@ -233,7 +247,7 @@ def sync_spawn(
     publish_initial_pose(nav, x, y, yaw, repeats=4)
     deadline = time.monotonic() + 40.0
     while time.monotonic() < deadline:
-        rclpy.spin_once(nav, timeout_sec=0.1)
+        _safe_spin_once(nav, timeout_sec=0.1)
         xy = resolve_map_xy(nav, tf_buffer, tracker)
         if xy and math.hypot(xy[0] - x, xy[1] - y) < 0.65:
             print(f"[sync] OK ({xy[0]:.2f}, {xy[1]:.2f})")

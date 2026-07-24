@@ -8,6 +8,7 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 import rclpy
 import yaml
@@ -31,6 +32,72 @@ GridCell = tuple[int, int]
 
 # Directions: 0: EAST (+X), 1: NORTH (+Y), 2: WEST (-X), 3: SOUTH (-Y)
 DIRECTIONS = [(1, 0), (0, 1), (-1, 0), (0, -1)]
+
+
+def _point_line_distance(point: Point, start: Point, end: Point) -> float:
+    px, py = point
+    ax, ay = start
+    bx, by = end
+    dx, dy = bx - ax, by - ay
+    denom = dx * dx + dy * dy
+    if denom <= 1e-12:
+        return math.hypot(px - ax, py - ay)
+    t = max(
+        0.0,
+        min(1.0, ((px - ax) * dx + (py - ay) * dy) / denom),
+    )
+    qx, qy = ax + t * dx, ay + t * dy
+    return math.hypot(px - qx, py - qy)
+
+
+def simplify_path(
+    points: Iterable[Point], tolerance_m: float
+) -> list[Point]:
+    """Simplify geometry while preserving corners outside the tolerance."""
+    pts = list(points)
+    if len(pts) <= 2:
+        return pts
+    start, end = pts[0], pts[-1]
+    index = -1
+    max_distance = -1.0
+    for i in range(1, len(pts) - 1):
+        distance = _point_line_distance(pts[i], start, end)
+        if distance > max_distance:
+            max_distance = distance
+            index = i
+    if max_distance > tolerance_m and index > 0:
+        left = simplify_path(pts[: index + 1], tolerance_m)
+        right = simplify_path(pts[index:], tolerance_m)
+        return left[:-1] + right
+    return [start, end]
+
+
+def merge_short_segments(
+    points: Iterable[Point], minimum_length_m: float
+) -> list[Point]:
+    """Remove tiny intermediate segments while preserving the final goal."""
+    pts = list(points)
+    if len(pts) <= 2:
+        return pts
+    merged = [pts[0]]
+    for point in pts[1:-1]:
+        if math.hypot(
+            point[0] - merged[-1][0],
+            point[1] - merged[-1][1],
+        ) >= minimum_length_m:
+            merged.append(point)
+    if (
+        math.hypot(
+            pts[-1][0] - merged[-1][0],
+            pts[-1][1] - merged[-1][1],
+        )
+        < minimum_length_m
+        and len(merged) > 1
+    ):
+        merged[-1] = pts[-1]
+    else:
+        merged.append(pts[-1])
+    return merged
 
 
 @dataclass(frozen=True)
@@ -284,7 +351,7 @@ class SimplifiedPathNavigator:
         *,
         label: str = "drive_distance",
     ) -> bool:
-        mission_id = f"{label}_{int(time.monotonic())}"
+        mission_id = f"{label}_{time.monotonic_ns()}"
         self._last_status = None
         self._spin_sleep(0.25)
         self._send_mission_command(
@@ -595,9 +662,12 @@ class SimplifiedPathNavigator:
         )
         self._publish_rviz_path(self._pub_dock_approach, [approach_pt, (gx, gy)])
 
-        mission_id = f"{label}_{int(time.monotonic())}"
-
         for attempt in range(self._cfg.replan_attempts + 1):
+            mission_id = (
+                f"{label}_{time.monotonic_ns()}_attempt_{attempt}"
+            )
+            self._last_status = None
+            self._spin_sleep(0.1)
             map_p = self._map_pose()
             raw_p = self._motion_pose()
             if map_p is None or raw_p is None:
