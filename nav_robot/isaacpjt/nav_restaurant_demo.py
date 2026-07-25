@@ -268,6 +268,11 @@ LIDAR_SAMPLES = 180
 LIDAR_PERIOD_SEC = 0.10
 LIDAR_SENSOR_FORWARD = 0.48
 LIDAR_SENSOR_HEIGHT = 0.45
+PERSON_LIDAR_PROXY_PATH = "/World/CrossingPedestrian_person_lidar_collider"
+PERSON_LIDAR_PROXY_RADIUS = float(
+    os.environ.get("NAV_CROSSING_COLLIDER_RADIUS", "0.30")
+)
+PERSON_LIDAR_ENABLED_ATTR = "userProperties:lidarEnabled"
 
 # Robot-local safety rectangles for _direct_nav's obstacle check (mission
 # driving never touches ROS cmd_vel, so it cannot be protected by
@@ -1776,6 +1781,25 @@ class NavBridge(Node):
             else "/World/NavRobot"
         )
 
+        # The walking person uses a non-contact capsule.  Read its current
+        # world position and intersect it analytically with each planar ray,
+        # preserving /scan detection without any PhysX contact response.
+        person_proxy = self.stage.GetPrimAtPath(PERSON_LIDAR_PROXY_PATH)
+        person_xy = None
+        if person_proxy.IsValid():
+            enabled_attr = person_proxy.GetAttribute(
+                PERSON_LIDAR_ENABLED_ATTR
+            )
+            enabled = (
+                bool(enabled_attr.Get()) if enabled_attr.IsValid() else False
+            )
+            if enabled:
+                matrix = UsdGeom.Xformable(
+                    person_proxy
+                ).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+                translation = matrix.ExtractTranslation()
+                person_xy = (float(translation[0]), float(translation[1]))
+
         ranges = []
         obstacle_ranges = []
         person_hits = []
@@ -1805,6 +1829,32 @@ class NavBridge(Node):
             else:
                 distance = math.inf
 
+            person_distance = math.inf
+            if person_xy is not None:
+                offset_x = origin[0] - person_xy[0]
+                offset_y = origin[1] - person_xy[1]
+                projection = (
+                    offset_x * direction[0] + offset_y * direction[1]
+                )
+                radius_term = (
+                    offset_x * offset_x
+                    + offset_y * offset_y
+                    - PERSON_LIDAR_PROXY_RADIUS
+                    * PERSON_LIDAR_PROXY_RADIUS
+                )
+                discriminant = projection * projection - radius_term
+                if discriminant >= 0.0:
+                    root = math.sqrt(discriminant)
+                    near = -projection - root
+                    far = -projection + root
+                    candidate = near if near >= LIDAR_MIN_RANGE else far
+                    if LIDAR_MIN_RANGE <= candidate <= LIDAR_MAX_RANGE:
+                        person_distance = candidate
+
+            virtual_person_hit = person_distance < distance
+            if virtual_person_hit:
+                distance = person_distance
+
             if distance < LIDAR_MIN_RANGE:
                 distance = math.inf
 
@@ -1812,7 +1862,7 @@ class NavBridge(Node):
 
             # Filter for dynamic person / obstacle detection: ignore static environment (tables, chairs, walls, kitchen)
             hit_path = (rigid_body + " " + collision_prim).lower()
-            is_person = (
+            is_person = virtual_person_hit or (
                 "/World/CorridorObstacleTestPerson" in (rigid_body + collision_prim)
                 or "person" in hit_path
                 or "character" in hit_path

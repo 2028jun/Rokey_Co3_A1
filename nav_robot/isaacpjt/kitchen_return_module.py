@@ -6,6 +6,8 @@ import math
 
 
 KITCHEN_DOCK = (0.0, 5.25, -math.pi / 2.0)
+BACKOUT_SPEED = 0.28
+AISLE_SPEED = 0.50
 
 
 def build_kitchen_route(x: float, y: float):
@@ -19,7 +21,7 @@ def build_kitchen_route(x: float, y: float):
                 {
                     "kind": "axis_x",
                     "value": 0.0,
-                    "speed": -0.22,
+                    "speed": -BACKOUT_SPEED,
                     "yaw": outward_yaw,
                 },
             ]
@@ -31,7 +33,7 @@ def build_kitchen_route(x: float, y: float):
                 {
                     "kind": "axis_y",
                     "value": KITCHEN_DOCK[1],
-                    "speed": 0.35,
+                    "speed": AISLE_SPEED,
                     "yaw": math.pi / 2.0,
                 },
             ]

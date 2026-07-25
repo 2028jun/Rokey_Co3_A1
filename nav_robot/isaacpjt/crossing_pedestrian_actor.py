@@ -10,7 +10,7 @@ from pathlib import Path
 import carb
 import carb.settings
 import omni.kit.app
-from pxr import Gf, Usd, UsdGeom, UsdPhysics
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
 
 
 PERSON_NAME = "CrossingPedestrian"
@@ -35,9 +35,9 @@ PROGRESS_LOG_SECONDS = float(
     os.environ.get("NAV_CROSSING_PROGRESS_LOG_SECONDS", "5.0")
 )
 
-# Actor SDG bipeds carry no PhysX collider, so the front RPLIDAR S2E's PhysX
-# raycast (/scan) cannot see CrossingPedestrian without a proxy.  This
-# invisible capsule is a sibling prim (not a child of the animated
+# Actor SDG bipeds carry no usable LiDAR geometry, so /scan cannot see
+# CrossingPedestrian without a proxy.  This non-contact analytic capsule is a
+# sibling prim (not a child of the animated
 # character), because the animation graph drives the SkelRoot transform
 # directly and does not propagate through a parent Xform -- so its position
 # is synced explicitly from the character's root position every update().
@@ -52,6 +52,7 @@ PERSON_COLLIDER_TOTAL_HEIGHT = float(
 PERSON_COLLIDER_CENTER_Z = float(
     os.environ.get("NAV_CROSSING_COLLIDER_CENTER_Z", "0.875")
 )
+PERSON_LIDAR_ENABLED_ATTR = "userProperties:lidarEnabled"
 # Root to search for the robot's collision-enabled prims (see
 # _create_person_lidar_collider below).  Must match ROBOT_ROOT in
 # nav_restaurant_demo.py.  The robot is an articulation made of several
@@ -234,6 +235,14 @@ def _create_person_lidar_collider(stage):
     CrossingPedestrian in PhysX raycasts.  Returns (prim, translate_op)."""
     existing = stage.GetPrimAtPath(PERSON_COLLIDER_PATH)
     if existing.IsValid():
+        collision_api = UsdPhysics.CollisionAPI.Apply(existing)
+        collision_api.CreateCollisionEnabledAttr().Set(False)
+        enabled_attr = existing.GetAttribute(PERSON_LIDAR_ENABLED_ATTR)
+        if not enabled_attr.IsValid():
+            enabled_attr = existing.CreateAttribute(
+                PERSON_LIDAR_ENABLED_ATTR, Sdf.ValueTypeNames.Bool
+            )
+        enabled_attr.Set(True)
         translate_op = None
         for op in UsdGeom.Xformable(existing).GetOrderedXformOps():
             if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
@@ -259,16 +268,21 @@ def _create_person_lidar_collider(stage):
     )
     translate_op.Set(Gf.Vec3d(LEFT_X, LANE_Y, PERSON_COLLIDER_CENTER_Z))
 
-    UsdPhysics.CollisionAPI.Apply(prim)
+    collision_api = UsdPhysics.CollisionAPI.Apply(prim)
+    # NavBridge inserts this capsule into /scan analytically.  It must never
+    # generate contact impulses because the scripted pedestrian does not
+    # react to the robot and would otherwise push a stopped articulation.
+    collision_api.CreateCollisionEnabledAttr().Set(False)
     rigid_body_api = UsdPhysics.RigidBodyAPI.Apply(prim)
     rigid_body_api.CreateRigidBodyEnabledAttr(True)
     rigid_body_api.CreateKinematicEnabledAttr(True)
+    prim.CreateAttribute(
+        PERSON_LIDAR_ENABLED_ATTR, Sdf.ValueTypeNames.Bool
+    ).Set(True)
 
-    # Suppress contact response against the robot only -- raycast/scene
-    # queries (what the front RPLIDAR uses) match by shape flag and are
-    # unaffected by collision-group filtering, so this leaves the capsule
-    # fully visible to /scan while stopping it from pushing or being
-    # pushed by the robot.
+    # Retain collision groups as defense in depth for stages created by older
+    # versions of this script.  Normal runs do not rely on this filter because
+    # physical collision is disabled above.
     #
     # UsdPhysics.CollisionGroup + a UsdCollectionAPI "colliders" set is
     # used instead of per-shape UsdPhysics.FilteredPairsAPI: a per-shape
@@ -326,7 +340,7 @@ def _create_person_lidar_collider(stage):
         f"[crossing_pedestrian] lidar collider created at "
         f"{PERSON_COLLIDER_PATH} radius={PERSON_COLLIDER_RADIUS:.2f} "
         f"height={PERSON_COLLIDER_TOTAL_HEIGHT:.2f} "
-        f"(collision-group filtered against {ROBOT_ROOT_PATH})",
+        "(non-contact analytic LiDAR proxy)",
         flush=True,
     )
     return prim, translate_op
@@ -383,9 +397,16 @@ class CrossingPedestrianController:
     def _set_collider_enabled(self, enabled: bool) -> None:
         if self._collider_prim is None or not self._collider_prim.IsValid():
             return
+        # Visibility to the custom LiDAR is independent from contact physics.
         UsdPhysics.CollisionAPI(
             self._collider_prim
-        ).CreateCollisionEnabledAttr().Set(enabled)
+        ).CreateCollisionEnabledAttr().Set(False)
+        attr = self._collider_prim.GetAttribute(PERSON_LIDAR_ENABLED_ATTR)
+        if not attr.IsValid():
+            attr = self._collider_prim.CreateAttribute(
+                PERSON_LIDAR_ENABLED_ATTR, Sdf.ValueTypeNames.Bool
+            )
+        attr.Set(bool(enabled))
 
     def _sync_collider(self, position) -> None:
         if self._collider_translate_op is None:
