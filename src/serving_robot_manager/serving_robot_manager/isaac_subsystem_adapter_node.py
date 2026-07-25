@@ -31,9 +31,18 @@ class IsaacSubsystemAdapterNode(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
         )
+        command_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
 
-        self._arm_trigger_pub = self.create_publisher(Int32, "/arm/trigger", status_qos)
-        self._spawn_trigger_pub = self.create_publisher(Int32, "/food_spawn/trigger", status_qos)
+        # Commands are events, not state.  TRANSIENT_LOCAL replays stale
+        # commands whenever Isaac reconnects and can spawn/serve the same
+        # payload repeatedly.  Only status topics should be latched.
+        self._arm_trigger_pub = self.create_publisher(Int32, "/arm/trigger", command_qos)
+        self._spawn_trigger_pub = self.create_publisher(Int32, "/food_spawn/trigger", command_qos)
 
         self._arm_status_sub = self.create_subscription(
             Int32, "/arm/status", self._on_arm_status, status_qos, callback_group=self._cb_group

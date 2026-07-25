@@ -124,12 +124,36 @@ class SodaCanPickPlace:
         self._preserve_grasp_orientation = False
         self._carried_orientation = None
         self._use_seeded_ik_for_lift = False
+        # Some payloads have disconnected Cartesian IK branches that RMPFlow
+        # may switch between.  Subclasses can keep every Cartesian phase on a
+        # continuously seeded Lula branch without changing soda/cutlery.
+        self._use_seeded_ik_for_all_motion = False
+        self._seeded_ik_solver = None
+        self._seeded_ik_max_delta = np.deg2rad(10.0)
         self._continuous_rmp_lift = False
         self._vertical_orientation = VERTICAL_EE_ORIENTATION.copy()
         self._grasp_hold_max_error = None
         self._grasp_object_max_lateral = None
+        # Optional tighter convergence requirement for the placement descent
+        # (phase 6).  The shared 25 mm tolerance is retained for soda/cutlery;
+        # large payloads can require the wrist to get closer before release.
+        self._placement_settle_error = None
+        # Optional contact check for rigid handled payloads.  If the driven
+        # joint reaches the requested close angle within this margin, nothing
+        # stopped the fingers and the grasp is empty.  Soda/cutlery retain
+        # their existing behavior unless a subclass enables this explicitly.
+        self._gripper_contact_margin = None
+        # Optional partially closed approach posture.  Most payloads approach
+        # fully open; tightly packed payloads can start the final close ramp
+        # from a narrower collision-safe finger span.
+        self._gripper_pregrasp = GRIPPER_OPEN
         self._gripper_close_ramp_steps = 120
         self._gripper_close_wait_steps = 120
+        # Ramp lengths for the Cartesian phases.  Subclasses may shorten them;
+        # the tested soda/cutlery timings stay at the module defaults.
+        self._vertical_steps = VERTICAL_STEPS
+        self._initial_steps = INITIAL_STEPS
+        self._transfer_steps = INITIAL_STEPS
         self._phase = 0
         self._phase_steps = 0
         self._settled_steps = 0
@@ -407,6 +431,51 @@ class SodaCanPickPlace:
         if phase == 9:
             self.done = True
 
+    def _apply_seeded_ik_action(
+        self, articulation, wrist_target, orientation, phase_label
+    ):
+        """Apply one continuous Lula IK sample from the measured joints."""
+        current_arm = np.asarray(
+            articulation.get_joint_positions()[self._arm_indices],
+            dtype=float,
+        )
+        joints, ik_ok = self._seeded_ik_solver.compute_inverse_kinematics(
+            "link_6",
+            wrist_target,
+            orientation,
+            current_arm,
+            0.003,
+            0.03,
+        )
+        if not ik_ok:
+            self.failed = True
+            print(
+                f"[{self._task_name}] STOPPED: seeded IK failed "
+                f"phase={phase_label} wrist={np.round(wrist_target, 4)}",
+                flush=True,
+            )
+            return False
+        joints = current_arm + (
+            np.asarray(joints, dtype=float) - current_arm + np.pi
+        ) % (2.0 * np.pi) - np.pi
+        joint_step = np.abs(joints - current_arm)
+        if float(np.max(joint_step)) > self._seeded_ik_max_delta:
+            self.failed = True
+            print(
+                f"[{self._task_name}] STOPPED: seeded IK branch jump "
+                f"phase={phase_label} delta_deg="
+                f"{np.round(np.degrees(joint_step), 1).tolist()}",
+                flush=True,
+            )
+            return False
+        articulation.apply_action(
+            ArticulationAction(
+                joint_positions=joints,
+                joint_indices=self._arm_indices,
+            )
+        )
+        return True
+
     def step(self, articulation):
         if not self._active or self.done or self.failed:
             return
@@ -442,21 +511,32 @@ class SodaCanPickPlace:
 
         self._phase_steps += 1
         if self._phase in (2, 7):
-            # Keep advancing RMPFlow while the fingers move.  Pausing it for
-            # 120 frames previously made its internal state stale and caused
-            # a large first-step transient when the vertical lift resumed.
-            hold_action = self._controller.forward(
-                target_end_effector_position=self._grasp_hold_wrist,
-                target_end_effector_orientation=self._grasp_hold_orientation,
-            )
-            articulation.apply_action(hold_action)
+            # Keep the arm controller active while the fingers move.  Most
+            # payloads advance RMPFlow; branch-sensitive payloads hold the
+            # same Cartesian pose with continuously seeded Lula IK.
+            if self._use_seeded_ik_for_all_motion:
+                if not self._apply_seeded_ik_action(
+                    articulation,
+                    self._grasp_hold_wrist,
+                    self._grasp_hold_orientation,
+                    self._phase,
+                ):
+                    return
+            else:
+                hold_action = self._controller.forward(
+                    target_end_effector_position=self._grasp_hold_wrist,
+                    target_end_effector_orientation=self._grasp_hold_orientation,
+                )
+                articulation.apply_action(hold_action)
             if self._phase == 2:
                 raw = min(
                     1.0,
                     self._phase_steps / float(self._gripper_close_ramp_steps),
                 )
                 amount = raw * raw * (3.0 - 2.0 * raw)
-                target = self._gripper_close * amount
+                target = self._gripper_pregrasp + (
+                    self._gripper_close - self._gripper_pregrasp
+                ) * amount
             else:
                 target = GRIPPER_OPEN
             self._command_gripper(articulation, target)
@@ -486,6 +566,25 @@ class SodaCanPickPlace:
                     flush=True,
                 )
             if self._phase_steps >= wait:
+                if (
+                    self._phase == 2
+                    and self._gripper_contact_margin is not None
+                ):
+                    actual_gripper = float(
+                        articulation.get_joint_positions()[self._gripper_index]
+                    )
+                    if actual_gripper >= (
+                        self._gripper_close - self._gripper_contact_margin
+                    ):
+                        self.failed = True
+                        print(
+                            f"[{self._task_name}] STOPPED: empty grasp; "
+                            f"gripper reached close target "
+                            f"target={self._gripper_close:.3f} "
+                            f"actual={actual_gripper:.3f}",
+                            flush=True,
+                        )
+                        return
                 if self._phase == 2 and self._grasp_hold_max_error is not None:
                     wrist_now, _, _ = prim_world_pose(self._end_effector)
                     wrist_error = float(
@@ -533,7 +632,7 @@ class SodaCanPickPlace:
         tcp_target = self._targets[self._phase].copy()
         transition_complete = True
         if self._phase in self._vertical_starts:
-            raw = min(1.0, self._phase_steps / VERTICAL_STEPS)
+            raw = min(1.0, self._phase_steps / float(self._vertical_steps))
             amount = raw * raw * (3.0 - 2.0 * raw)
             start = self._vertical_starts[self._phase]
             tcp_target[:2] = start[:2]
@@ -545,6 +644,17 @@ class SodaCanPickPlace:
             start = self._targets[3] if self._phase == 4 else self._targets[4]
             end = self._targets[self._phase]
             tcp_target = start + amount * (end - start)
+            transition_complete = raw >= 1.0
+        elif self._phase == 4 and self._use_seeded_ik_for_all_motion:
+            # RMPFlow normally turns a distant phase-4 target into a smooth
+            # motion internally.  A joint-by-joint seeded IK controller needs
+            # that Cartesian interpolation made explicit to preserve branch
+            # continuity during the long pickup-to-table transfer.
+            raw = min(1.0, self._phase_steps / float(self._transfer_steps))
+            amount = raw * raw * (3.0 - 2.0 * raw)
+            tcp_target = self._targets[3] + amount * (
+                self._targets[4] - self._targets[3]
+            )
             transition_complete = raw >= 1.0
         wrist_target = self._tcp_to_wrist(tcp_target)
         orientation = self._vertical_orientation
@@ -559,7 +669,7 @@ class SodaCanPickPlace:
             # only and cannot whip J3 across the robot.
             orientation = self._carried_orientation
         if self._phase == 0:
-            raw = min(1.0, self._phase_steps / INITIAL_STEPS)
+            raw = min(1.0, self._phase_steps / float(self._initial_steps))
             amount = raw * raw * (3.0 - 2.0 * raw)
             wrist_target = self._initial_wrist + amount * (
                 wrist_target - self._initial_wrist
@@ -568,7 +678,15 @@ class SodaCanPickPlace:
                 self._initial_orientation, self._vertical_orientation, amount
             )
             transition_complete = raw >= 1.0
-        if self._phase == 3 and self._use_seeded_ik_for_lift:
+        if self._use_seeded_ik_for_all_motion:
+            if not self._apply_seeded_ik_action(
+                articulation,
+                wrist_target,
+                orientation,
+                self._phase,
+            ):
+                return
+        elif self._phase == 3 and self._use_seeded_ik_for_lift:
             # RMPFlow can leave the rear-tray IK branch even for a few mm of
             # vertical motion.  Solve each lift sample from the *current*
             # joints instead, making the local branch explicit and continuous.
@@ -624,9 +742,14 @@ class SodaCanPickPlace:
             articulation.apply_action(action)
         actual, _, _ = prim_world_pose(self._end_effector)
         error = float(np.linalg.norm(wrist_target - actual))
+        settle_error = (
+            self._placement_settle_error
+            if self._phase == 6 and self._placement_settle_error is not None
+            else 0.025
+        )
         self._settled_steps = (
             self._settled_steps + 1
-            if transition_complete and error < 0.025
+            if transition_complete and error < settle_error
             else 0
         )
         if self._phase_steps % 60 == 0:

@@ -83,6 +83,8 @@ from pizza_serving import (
 from drink_serving import spawn_soda_cans
 from cutlery_serving import spawn_cutlery_box
 from cutlery_pick_place import CutleryBoxPickPlace
+from plate_rack_serving import spawn_plate_rack
+from plate_rack_pick_place import PlateRackPickPlace
 from soda1_delivery import Soda1PickPlace
 from soda2_delivery import Soda2PickPlace
 from delivery_sequence import (
@@ -96,12 +98,12 @@ SERVING_TASK = os.environ.get("MOBILE_DEMO_TASK", "pizza").strip().lower()
 if SERVING_TASK not in {
     "pizza", "soda", "soda1", "soda2", "pizza_soda",
     "soda1_soda2", "soda1_soda2_cutlery", "pizza_soda1_soda2",
-    "pizza_soda1_soda2_cutlery", "cutlery", "none"
+    "pizza_soda1_soda2_cutlery", "cutlery", "plate_rack", "none"
 }:
     raise ValueError(
         "MOBILE_DEMO_TASK must be one of: pizza, soda, soda1, soda2, "
         "pizza_soda, soda1_soda2, soda1_soda2_cutlery, pizza_soda1_soda2, "
-        "pizza_soda1_soda2_cutlery, cutlery, none; "
+        "pizza_soda1_soda2_cutlery, cutlery, plate_rack, none; "
         f"got {SERVING_TASK!r}"
     )
 
@@ -1076,8 +1078,23 @@ def main():
     prepare_antigravity_food_assets()
     import_robot_usd()
     stage = open_restaurant_and_reference_robot()
-    spawn_soda_cans(stage)
-    spawn_cutlery_box(stage)
+    if SERVING_TASK in {
+        "soda", "soda1", "soda2", "soda1_soda2",
+        "soda1_soda2_cutlery", "pizza_soda", "pizza_soda1_soda2",
+        "pizza_soda1_soda2_cutlery",
+    }:
+        spawn_soda_cans(stage)
+    if SERVING_TASK in {
+        "cutlery", "soda1_soda2_cutlery", "pizza_soda1_soda2_cutlery",
+    }:
+        spawn_cutlery_box(stage)
+    if SERVING_TASK == "plate_rack":
+        # Spawn on the closed left tray so this standalone path also validates
+        # that the loaded tray can deploy without contacting the fixed deck.
+        spawn_plate_rack(
+            stage,
+            plate_count=int(os.environ.get("MOBILE_PLATE_COUNT", "4")),
+        )
     attach_m0609_visuals(stage)
     attach_fixed_table_depth_camera(stage)
     connect_table_camera_ros2(stage)
@@ -1090,6 +1107,8 @@ def main():
         serving_task = Soda2PickPlace(stage)
     elif SERVING_TASK == "cutlery":
         serving_task = CutleryBoxPickPlace(stage)
+    elif SERVING_TASK == "plate_rack":
+        serving_task = PlateRackPickPlace(stage)
     elif SERVING_TASK == "soda1_soda2":
         serving_task = CommandServingSequence(
             [
