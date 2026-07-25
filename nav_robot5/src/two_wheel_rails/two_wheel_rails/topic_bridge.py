@@ -4,21 +4,19 @@
 from __future__ import annotations
 
 import math
-import os
-
 import rclpy
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import LaserScan
-from tf2_ros import TransformBroadcaster
+from tf2_msgs.msg import TFMessage
 
 BASE_LINK = "ridgeback_base_link"
 LIDAR_FRAME = "nav_lidar_link"
-TELEPORT_TOPIC = "/two_wheel/teleport"
-RAW_ODOM_TOPIC = "/two_wheel/odom_raw"
-RAW_SCAN_TOPIC = "/two_wheel/scan_raw"
+TELEPORT_TOPIC = "two_wheel/teleport"
+RAW_ODOM_TOPIC = "two_wheel/odom_raw"
+RAW_SCAN_TOPIC = "two_wheel/scan_raw"
 
 
 def _yaw_from_quat(x: float, y: float, z: float, w: float) -> float:
@@ -57,14 +55,16 @@ def _sensor_data(depth: int = 5) -> QoSProfile:
 class TopicBridge(Node):
     def __init__(self) -> None:
         super().__init__("two_wheel_topic_bridge")
-        self._tf = TransformBroadcaster(self)
+        # TransformBroadcaster publishes to absolute /tf in Humble.  A plain
+        # publisher is used so ROS namespaces isolate the two Nav2 trees.
+        self._tf_pub = self.create_publisher(TFMessage, "tf", 100)
 
-        self._odom_pub = self.create_publisher(Odometry, "/odom", _sensor_data(20))
+        self._odom_pub = self.create_publisher(Odometry, "odom", _sensor_data(20))
         self.create_subscription(
             Odometry, RAW_ODOM_TOPIC, self._on_odom, _reliable(20)
         )
 
-        self._scan_pub = self.create_publisher(LaserScan, "/scan", _reliable(5))
+        self._scan_pub = self.create_publisher(LaserScan, "scan", _reliable(5))
         self.create_subscription(
             LaserScan, RAW_SCAN_TOPIC, self._on_scan, _sensor_data(5)
         )
@@ -103,7 +103,7 @@ class TopicBridge(Node):
         tf.transform.translation.y = out.pose.pose.position.y
         tf.transform.translation.z = out.pose.pose.position.z
         tf.transform.rotation = out.pose.pose.orientation
-        self._tf.sendTransform(tf)
+        self._tf_pub.publish(TFMessage(transforms=[tf]))
 
     def _on_scan(self, msg: LaserScan) -> None:
         msg.header.frame_id = LIDAR_FRAME

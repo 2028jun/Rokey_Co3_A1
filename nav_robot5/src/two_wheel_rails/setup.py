@@ -35,6 +35,7 @@ setup(
             "navigation_subsystem = two_wheel_rails.navigation_subsystem_node:main",
             "navigation_initialize = two_wheel_rails.navigation_initialize:main",
             "navigation_auto_initializer = two_wheel_rails.navigation_auto_initializer:main",
+            "rviz_tf_aggregator = two_wheel_rails.rviz_tf_aggregator:main",
         ],
     },
 )

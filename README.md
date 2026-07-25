@@ -34,6 +34,75 @@ export NAV_ROBOT5_ROS_DOMAIN_ID="$ROS_DOMAIN_ID"
 
 Open a new terminal after changing `~/.bashrc`.
 
+## Multi-robot Quick Start (3 terminals)
+
+The integrated multi-robot mode spawns two complete serving robots in Isaac
+Sim, runs an independent namespaced Nav2/safety/manager stack for each robot,
+and shows both robots in one RViz window. Keep the Isaac and ROS commands in
+separate terminals; do not source the ROS setup in the Isaac terminal.
+
+Build once before the first run or after changing ROS packages:
+
+```bash
+cd /home/rokey/cobot3_ws
+source /opt/ros/humble/setup.bash
+PYTHONNOUSERSITE=1 ./tools/colcon_safe.py build \
+  --packages-up-to serving_robot_manager serving_hmi two_wheel_rails hand_safety \
+  --executor sequential \
+  --event-handlers console_start_end+ desktop_notification- status- terminal_title-
+```
+
+**Terminal 1 — Isaac Sim with two integrated robots**
+
+```bash
+cd /home/rokey/cobot3_ws
+./tools/run_multi_integrated_isaac.sh
+```
+
+This script sets `NAV_MULTI_ROBOT=1`, configures the Isaac ROS 2 bridge
+library path, and starts `nav_robot/isaacpjt/nav_restaurant_demo.py`. Wait
+until the restaurant and both `/World/NavRobot1` and `/World/NavRobot2`
+instances have finished loading.
+
+**Terminal 2 — two Nav2 stacks, fleet manager, safety nodes, and RViz**
+
+```bash
+cd /home/rokey/cobot3_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 launch serving_robot_manager multi_robot.launch.py
+```
+
+The launch starts `/robot1` and `/robot2` workers and opens one RViz window
+with both robot models, LiDAR scans, local/global costmaps, footprints, and
+stop/slowdown zones.
+
+**Terminal 3 — HMI**
+
+```bash
+cd /home/rokey/cobot3_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 launch serving_hmi hmi.launch.py
+```
+
+Open `http://localhost:8000`. HMI orders are sent to `/manager/order`; the
+fleet manager assigns an idle robot. Payload prims are currently shared, so
+complete serving orders are serialized even though both navigation and
+safety stacks run concurrently.
+
+For a navigation-only smoke test without the HMI:
+
+```bash
+ros2 service call /robot1/navigation/command \
+  serving_robot_interfaces/srv/TaskCommand "{command: 0}"
+ros2 service call /robot2/navigation/command \
+  serving_robot_interfaces/srv/TaskCommand "{command: 1}"
+```
+
+Commands `0` through `3` select a table; command `4` returns that robot to
+the kitchen.
+
 ## Quick Start (3-terminal integration test)
 
 **Terminal 1 — Isaac Sim**

@@ -11,7 +11,7 @@ from std_srvs.srv import Trigger
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = Node("navigation_initialize_client")
-    client = node.create_client(Trigger, "/navigation/initialize")
+    client = node.create_client(Trigger, "navigation/initialize")
     try:
         if not client.wait_for_service(timeout_sec=10.0):
             raise RuntimeError("/navigation/initialize service unavailable")

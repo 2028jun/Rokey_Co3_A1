@@ -1,0 +1,5 @@
+# Robot 1 starts in the left kitchen slot. Routes are otherwise shared.
+frame_id: map
+kitchen: {x: -0.90, y: 5.25, yaw: -1.5707963267948966}
+spawn: {x: -0.90, y: 5.25, yaw: -1.5707963267948966}
+routes: {}

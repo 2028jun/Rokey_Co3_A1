@@ -82,7 +82,7 @@ class RailNavigator:
         self._spin_attempts = int(self._cfg.get("max_spin_attempts", 3))
         self._raw_pose: tuple[float, float, float] | None = None
         self._raw_pose_sub = nav.create_subscription(
-            Odometry, "/two_wheel/odom_raw", self._on_raw_odom, 20
+            Odometry, "two_wheel/odom_raw", self._on_raw_odom, 20
         )
         self._drive_pub = nav.create_publisher(Twist, "/cmd_vel", 10)
 

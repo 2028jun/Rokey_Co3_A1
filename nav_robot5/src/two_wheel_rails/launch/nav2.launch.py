@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Nav2 + AMCL for the two-wheel restaurant robot (occupancy map)."""
+"""One namespaced Nav2 stack for a serving robot."""
 
 import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
+from launch_ros.actions import Node, PushRosNamespace
 from nav2_common.launch import RewrittenYaml
 
 
@@ -24,7 +24,6 @@ def _default_map(pkg_share: str) -> str:
     root = _workspace_root()
     for path in (
         os.path.join(pkg_share, "maps", "restaurant", "map.yaml"),
-        os.path.join(os.getcwd(), "maps", "restaurant", "map.yaml"),
         os.path.join(root, "maps", "restaurant", "map.yaml"),
     ):
         if os.path.isfile(path):
@@ -34,144 +33,122 @@ def _default_map(pkg_share: str) -> str:
 
 def generate_launch_description():
     pkg_share = get_package_share_directory("two_wheel_rails")
-    nav2_bringup_dir = get_package_share_directory("nav2_bringup")
-    nav2_bt_dir = get_package_share_directory("nav2_bt_navigator")
-
-    default_map = _default_map(pkg_share)
-    default_params = os.path.join(pkg_share, "config", "nav2_params.yaml")
-    default_rviz = os.path.join(pkg_share, "rviz", "nav2.rviz")
-    robot_urdf = os.path.join(pkg_share, "urdf", "two_wheel_robot.urdf")
-    with open(robot_urdf, encoding="utf-8") as urdf_file:
-        robot_description = urdf_file.read()
-    default_bt = os.path.join(
-        nav2_bt_dir,
-        "behavior_trees",
-        "navigate_to_pose_w_replanning_and_recovery.xml",
-    )
-    default_bt_through = os.path.join(
-        nav2_bt_dir,
-        "behavior_trees",
-        "navigate_through_poses_w_replanning_and_recovery.xml",
-    )
+    nav2_share = get_package_share_directory("nav2_bringup")
+    bt_share = get_package_share_directory("nav2_bt_navigator")
+    urdf_path = os.path.join(pkg_share, "urdf", "two_wheel_robot.urdf")
+    with open(urdf_path, encoding="utf-8") as stream:
+        robot_description = stream.read()
 
     namespace = LaunchConfiguration("namespace")
-    map_yaml_file = LaunchConfiguration("map")
     params_file = LaunchConfiguration("params_file")
     use_sim_time = LaunchConfiguration("use_sim_time")
     autostart = LaunchConfiguration("autostart")
-    bt_xml_file = LaunchConfiguration("default_bt_xml_filename")
-    bt_through_xml_file = LaunchConfiguration("default_nav_through_poses_bt_xml")
     rviz = LaunchConfiguration("rviz")
     rviz_config = LaunchConfiguration("rviz_config")
+    initial_x = LaunchConfiguration("initial_pose_x")
+    initial_y = LaunchConfiguration("initial_pose_y")
+    initial_yaw = LaunchConfiguration("initial_pose_yaw")
 
+    rewrites = {
+        "use_sim_time": use_sim_time,
+        "autostart": autostart,
+        "x": initial_x,
+        "y": initial_y,
+        "yaw": initial_yaw,
+    }
     navigation_params = RewrittenYaml(
         source_file=params_file,
+        root_key="",
+        param_rewrites=rewrites,
+        convert_types=True,
+    )
+    collision_params = RewrittenYaml(
+        source_file=params_file,
         root_key=namespace,
-        param_rewrites={
-            "use_sim_time": use_sim_time,
-            "autostart": autostart,
-            "default_nav_to_pose_bt_xml": bt_xml_file,
-            "default_nav_through_poses_bt_xml": bt_through_xml_file,
-        },
+        param_rewrites=rewrites,
         convert_types=True,
     )
 
-    return LaunchDescription(
-        [
-            DeclareLaunchArgument("namespace", default_value=""),
-            DeclareLaunchArgument(
-                "map",
-                default_value=default_map,
-                description="Occupancy map yaml",
+    group = GroupAction([
+        PushRosNamespace(namespace),
+        Node(
+            package="two_wheel_rails", executable="topic_bridge",
+            name="topic_bridge", output="screen",
+            parameters=[{"use_sim_time": use_sim_time}],
+        ),
+        Node(
+            package="robot_state_publisher", executable="robot_state_publisher",
+            name="robot_state_publisher", output="screen",
+            parameters=[{"use_sim_time": use_sim_time,
+                         "robot_description": robot_description}],
+            remappings=[("/tf", "tf"), ("/tf_static", "tf_static")],
+        ),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                os.path.join(nav2_share, "launch", "localization_launch.py")
             ),
-            DeclareLaunchArgument(
-                "params_file",
-                default_value=default_params,
-                description="Nav2 parameters",
+            launch_arguments={
+                "namespace": namespace,
+                "map": LaunchConfiguration("map"),
+                "params_file": navigation_params,
+                "use_sim_time": use_sim_time,
+                "autostart": autostart,
+            }.items(),
+        ),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                os.path.join(nav2_share, "launch", "navigation_launch.py")
             ),
-            DeclareLaunchArgument("use_sim_time", default_value="true"),
-            DeclareLaunchArgument("autostart", default_value="true"),
-            DeclareLaunchArgument(
-                "default_bt_xml_filename",
-                default_value=default_bt,
-            ),
-            DeclareLaunchArgument(
-                "default_nav_through_poses_bt_xml",
-                default_value=default_bt_through,
-            ),
-            DeclareLaunchArgument("rviz", default_value="true"),
-            DeclareLaunchArgument("rviz_config", default_value=default_rviz),
-            Node(
-                package="two_wheel_rails",
-                executable="topic_bridge",
-                name="two_wheel_rails_topic_bridge",
-                output="screen",
-                parameters=[{"use_sim_time": use_sim_time}],
-            ),
-            Node(
-                package="robot_state_publisher",
-                executable="robot_state_publisher",
-                name="two_wheel_robot_state_publisher",
-                output="screen",
-                parameters=[
-                    {"use_sim_time": use_sim_time},
-                    {"robot_description": robot_description},
-                ],
-            ),
-            IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(
-                    os.path.join(nav2_bringup_dir, "launch", "localization_launch.py")
-                ),
-                launch_arguments={
-                    "namespace": namespace,
-                    "map": map_yaml_file,
-                    "params_file": params_file,
-                    "use_sim_time": use_sim_time,
-                    "autostart": autostart,
-                }.items(),
-            ),
-            IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(
-                    os.path.join(nav2_bringup_dir, "launch", "navigation_launch.py")
-                ),
-                launch_arguments={
-                    "namespace": namespace,
-                    "params_file": navigation_params,
-                    "use_sim_time": use_sim_time,
-                    "autostart": autostart,
-                }.items(),
-            ),
-            # Independent safety layer.  Owns its own lifecycle manager
-            # because it is not part of nav2_bringup's navigation_launch.py
-            # lifecycle group; see nav2_params.yaml's collision_monitor
-            # block for why it sits after velocity_smoother and gates
-            # "cmd_vel" -> "cmd_vel_safe".
-            Node(
-                package="nav2_collision_monitor",
-                executable="collision_monitor",
-                name="collision_monitor",
-                output="screen",
-                parameters=[navigation_params],
-            ),
-            Node(
-                package="nav2_lifecycle_manager",
-                executable="lifecycle_manager",
-                name="lifecycle_manager_collision_monitor",
-                output="screen",
-                parameters=[
-                    {"use_sim_time": use_sim_time},
-                    {"autostart": autostart},
-                    {"node_names": ["collision_monitor"]},
-                ],
-            ),
-            Node(
-                condition=IfCondition(rviz),
-                package="rviz2",
-                executable="rviz2",
-                name="rviz2",
-                output="screen",
-                arguments=["-d", rviz_config],
-                parameters=[{"use_sim_time": use_sim_time}],
-            ),
-        ]
-    )
+            launch_arguments={
+                "namespace": namespace,
+                "params_file": navigation_params,
+                "use_sim_time": use_sim_time,
+                "autostart": autostart,
+            }.items(),
+        ),
+        Node(
+            package="nav2_collision_monitor", executable="collision_monitor",
+            name="collision_monitor", output="screen",
+            parameters=[collision_params],
+            remappings=[("/tf", "tf"), ("/tf_static", "tf_static")],
+        ),
+        Node(
+            package="nav2_lifecycle_manager", executable="lifecycle_manager",
+            name="lifecycle_manager_collision_monitor", output="screen",
+            parameters=[{"use_sim_time": use_sim_time}, {"autostart": autostart},
+                        {"node_names": ["collision_monitor"]}],
+        ),
+    ])
+
+    return LaunchDescription([
+        DeclareLaunchArgument("namespace", default_value=""),
+        DeclareLaunchArgument("map", default_value=_default_map(pkg_share)),
+        DeclareLaunchArgument(
+            "params_file", default_value=os.path.join(pkg_share, "config", "nav2_params.yaml")
+        ),
+        DeclareLaunchArgument("use_sim_time", default_value="true"),
+        DeclareLaunchArgument("autostart", default_value="true"),
+        DeclareLaunchArgument("rviz", default_value="true"),
+        DeclareLaunchArgument(
+            "rviz_config", default_value=os.path.join(pkg_share, "rviz", "nav2.rviz")
+        ),
+        DeclareLaunchArgument("initial_pose_x", default_value="0.0"),
+        DeclareLaunchArgument("initial_pose_y", default_value="5.25"),
+        DeclareLaunchArgument("initial_pose_yaw", default_value="-1.5707963267948966"),
+        DeclareLaunchArgument(
+            "default_bt_xml_filename",
+            default_value=os.path.join(bt_share, "behavior_trees",
+                                       "navigate_to_pose_w_replanning_and_recovery.xml"),
+        ),
+        DeclareLaunchArgument(
+            "default_nav_through_poses_bt_xml",
+            default_value=os.path.join(bt_share, "behavior_trees",
+                                       "navigate_through_poses_w_replanning_and_recovery.xml"),
+        ),
+        group,
+        Node(
+            condition=IfCondition(rviz), package="rviz2", executable="rviz2",
+            name="rviz2", output="screen", arguments=["-d", rviz_config],
+            parameters=[{"use_sim_time": use_sim_time}],
+        ),
+    ])

@@ -36,11 +36,11 @@ class NavigationAutoInitializerNode(Node):
         )
 
         self.create_subscription(Clock, "/clock", self._on_clock, 10)
-        self.create_subscription(Int32, "/navigation/status", self._on_nav_status, status_qos)
-        self.create_subscription(Int32, "/navigation/current_location", self._on_nav_location, status_qos)
-        self.create_subscription(String, "/navigation/detail", self._on_nav_detail, status_qos)
+        self.create_subscription(Int32, "navigation/status", self._on_nav_status, status_qos)
+        self.create_subscription(Int32, "navigation/current_location", self._on_nav_location, status_qos)
+        self.create_subscription(String, "navigation/detail", self._on_nav_detail, status_qos)
 
-        self._init_client = self.create_client(Trigger, "/navigation/initialize")
+        self._init_client = self.create_client(Trigger, "navigation/initialize")
 
         # Evaluate readiness every 1.5 seconds
         self._timer = self.create_timer(1.5, self._evaluate_readiness)

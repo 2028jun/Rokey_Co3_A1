@@ -240,6 +240,13 @@ function updateCart(id, name, price, delta) {
         cart[id] = { id, name, price, quantity: 0 };
     }
     cart[id].quantity += delta;
+    // Cutlery is a one-set option; a plate rack carries one to four plates.
+    if (id === 'm5' && cart[id].quantity > 1) {
+        cart[id].quantity = 1;
+    }
+    if (id === 'm6' && cart[id].quantity > 4) {
+        cart[id].quantity = 4;
+    }
     if (cart[id].quantity <= 0) {
         delete cart[id];
     }

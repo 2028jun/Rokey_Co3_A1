@@ -38,8 +38,8 @@ NAV_ARRIVED = 2
 NAV_FAILED = 3
 NAV_PAUSED = 4
 
-MISSION_COMMAND_TOPIC = "/two_wheel/mission_command"
-MISSION_STATUS_TOPIC = "/two_wheel/mission_status"
+MISSION_COMMAND_TOPIC = "two_wheel/mission_command"
+MISSION_STATUS_TOPIC = "two_wheel/mission_status"
 
 DOCKING_PHASES = {
     "final_forward_approach",
@@ -56,7 +56,15 @@ class NavigationSubsystemNode(Node):
 
     def __init__(self) -> None:
         super().__init__("navigation_subsystem")
+        self.declare_parameter("routes_file", "")
+        routes_file = str(self.get_parameter("routes_file").value or "")
         self._routes = load_routes()
+        if routes_file:
+            overrides = load_routes(routes_file)
+            self._routes.update({
+                key: value for key, value in overrides.items() if key != "routes"
+            })
+            self._routes["routes"].update(overrides.get("routes") or {})
         self._lock = threading.Lock()
         self._worker: threading.Thread | None = None
         self._worker_nav = None
@@ -80,13 +88,13 @@ class NavigationSubsystemNode(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
         self._status_pub = self.create_publisher(
-            Int32, "/navigation/status", status_qos
+            Int32, "navigation/status", status_qos
         )
         self._location_pub = self.create_publisher(
-            Int32, "/navigation/current_location", status_qos
+            Int32, "navigation/current_location", status_qos
         )
         self._detail_pub = self.create_publisher(
-            String, "/navigation/detail", status_qos
+            String, "navigation/detail", status_qos
         )
         self._mission_command_pub = self.create_publisher(
             String, MISSION_COMMAND_TOPIC, mission_qos
@@ -98,10 +106,10 @@ class NavigationSubsystemNode(Node):
             mission_qos,
         )
         self.create_service(
-            TaskCommand, "/navigation/command", self._on_command
+            TaskCommand, "navigation/command", self._on_command
         )
         self.create_service(
-            Trigger, "/navigation/initialize", self._on_initialize
+            Trigger, "navigation/initialize", self._on_initialize
         )
         self._publish_status(NAV_IDLE, "IDLE", "idle")
         self.get_logger().info(
@@ -162,7 +170,8 @@ class NavigationSubsystemNode(Node):
         if self._worker_nav is not None:
             return
         nav, tf_buffer, tracker = prepare_navigator(
-            node_name="navigation_subsystem_navigator"
+            node_name="navigation_subsystem_navigator",
+            namespace=self.get_namespace(),
         )
         # Never let BasicNavigator publish its default map (0, 0, 0) pose.
         nav.initial_pose_received = True
@@ -326,7 +335,9 @@ class NavigationSubsystemNode(Node):
 
     def _send_control(self, kind: str) -> None:
         msg = String()
-        msg.data = json.dumps({"kind": kind, "mission_id": ""})
+        msg.data = json.dumps(
+            {"kind": kind, "mission_id": self._last_mission_id}
+        )
         for _ in range(3):
             self._mission_command_pub.publish(msg)
 

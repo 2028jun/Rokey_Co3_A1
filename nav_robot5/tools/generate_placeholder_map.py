@@ -76,8 +76,9 @@ def main() -> int:
     fill_rect(grid, origin_x, origin_y, res, height, width, 5.92, -5.0, 6.08, 5.0, 0)
     fill_rect(grid, origin_x, origin_y, res, height, width, -6.0, -5.08, -1.0, -4.92, 0)
     fill_rect(grid, origin_x, origin_y, res, height, width, 1.0, -5.08, 6.0, -4.92, 0)
-    fill_rect(grid, origin_x, origin_y, res, height, width, -6.0, 4.92, -1.2, 5.08, 0)
-    fill_rect(grid, origin_x, origin_y, res, height, width, 1.2, 4.92, 6.0, 5.08, 0)
+    # Current USDA BackWallLeft/Right inner edges are x=-1.8/+1.8.
+    fill_rect(grid, origin_x, origin_y, res, height, width, -6.0, 4.92, -1.8, 5.08, 0)
+    fill_rect(grid, origin_x, origin_y, res, height, width, 1.8, 4.92, 6.0, 5.08, 0)
 
     for tx, ty in [(-3.2, -2.2), (3.2, -2.2), (-3.2, 0.7), (3.2, 0.7)]:
         fill_rect(
@@ -91,8 +92,8 @@ def main() -> int:
             sx - 0.35, sy - 0.35, sx + 0.35, sy + 0.35, 0,
         )
 
-    fill_rect(grid, origin_x, origin_y, res, height, width, -6.0, 5.2, -1.5, 9.2, 0)
-    fill_rect(grid, origin_x, origin_y, res, height, width, 1.5, 5.2, 6.0, 9.2, 0)
+    fill_rect(grid, origin_x, origin_y, res, height, width, -6.0, 5.2, -2.0, 9.2, 0)
+    fill_rect(grid, origin_x, origin_y, res, height, width, 2.0, 5.2, 6.0, 9.2, 0)
     fill_rect(grid, origin_x, origin_y, res, height, width, -6.0, 9.2, 6.0, 9.4, 0)
 
     docks = [
@@ -106,7 +107,7 @@ def main() -> int:
     for dx, dy in docks:
         clear_disk(grid, origin_x, origin_y, res, height, width, dx, dy, 1.05, wall)
 
-    fill_rect(grid, origin_x, origin_y, res, height, width, -1.15, 4.5, 1.15, 7.2, 254)
+    fill_rect(grid, origin_x, origin_y, res, height, width, -1.75, 4.5, 1.75, 7.2, 254)
     fill_rect(grid, origin_x, origin_y, res, height, width, -0.7, -3.0, 0.7, 5.5, 254)
 
     pgm = out_dir / "map.pgm"

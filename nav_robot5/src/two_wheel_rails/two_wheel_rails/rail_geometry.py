@@ -51,6 +51,8 @@ def _pt(d: dict[str, Any]) -> Pose3:
 def load_routes(path: Path | None = None) -> dict[str, Any]:
     if path is None:
         path = Path(get_package_share_directory("two_wheel_rails")) / "config" / "routes.yaml"
+    else:
+        path = Path(path)
     with path.open(encoding="utf-8") as f:
         return yaml.safe_load(f)
 

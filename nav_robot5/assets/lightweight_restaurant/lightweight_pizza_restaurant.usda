@@ -26,14 +26,29 @@ def Xform "World"
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 
+        def Cube "KitchenFloorPatch" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            # The main floor ends at y=5.0 while both robots wait behind the
+            # kitchen entrance at y=5.25. Keep visual and physical support
+            # continuous across the widened doorway.
+            color3f[] primvars:displayColor = [(0.32, 0.34, 0.38)]
+            double size = 1
+            float3 xformOp:scale = (5.0, 1.8, 0.12)
+            double3 xformOp:translate = (0, 5.6, -0.06)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
         def Cube "BackWallLeft" (
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
             color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
             double size = 1
-            float3 xformOp:scale = (4.8, 0.16, 2.8)
-            double3 xformOp:translate = (-3.6, 5, 1.4)
+            # Inner edge x=-1.8: 3.6 m clear kitchen entrance.
+            float3 xformOp:scale = (4.2, 0.16, 2.8)
+            double3 xformOp:translate = (-3.9, 5, 1.4)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 
@@ -43,8 +58,9 @@ def Xform "World"
         {
             color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
             double size = 1
-            float3 xformOp:scale = (4.8, 0.16, 2.8)
-            double3 xformOp:translate = (3.6, 5, 1.4)
+            # Inner edge x=+1.8: matches the left wall opening.
+            float3 xformOp:scale = (4.2, 0.16, 2.8)
+            double3 xformOp:translate = (3.9, 5, 1.4)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 

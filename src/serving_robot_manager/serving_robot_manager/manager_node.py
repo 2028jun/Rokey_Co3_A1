@@ -1,7 +1,8 @@
 """서빙 로봇 전체 작업을 조율하는 Manager(컨트롤) 노드.
 
-UI가 /manager/order로 주문(테이블 번호, 피자1~3 개수, 음료 개수, 식기리필 개수)을 보내면,
-주문을 트립(피자 최대 1개 + 음료 최대 4개 + 식기리필 최대 1세트) 단위로 나눠 트립마다 다음
+UI가 /manager/order로 주문(테이블 번호, 피자1~3 개수, 음료 개수, 식기리필, 접시 수)을 보내면,
+주문을 트립(피자 최대 1개 + 음료 최대 4개 + 식기리필 최대 1세트) 단위로 나누고 접시 랙은
+좌측 전방 2층 트레이에서 별도 트립으로 배정한다. 트립마다 다음
 순서를 반복한다:
 
   주방 도착 확인 -> 음식 스폰(완료 확인까지 대기) -> 테이블 이동
@@ -56,7 +57,8 @@ NAV_LOCATION_KITCHEN = 4
 TABLE_ID_MIN, TABLE_ID_MAX = 0, 3
 
 # 로봇팔 command / status (스펙 2장). 로봇팔은 피자 종류를 구분하지 않는다.
-# 한 트립(command)은 음료 + 피자*10 + 식기리필*20으로 인코딩한다.
+# 한 트립(command)은 음료 + 피자*10 + 식기리필*20 + 접시랙*40으로 인코딩한다.
+# 접시 개수는 스폰 명령에서만 전달하며 Arm은 같은 랙 동작을 사용한다.
 ARM_CMD_RESUME = 98
 ARM_CMD_PAUSE = 99
 ARM_STATUS_WORKING = 1
@@ -68,19 +70,24 @@ ARM_TRIP_CUTLERY_MAX = 1
 ARM_CMD_DRINK_WEIGHT = 1
 ARM_CMD_PIZZA_WEIGHT = 10
 ARM_CMD_CUTLERY_WEIGHT = 20
+ARM_CMD_PLATE_RACK_WEIGHT = 40
 
-# 음식 스폰 command/status: 트립 하나를 음료 + 피자종류*10 + 식기*40으로 인코딩한다 (Arm과
-# 달리 피자 종류를 구분해야 해서 가중치가 다르다). status는 Arm과 동일한 관례
+# 음식 스폰 command/status: 하위 두 자리는 음료 + 피자종류*10 + 식기*40,
+# 백의 자리는 접시 수(1~4)로 인코딩한다. 따라서 피자1+음료1+식기+접시2는
+# 251이다. Arm과 달리 피자 종류와 접시 수를 모두 보존해야 한다.
+# status는 Arm과 동일한 관례
 # (0=IDLE,1=WORKING,2=COMPLETED,3=FAILED)를 스폰 노드 쪽에서 지켜야 한다.
 SPAWN_CMD_DRINK_WEIGHT = 1
 SPAWN_CMD_PIZZA_TYPE_WEIGHT = 10  # 피자 N번 -> 10*N
 SPAWN_CMD_CUTLERY_WEIGHT = 40
+SPAWN_CMD_PLATE_COUNT_WEIGHT = 100
 SPAWN_STATUS_WORKING = 1
 SPAWN_STATUS_COMPLETED = 2
 SPAWN_STATUS_FAILED = 3
 
 ITEM_COUNT_MIN, ITEM_COUNT_MAX = 0, 99
 CUTLERY_COUNT_MAX = 1  # 식기리필은 개수가 아니라 여부(0/1)이다.
+PLATE_COUNT_MAX = 4
 MAX_TRIPS_PER_ORDER = 20
 MAX_PENDING_ORDERS = 10
 COMPLETED_DISPLAY_SEC = 1.5  # 완료 상태를 최소 이 정도는 유지한 뒤 다음 단계로 넘어간다.
@@ -93,20 +100,23 @@ class Trip:
     pizza_type: Optional[int]  # 1, 2, 3 중 하나 또는 없음(None)
     drink_count: int  # 0~4
     cutlery: bool
+    plate_count: int = 0
 
     def arm_command(self):
         """Arm 노드용 트립 명령 정수를 반환한다."""
         # 로봇팔은 피자 종류를 구분하지 않으므로 있음/없음만 반영한다.
         return (self.drink_count * ARM_CMD_DRINK_WEIGHT
                 + (ARM_CMD_PIZZA_WEIGHT if self.pizza_type else 0)
-                + (ARM_CMD_CUTLERY_WEIGHT if self.cutlery else 0))
+                + (ARM_CMD_CUTLERY_WEIGHT if self.cutlery else 0)
+                + (ARM_CMD_PLATE_RACK_WEIGHT if self.plate_count else 0))
 
     def spawn_command(self):
         """음식 스폰 노드용 트립 명령 정수를 반환한다."""
         # 스폰은 피자 종류를 구분해야 하므로 Arm과 다른 가중치를 쓴다.
         return (self.drink_count * SPAWN_CMD_DRINK_WEIGHT
                 + (self.pizza_type * SPAWN_CMD_PIZZA_TYPE_WEIGHT if self.pizza_type else 0)
-                + (SPAWN_CMD_CUTLERY_WEIGHT if self.cutlery else 0))
+                + (SPAWN_CMD_CUTLERY_WEIGHT if self.cutlery else 0)
+                + self.plate_count * SPAWN_CMD_PLATE_COUNT_WEIGHT)
 
 
 class _State(IntEnum):
@@ -223,18 +233,21 @@ class ManagerNode(Node):
         self._state_deadline = None
         self._completed_advance_timer = None
 
-        self._arm_client = self.create_client(TaskCommand, '/arm/command')
-        self._nav_client = self.create_client(TaskCommand, '/navigation/command')
-        self._spawn_client = self.create_client(TaskCommand, '/food_spawn/command')
+        # All endpoints are relative.  At the root namespace this preserves
+        # the legacy API; under /robot1 or /robot2 it creates an independent
+        # worker state machine for that robot.
+        self._arm_client = self.create_client(TaskCommand, 'arm/command')
+        self._nav_client = self.create_client(TaskCommand, 'navigation/command')
+        self._spawn_client = self.create_client(TaskCommand, 'food_spawn/command')
 
-        self.create_subscription(Int32, '/arm/status', self._on_arm_status, 10)
-        self.create_subscription(Int32, '/navigation/status', self._on_nav_status, 10)
+        self.create_subscription(Int32, 'arm/status', self._on_arm_status, 10)
+        self.create_subscription(Int32, 'navigation/status', self._on_nav_status, 10)
         self.create_subscription(
-            Int32, '/navigation/current_location', self._on_nav_location, 10)
-        self.create_subscription(Int32, '/food_spawn/status', self._on_spawn_status, 10)
-        self.create_subscription(Bool, '/hand_safety/intrusion', self._on_hand_intrusion, 10)
+            Int32, 'navigation/current_location', self._on_nav_location, 10)
+        self.create_subscription(Int32, 'food_spawn/status', self._on_spawn_status, 10)
+        self.create_subscription(Bool, 'hand_safety/intrusion', self._on_hand_intrusion, 10)
         self.create_subscription(
-            Bool, '/serving_robot/emergency_stop', self._on_emergency_stop, 10)
+            Bool, 'serving_robot/emergency_stop', self._on_emergency_stop, 10)
 
         # 늦게 연결된 UI도 마지막 시스템 상태를 즉시 받을 수 있게 상태 토픽은 latched QoS로
         # 발행한다. 일반 volatile 구독자와도 현재 이후의 발행은 호환된다.
@@ -244,12 +257,12 @@ class ManagerNode(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
         self._system_status_pub = self.create_publisher(
-            Int32, '/system/status', status_qos)
+            Int32, 'system/status', status_qos)
         self._table_arrived_pub = self.create_publisher(
-            Bool, '/serving_robot/table_arrived', status_qos)
-        self._order_cancelled_pub = self.create_publisher(Int32, '/manager/order_cancelled', 10)
-        self.create_service(OrderRequest, '/manager/order', self._on_order_request)
-        self.create_service(Trigger, '/manager/reset_fault', self._on_reset_fault)
+            Bool, 'serving_robot/table_arrived', status_qos)
+        self._order_cancelled_pub = self.create_publisher(Int32, 'manager/order_cancelled', 10)
+        self.create_service(OrderRequest, 'manager/order', self._on_order_request)
+        self.create_service(Trigger, 'manager/reset_fault', self._on_reset_fault)
 
         self.create_timer(1.0, self._check_timeouts)
 
@@ -262,7 +275,8 @@ class ManagerNode(Node):
         self.get_logger().info(
             f'📥 [수신/RECV Service] /manager/order -> Table={request.table_id}, '
             f'Pizza1={request.pizza1_count}, Pizza2={request.pizza2_count}, '
-            f'Pizza3={request.pizza3_count}, Drink={request.drink_count}, Cutlery={request.cutlery_count}')
+            f'Pizza3={request.pizza3_count}, Drink={request.drink_count}, '
+            f'Cutlery={request.cutlery_count}, Plate={request.plate_count}')
         if self._state == _State.FAILED:
             self.get_logger().warn('❌ [FAILED] FAILED 상태입니다. /manager/reset_fault 호출 후 다시 주문해주세요.')
             response.success = False
@@ -285,13 +299,20 @@ class ManagerNode(Node):
             response.success = False
             return response
 
-        if not any(list(counts.values()) + [request.cutlery_count]):
+        if not (0 <= request.plate_count <= PLATE_COUNT_MAX):
+            self.get_logger().warn(
+                f'❌ [REJECT] 접시는 0~{PLATE_COUNT_MAX}개만 가능합니다 '
+                f'(받은 값: {request.plate_count}).')
+            response.success = False
+            return response
+
+        if not any(list(counts.values()) + [request.cutlery_count, request.plate_count]):
             self.get_logger().warn('❌ [REJECT] 서빙할 항목이 없는 주문입니다.')
             response.success = False
             return response
         serve_queue = self._build_serve_queue(
             request.pizza1_count, request.pizza2_count, request.pizza3_count,
-            request.drink_count, request.cutlery_count)
+            request.drink_count, request.cutlery_count, request.plate_count)
         if len(serve_queue) > MAX_TRIPS_PER_ORDER:
             self.get_logger().warn(
                 f'❌ [REJECT] 트립 수가 너무 많은 주문입니다 ({len(serve_queue)}건, 최대 {MAX_TRIPS_PER_ORDER}건).')
@@ -362,7 +383,9 @@ class ManagerNode(Node):
         self._fail()
 
     @staticmethod
-    def _build_serve_queue(pizza1_count, pizza2_count, pizza3_count, drink_total, cutlery_count):
+    def _build_serve_queue(
+            pizza1_count, pizza2_count, pizza3_count, drink_total,
+            cutlery_count, plate_count=0):
         # 피자는 종류별로 한 개씩 나열해 트립을 나눌 때도 어떤 종류인지 잃지 않게 한다.
         pizza_queue = [1] * pizza1_count + [2] * pizza2_count + [3] * pizza3_count
         # 식기리필은 주문당 한 번만 필요하므로 첫 트립에만 붙인다.
@@ -375,6 +398,18 @@ class ManagerNode(Node):
             drink_total -= trip_drink
             cutlery_remaining -= int(trip_cutlery)
             trips.append(Trip(pizza_type=pizza_type, drink_count=trip_drink, cutlery=trip_cutlery))
+        # 접시 랙은 왼쪽 트레이, 음료/수저는 오른쪽 트레이, 피자는 상판을
+        # 사용하므로 첫 트립에 함께 적재할 수 있다.
+        if plate_count:
+            if trips:
+                trips[0].plate_count = plate_count
+            else:
+                trips.append(Trip(
+                    pizza_type=None,
+                    drink_count=0,
+                    cutlery=False,
+                    plate_count=plate_count,
+                ))
         return trips
 
     def _start_task(self, table_id, serve_queue):

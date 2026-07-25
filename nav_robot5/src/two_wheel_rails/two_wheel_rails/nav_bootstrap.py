@@ -16,8 +16,8 @@ from rclpy.time import Time
 from std_srvs.srv import Empty
 from tf2_ros import Buffer, TransformListener
 
-TELEPORT_TOPIC = "/two_wheel/teleport"
-DIRECT_CMD_VEL_TOPIC = "/two_wheel/direct_cmd_vel"
+TELEPORT_TOPIC = "two_wheel/teleport"
+DIRECT_CMD_VEL_TOPIC = "two_wheel/direct_cmd_vel"
 
 AMCL_POSE_QOS = QoSProfile(
     depth=10,
@@ -55,7 +55,7 @@ class AmclPoseTracker:
         self._xy: tuple[float, float] | None = None
         self._yaw: float | None = None
         self._sub = nav.create_subscription(
-            PoseWithCovarianceStamped, "/amcl_pose", self._on_amcl, AMCL_POSE_QOS
+            PoseWithCovarianceStamped, "amcl_pose", self._on_amcl, AMCL_POSE_QOS
         )
 
     def _on_amcl(self, msg: PoseWithCovarianceStamped) -> None:
@@ -221,7 +221,7 @@ def teleport_to_spawn(nav: BasicNavigator, x: float, y: float, yaw: float) -> No
 
 
 def reinitialize_amcl(nav: BasicNavigator) -> None:
-    client = nav.create_client(Empty, "/reinitialize_global_localization")
+    client = nav.create_client(Empty, "reinitialize_global_localization")
     if not client.wait_for_service(timeout_sec=2.0):
         return
     future = client.call_async(Empty.Request())
@@ -307,10 +307,10 @@ def reverse_open_loop(
     return ok, traveled
 
 
-def prepare_navigator(node_name: str = "rail_navigator") -> tuple[
+def prepare_navigator(node_name: str = "rail_navigator", namespace: str = "") -> tuple[
     BasicNavigator, Buffer, AmclPoseTracker
 ]:
-    nav = BasicNavigator(node_name=node_name)
+    nav = BasicNavigator(node_name=node_name, namespace=namespace)
     if not wait_for_clock(nav):
         raise RuntimeError("/clock 없음 — Isaac Play 및 ROS_DOMAIN_ID 확인")
     nav.set_parameters([Parameter("use_sim_time", Parameter.Type.BOOL, True)])

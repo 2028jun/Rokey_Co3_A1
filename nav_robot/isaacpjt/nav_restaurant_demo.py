@@ -86,6 +86,7 @@ from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Int32, String
 from std_srvs.srv import SetBool
+from tf2_msgs.msg import TFMessage
 
 # The colcon workspace builds this custom interface for system Python 3.10,
 # while Isaac Sim 5.1 embeds Python 3.11.  Do not abort the entire navigation
@@ -107,12 +108,22 @@ sys.path.insert(0, str(WORKSPACE / "isaacpjt/M0609/rmpflow"))
 try:
     from drink_serving import spawn_soda_cans
     from cutlery_serving import spawn_cutlery_box
-    from pizza_serving import TrayPizzaPickPlace
+    from plate_rack_serving import (
+        follow_plate_rack_transport,
+        spawn_plate_rack,
+    )
+    from pizza_serving import (
+        GRIP_CONTACT_DYNAMIC_FRICTION,
+        GRIP_CONTACT_STATIC_FRICTION,
+        GRIPPER_DRIVE_MAX_FORCE,
+        TrayPizzaPickPlace,
+    )
     from soda1_delivery import Soda1PickPlace
     from soda2_delivery import Soda2PickPlace
     from cutlery_pick_place import CutleryBoxPickPlace
+    from plate_rack_pick_place import PlateRackPickPlace
     print(
-        "[food_spawn] loaded pizza, soda1, soda2 and cutlery delivery modules",
+        "[food_spawn] loaded pizza, soda1, soda2, cutlery and plate-rack modules",
         flush=True,
     )
 except Exception as _food_import_exc:
@@ -293,6 +304,21 @@ _front_lidar_render_product = None
 _front_lidar_writer = None
 _embedded_lidar_render_product = None
 _embedded_lidar_writer = None
+
+
+def set_robot_context(root: str, spawn_position: Gf.Vec3d) -> None:
+    """Select the robot instance used by the legacy setup helpers."""
+    global ROBOT_ROOT, SPAWN_POSITION, ARTICULATION_CANDIDATES, TABLE_CAMERA_PATH
+    ROBOT_ROOT = root
+    SPAWN_POSITION = spawn_position
+    ARTICULATION_CANDIDATES = [
+        f"{root}/Robot/ridgeback_base_link",
+        f"{root}/Robot",
+    ]
+    TABLE_CAMERA_PATH = (
+        f"{root}/Robot/ridgeback_base_link/ridgeback_base_link/"
+        "fixed_table_depth_camera/realsense_d455/RSD455/Camera_Pseudo_Depth"
+    )
 
 
 def quaternion_to_yaw(orientation) -> float:
@@ -494,7 +520,7 @@ def remove_parking_brake(stage):
     pass
 
 
-def open_restaurant_and_robot():
+def open_restaurant_and_robot(open_stage: bool = True):
     if not RESTAURANT_USD.is_file():
         raise FileNotFoundError(RESTAURANT_USD)
 
@@ -502,10 +528,11 @@ def open_restaurant_and_robot():
         raise FileNotFoundError(ROBOT_USD)
 
     context = omni.usd.get_context()
-    if not context.open_stage(str(RESTAURANT_USD)):
-        raise RuntimeError(f"failed to open {RESTAURANT_USD}")
-    for _ in range(30):
-        simulation_app.update()
+    if open_stage:
+        if not context.open_stage(str(RESTAURANT_USD)):
+            raise RuntimeError(f"failed to open {RESTAURANT_USD}")
+        for _ in range(30):
+            simulation_app.update()
 
     stage = context.get_stage()
     spawn = UsdGeom.Xform.Define(stage, ROBOT_ROOT)
@@ -671,6 +698,54 @@ def configure_wheel_contact_material(stage):
         )
 
 
+def configure_gripper_contact_material(stage):
+    """Bind the proven high-friction physics material to RG2 moving links."""
+    material = UsdShade.Material.Define(
+        stage, "/World/PhysicsMaterials/RG2Grip"
+    )
+    material_api = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
+    material_api.CreateStaticFrictionAttr(GRIP_CONTACT_STATIC_FRICTION)
+    material_api.CreateDynamicFrictionAttr(GRIP_CONTACT_DYNAMIC_FRICTION)
+    material_api.CreateRestitutionAttr(0.0)
+    physx_material = PhysxSchema.PhysxMaterialAPI.Apply(material.GetPrim())
+    physx_material.CreateFrictionCombineModeAttr("max")
+    physx_material.CreateRestitutionCombineModeAttr("min")
+
+    grip_link_names = {
+        "rg2_left_inner_knuckle",
+        "rg2_right_outer_knuckle",
+        "rg2_left_outer_knuckle",
+        "rg2_left_inner_finger",
+        "rg2_right_inner_finger",
+        "rg2_right_inner_knuckle",
+    }
+    bound_links = []
+    for prim in stage.Traverse():
+        if not str(prim.GetPath()).startswith(ROBOT_ROOT):
+            continue
+        if prim.GetName() not in grip_link_names:
+            continue
+        UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+            material,
+            bindingStrength=UsdShade.Tokens.strongerThanDescendants,
+            materialPurpose="physics",
+        )
+        bound_links.append(str(prim.GetPath()))
+
+    if len(bound_links) != len(grip_link_names):
+        raise RuntimeError(
+            "RG2 grip material setup incomplete: "
+            f"expected={len(grip_link_names)} bound={bound_links}"
+        )
+    print(
+        "[nav_robot] RG2 grip material "
+        f"static={GRIP_CONTACT_STATIC_FRICTION:.1f} "
+        f"dynamic={GRIP_CONTACT_DYNAMIC_FRICTION:.1f} "
+        f"links={len(bound_links)} max_force={GRIPPER_DRIVE_MAX_FORCE:.0f}N",
+        flush=True,
+    )
+
+
 def find_articulation_path(stage) -> str:
     for path in ARTICULATION_CANDIDATES:
         if stage.GetPrimAtPath(path).IsValid():
@@ -748,15 +823,13 @@ def log_stray_robot_geometry(stage):
         print("[stray-geometry] no USD Boundable under NavRobot near origin", flush=True)
 
 
-def initialize_robot(articulation_path: str):
+def initialize_robot(articulation_path: str, name: str = "nav_ridgeback"):
     timeline = omni.timeline.get_timeline_interface()
     timeline.play()
     for _ in range(2):
         simulation_app.update()
 
-    articulation = SingleArticulation(
-        prim_path=articulation_path, name="nav_ridgeback"
-    )
+    articulation = SingleArticulation(prim_path=articulation_path, name=name)
     articulation.initialize()
     if not articulation.handles_initialized:
         raise RuntimeError(f"invalid articulation handle: {articulation_path}")
@@ -929,7 +1002,13 @@ def create_sensor_ros_graph(lidar_path: str, camera_path: str):
     )
 
 
-def connect_embedded_sensor_ros(stage):
+def connect_embedded_sensor_ros(
+    stage,
+    *,
+    robot_root=ROBOT_ROOT,
+    robot_name="",
+    publish_clock=True,
+):
     """Connect the D455/RPLIDAR already contained in the two-wheel USD."""
     global _embedded_lidar_render_product, _embedded_lidar_writer
     camera_width = int(os.environ.get("NAV_CAMERA_WIDTH", "1280"))
@@ -938,9 +1017,7 @@ def connect_embedded_sensor_ros(stage):
         raise ValueError(
             "NAV_CAMERA_WIDTH and NAV_CAMERA_HEIGHT must be positive"
         )
-    base_path = (
-        f"{ROBOT_ROOT}/Robot/ridgeback_base_link/ridgeback_base_link"
-    )
+    base_path = f"{robot_root}/Robot/ridgeback_base_link/ridgeback_base_link"
     sensor_mount = f"{base_path}/fixed_table_depth_camera/realsense_d455"
     depth_camera = f"{sensor_mount}/RSD455/Camera_Pseudo_Depth"
     lidar_path = f"{base_path}/base_scan/RPLIDAR_S2E"
@@ -949,30 +1026,47 @@ def connect_embedded_sensor_ros(stage):
             raise RuntimeError(f"embedded sensor prim is missing: {required}")
 
     keys = og.Controller.Keys
+    nodes = [
+        ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+        ("Context", "isaacsim.ros2.bridge.ROS2Context"),
+        ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
+        ("RenderProduct", "isaacsim.core.nodes.IsaacCreateRenderProduct"),
+        ("ColorPub", "isaacsim.ros2.bridge.ROS2CameraHelper"),
+        ("DepthPub", "isaacsim.ros2.bridge.ROS2CameraHelper"),
+    ]
+    connections = [
+        ("OnPlaybackTick.outputs:tick", "RenderProduct.inputs:execIn"),
+        ("Context.outputs:context", "ColorPub.inputs:context"),
+        ("Context.outputs:context", "DepthPub.inputs:context"),
+        ("RenderProduct.outputs:execOut", "ColorPub.inputs:execIn"),
+        ("RenderProduct.outputs:renderProductPath", "ColorPub.inputs:renderProductPath"),
+        ("RenderProduct.outputs:execOut", "DepthPub.inputs:execIn"),
+        ("RenderProduct.outputs:renderProductPath", "DepthPub.inputs:renderProductPath"),
+    ]
+    if publish_clock:
+        nodes.append(("PublishClock", "isaacsim.ros2.bridge.ROS2PublishClock"))
+        connections.extend([
+            ("OnPlaybackTick.outputs:tick", "PublishClock.inputs:execIn"),
+            ("Context.outputs:context", "PublishClock.inputs:context"),
+            ("ReadSimTime.outputs:simulationTime", "PublishClock.inputs:timeStamp"),
+        ])
+    camera_prefix = f"{robot_name}/" if robot_name else ""
     og.Controller.edit(
-        {"graph_path": f"{ROBOT_ROOT}/EmbeddedSensorsROS2", "evaluator_name": "execution"},
+        {"graph_path": f"{robot_root}/EmbeddedSensorsROS2", "evaluator_name": "execution"},
         {
-            keys.CREATE_NODES: [
-                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
-                ("Context", "isaacsim.ros2.bridge.ROS2Context"),
-                ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
-                ("PublishClock", "isaacsim.ros2.bridge.ROS2PublishClock"),
-                ("RenderProduct", "isaacsim.core.nodes.IsaacCreateRenderProduct"),
-                ("ColorPub", "isaacsim.ros2.bridge.ROS2CameraHelper"),
-                ("DepthPub", "isaacsim.ros2.bridge.ROS2CameraHelper"),
-            ],
+            keys.CREATE_NODES: nodes,
             keys.SET_VALUES: [
                 ("RenderProduct.inputs:cameraPrim", [usdrt.Sdf.Path(depth_camera)]),
                 ("RenderProduct.inputs:width", camera_width),
                 ("RenderProduct.inputs:height", camera_height),
-                ("ColorPub.inputs:nodeNamespace", "camera/color"),
+                ("ColorPub.inputs:nodeNamespace", f"{camera_prefix}camera/color"),
                 ("ColorPub.inputs:topicName", "image_raw"),
                 ("ColorPub.inputs:frameId", "d455_color_optical_frame"),
                 ("ColorPub.inputs:type", "rgb"),
                 # Publish every rendered frame.  The previous value of 3
                 # capped the RGB stream to one image per four sim frames.
                 ("ColorPub.inputs:frameSkipCount", 0),
-                ("DepthPub.inputs:nodeNamespace", "camera/depth"),
+                ("DepthPub.inputs:nodeNamespace", f"{camera_prefix}camera/depth"),
                 ("DepthPub.inputs:topicName", "image_raw"),
                 ("DepthPub.inputs:frameId", "d455_depth_optical_frame"),
                 ("DepthPub.inputs:type", "depth"),
@@ -980,23 +1074,13 @@ def connect_embedded_sensor_ros(stage):
                 # so RGB inference gets the shared GPU budget.
                 ("DepthPub.inputs:frameSkipCount", 29),
             ],
-            keys.CONNECT: [
-                ("OnPlaybackTick.outputs:tick", "PublishClock.inputs:execIn"),
-                ("OnPlaybackTick.outputs:tick", "RenderProduct.inputs:execIn"),
-                ("Context.outputs:context", "PublishClock.inputs:context"),
-                ("Context.outputs:context", "ColorPub.inputs:context"),
-                ("Context.outputs:context", "DepthPub.inputs:context"),
-                ("ReadSimTime.outputs:simulationTime", "PublishClock.inputs:timeStamp"),
-                ("RenderProduct.outputs:execOut", "ColorPub.inputs:execIn"),
-                ("RenderProduct.outputs:renderProductPath", "ColorPub.inputs:renderProductPath"),
-                ("RenderProduct.outputs:execOut", "DepthPub.inputs:execIn"),
-                ("RenderProduct.outputs:renderProductPath", "DepthPub.inputs:renderProductPath"),
-            ],
+            keys.CONNECT: connections,
         },
     )
 
     print(
-        f"[ros] embedded D455 RGB/depth {camera_width}x{camera_height} and /clock connected",
+        f"[ros] {robot_name or 'default'} embedded D455 RGB/depth "
+        f"{camera_width}x{camera_height} clock={int(publish_clock)} connected",
         flush=True,
     )
 
@@ -1009,7 +1093,7 @@ def create_sensor_static_tf(stage, lidar_path: str, camera_path: str, node: Node
 class CommandServingSequence:
     """Frame-driven composition of the already tested serving tasks."""
 
-    TRAY_TASK_NAMES = frozenset({"soda1", "soda2", "cutlery"})
+    TRAY_TASK_NAMES = frozenset({"soda1", "soda2", "cutlery", "plate_rack"})
     TRAY_EXTENSION = 0.25
     TRAY_TOLERANCE = 0.005
 
@@ -1062,6 +1146,12 @@ class CommandServingSequence:
         error = float(np.max(np.abs(actual - self.TRAY_EXTENSION)))
         return error <= self.TRAY_TOLERANCE, actual, error
 
+    @property
+    def current_name(self):
+        if self.done or self.failed or self._index >= len(self._named_tasks):
+            return None
+        return self._named_tasks[self._index][0]
+
     def step(self, articulation):
         if self.done or self.failed:
             return
@@ -1107,11 +1197,27 @@ class CommandServingSequence:
 class NavBridge(Node):
     """cmd_vel subscriber + odom/TF publisher + food spawn & arm serving server."""
 
-    def __init__(self, articulation, dof_names, stage=None):
-        super().__init__("nav_robot_isaac_bridge")
+    def __init__(
+        self,
+        articulation,
+        dof_names,
+        stage=None,
+        *,
+        robot_name="",
+        robot_root=ROBOT_ROOT,
+    ):
+        namespace = f"/{robot_name}" if robot_name else ""
+        node_name = (
+            f"nav_robot_isaac_bridge_{robot_name}"
+            if robot_name
+            else "nav_robot_isaac_bridge"
+        )
+        super().__init__(node_name, namespace=namespace)
         self.articulation = articulation
         self.dof_names = dof_names
         self.stage = stage
+        self.robot_name = robot_name
+        self.robot_root = robot_root
         self.wheel_indices = np.asarray(
             [dof_names.index(name) for name in WHEEL_JOINTS], dtype=np.int32
         )
@@ -1141,6 +1247,8 @@ class NavBridge(Node):
         self._tray_home_step = 0
         self._tray_home_start = None
         self._spawned_serving_tasks = {}
+        self._plate_rack_in_transport = False
+        self._pending_plate_count = 0
         self._direct_nav = None
         self._direct_nav_request = None
         self._active_two_wheel_mission_id = ""
@@ -1177,10 +1285,10 @@ class NavBridge(Node):
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
         )
-        self.scan_pub = self.create_publisher(LaserScan, "/scan", sensor_qos)
-        self.nav_scan_pub = self.create_publisher(LaserScan, "/nav_robot/scan", sensor_qos)
-        self.two_wheel_scan_pub = self.create_publisher(LaserScan, "/two_wheel/scan_raw", sensor_qos)
-        self.create_subscription(Twist, "/nav_robot/cmd_vel", self._on_cmd_vel, qos)
+        self.scan_pub = self.create_publisher(LaserScan, "scan", sensor_qos)
+        self.nav_scan_pub = self.create_publisher(LaserScan, "nav_robot/scan", sensor_qos)
+        self.two_wheel_scan_pub = self.create_publisher(LaserScan, "two_wheel/scan_raw", sensor_qos)
+        self.create_subscription(Twist, "nav_robot/cmd_vel", self._on_cmd_vel, qos)
         # nav2_collision_monitor sits between the controller/velocity_smoother
         # output and the robot: it re-publishes "cmd_vel" as "cmd_vel_safe"
         # after gating it against the stop/slowdown polygons in
@@ -1189,32 +1297,39 @@ class NavBridge(Node):
         # (which also publish to "cmd_vel") get the same safety gate.
         self.create_subscription(Twist, "cmd_vel_safe", self._on_cmd_vel, qos)
         self.create_subscription(
-            PoseStamped, "/nav_robot/teleport", self._on_teleport, qos
+            PoseStamped, "nav_robot/teleport", self._on_teleport, qos
         )
         self.create_subscription(
-            PoseStamped, "/two_wheel/teleport", self._on_teleport, qos
+            PoseStamped, "two_wheel/teleport", self._on_teleport, qos
         )
-        self.odom_pub = self.create_publisher(Odometry, "/nav_robot/odom", qos)
-        self.two_wheel_odom_pub = self.create_publisher(Odometry, "/two_wheel/odom_raw", qos)
-        self.obstacle_pub = self.create_publisher(String, "/serving_robot/obstacle_event", qos)
-        self.tf_broadcaster = TransformBroadcaster(self)
-        self.static_tf_broadcaster = StaticTransformBroadcaster(self)
+        self.odom_pub = self.create_publisher(Odometry, "nav_robot/odom", qos)
+        self.two_wheel_odom_pub = self.create_publisher(Odometry, "two_wheel/odom_raw", qos)
+        self.obstacle_pub = self.create_publisher(String, "serving_robot/obstacle_event", qos)
+        self.tf_pub = self.create_publisher(TFMessage, "tf", 100)
+        static_tf_qos = QoSProfile(
+            depth=100,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.static_tf_pub = self.create_publisher(
+            TFMessage, "tf_static", static_tf_qos
+        )
 
         # Subsystems Services & Publishers for Manager Node
-        self.spawn_status_pub = self.create_publisher(Int32, "/food_spawn/status", transient_local_qos)
-        self.arm_status_pub = self.create_publisher(Int32, "/arm/status", transient_local_qos)
+        self.spawn_status_pub = self.create_publisher(Int32, "food_spawn/status", transient_local_qos)
+        self.arm_status_pub = self.create_publisher(Int32, "arm/status", transient_local_qos)
         self.navigation_status_pub = self.create_publisher(
-            Int32, "/navigation/status", transient_local_qos
+            Int32, "navigation/status", transient_local_qos
         )
         self.navigation_location_pub = self.create_publisher(
-            Int32, "/navigation/current_location", transient_local_qos
+            Int32, "navigation/current_location", transient_local_qos
         )
 
         # Standard Int32 topic subscribers for Isaac Sim food spawning & arm serving
-        self.create_subscription(Int32, "/food_spawn/trigger", self._on_food_spawn_trigger, qos)
-        self.create_subscription(Int32, "/arm/trigger", self._on_arm_trigger, qos)
+        self.create_subscription(Int32, "food_spawn/trigger", self._on_food_spawn_trigger, qos)
+        self.create_subscription(Int32, "arm/trigger", self._on_arm_trigger, qos)
         self.create_subscription(
-            Int32, "/navigation/trigger", self._on_navigation_trigger, qos
+            Int32, "navigation/trigger", self._on_navigation_trigger, qos
         )
 
         mission_qos = QoSProfile(
@@ -1224,11 +1339,11 @@ class NavBridge(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
         self.two_wheel_mission_status_pub = self.create_publisher(
-            String, "/two_wheel/mission_status", mission_qos
+            String, "two_wheel/mission_status", mission_qos
         )
         self.create_subscription(
             String,
-            "/two_wheel/mission_command",
+            "two_wheel/mission_command",
             self._on_two_wheel_mission_command,
             mission_qos,
         )
@@ -1236,24 +1351,24 @@ class NavBridge(Node):
         self._obstacle_test_controller = None
         self.create_service(
             SetBool,
-            "/hand_test/set_visible",
+            "hand_test/set_visible",
             self._on_hand_test_set_visible,
         )
         self.create_service(
             SetBool,
-            "/obstacle_test/set_visible",
+            "obstacle_test/set_visible",
             self._on_obstacle_test_set_visible,
         )
 
         if TaskCommand is not None:
             self.create_service(
                 TaskCommand,
-                "/food_spawn/command",
+                "food_spawn/command",
                 self._on_food_spawn_command,
             )
             self.create_service(
                 TaskCommand,
-                "/arm/command",
+                "arm/command",
                 self._on_arm_command,
             )
 
@@ -1534,6 +1649,20 @@ class NavBridge(Node):
                 self._active_two_wheel_target = None
             return
 
+        if kind in ("pause", "resume"):
+            # The ROS navigation subsystem can issue safety control before it
+            # has received the first mission-status echo.  In that short
+            # window its mission_id is empty; target the currently active
+            # Isaac mission instead of rejecting the safety command.
+            if not mission_id:
+                mission_id = self._active_two_wheel_mission_id
+            target = 99 if kind == "pause" else 98
+            if not mission_id or not self._queue_navigation(target):
+                self.get_logger().warning(
+                    f"[Mission RX] ignored {kind}: no active mission"
+                )
+            return
+
         if not mission_id:
             self.get_logger().error(
                 f"[Mission RX] missing mission_id: {payload}"
@@ -1719,7 +1848,7 @@ class NavBridge(Node):
             st.transform.rotation.z = math.sin(oyaw * 0.5)
             st.transform.rotation.w = math.cos(oyaw * 0.5)
             static_tfs.append(st)
-        self.static_tf_broadcaster.sendTransform(static_tfs)
+        self.static_tf_pub.publish(TFMessage(transforms=static_tfs))
 
     def _on_cmd_vel(self, msg: Twist):
         if abs(float(msg.linear.y)) > 1e-3 and not self._warned_vy:
@@ -1780,7 +1909,7 @@ class NavBridge(Node):
         robot_prefix = (
             str(self.articulation.prim_path)
             if hasattr(self.articulation, "prim_path")
-            else "/World/NavRobot"
+            else self.robot_root
         )
 
         # The walking person uses a non-contact capsule.  Read its current
@@ -2745,7 +2874,24 @@ class NavBridge(Node):
                 f"Spawning requested payload command={pending_spawn} in Isaac Sim..."
             )
             try:
-                spawn_command = int(pending_spawn)
+                requested_spawn_command = int(pending_spawn)
+                # New combined encoding: hundreds digit is plate count and the
+                # lower two digits retain pizza/drink/cutlery.  Accept the old
+                # plate-only 81..84 values for compatibility with an already
+                # running manager during rollout.
+                if 81 <= requested_spawn_command <= 84:
+                    plate_count = requested_spawn_command - 80
+                    spawn_command = 0
+                else:
+                    plate_count, spawn_command = divmod(
+                        requested_spawn_command, 100
+                    )
+                if plate_count < 0 or plate_count > 4:
+                    raise ValueError(
+                        "unsupported plate count in food spawn command="
+                        f"{requested_spawn_command}"
+                    )
+                plate_rack_requested = plate_count > 0
                 if spawn_command >= 40:
                     cutlery_requested = True
                     remainder = spawn_command - 40
@@ -2775,6 +2921,7 @@ class NavBridge(Node):
                     "/World/PizzaBoardGripBlock",
                     "/World/ServingDrinks",
                     "/World/ServingCutlery",
+                    "/World/ServingPlateRack",
                 )
                 reused_payload_paths = set()
                 if pizza_requested:
@@ -2783,6 +2930,8 @@ class NavBridge(Node):
                     reused_payload_paths.add("/World/ServingDrinks")
                 if cutlery_requested:
                     reused_payload_paths.add("/World/ServingCutlery")
+                if plate_rack_requested:
+                    reused_payload_paths.add("/World/ServingPlateRack")
                 existing_payloads = [
                     path
                     for path in payload_paths
@@ -2812,6 +2961,25 @@ class NavBridge(Node):
                     spawn_soda_cans(self.stage, count=drink_count)
                 if cutlery_requested and 'spawn_cutlery_box' in globals():
                     spawn_cutlery_box(self.stage)
+                if plate_rack_requested and 'spawn_plate_rack' in globals():
+                    spawn_plate_rack(self.stage, plate_count=plate_count)
+                    self._plate_rack_in_transport = True
+                    self._pending_plate_count = plate_count
+                    rack_prim = self.stage.GetPrimAtPath(
+                        "/World/ServingPlateRack"
+                    )
+                    visible_plates = [
+                        str(prim.GetPath())
+                        for prim in Usd.PrimRange(rack_prim)
+                        if prim.GetName().startswith("Plate_")
+                        and UsdGeom.Imageable(prim).ComputeVisibility()
+                        != UsdGeom.Tokens.invisible
+                    ]
+                    self.get_logger().info(
+                        "[FoodSpawn][PlateRack] authored "
+                        f"count={plate_count} root_valid={rack_prim.IsValid()} "
+                        f"visible_plates={visible_plates}"
+                    )
                 if pizza_requested and 'TrayPizzaPickPlace' in globals():
                     # Constructor authors the physical dish at the kitchen.
                     # Keep this exact object for delivery: constructing it a
@@ -2836,11 +3004,16 @@ class NavBridge(Node):
                     missing_prims.append("/World/ServingDrinks")
                 if cutlery_requested and not self.stage.GetPrimAtPath("/World/ServingCutlery").IsValid():
                     missing_prims.append("/World/ServingCutlery")
+                if plate_rack_requested and not self.stage.GetPrimAtPath("/World/ServingPlateRack").IsValid():
+                    missing_prims.append("/World/ServingPlateRack")
 
                 if missing_prims:
                     raise RuntimeError(f"Food spawn missing required prims on Stage: {missing_prims}")
 
-                self.get_logger().info(f"[FoodSpawn] Successfully spawned and verified food prims for command={spawn_command}")
+                self.get_logger().info(
+                    "[FoodSpawn] Successfully spawned and verified food prims "
+                    f"for command={requested_spawn_command}"
+                )
                 self.spawn_status_pub.publish(Int32(data=2))  # 2 = COMPLETED
             except Exception as exc:
                 self.get_logger().exception(f"Food spawn execution error for command={pending_spawn}: {exc}")
@@ -2853,7 +3026,10 @@ class NavBridge(Node):
         if arm_command is not None:
             try:
                 cutlery_requested = arm_command >= 20
-                remainder = arm_command - (20 if cutlery_requested else 0)
+                plate_rack_requested = arm_command >= 40
+                remainder = arm_command - (40 if plate_rack_requested else 0)
+                cutlery_requested = remainder >= 20
+                remainder -= 20 if cutlery_requested else 0
                 pizza_requested = remainder >= 10
                 drink_count = remainder - (10 if pizza_requested else 0)
                 if drink_count > 2:
@@ -2885,6 +3061,51 @@ class NavBridge(Node):
                             self.stage, wait_for_start=bool(named_tasks)
                         ))
                     )
+                if plate_rack_requested:
+                    rack_prim = self.stage.GetPrimAtPath(
+                        "/World/ServingPlateRack"
+                    )
+                    visible_plate_count = 0
+                    if rack_prim.IsValid():
+                        visible_plate_count = sum(
+                            1
+                            for prim in Usd.PrimRange(rack_prim)
+                            if prim.GetName().startswith("Plate_")
+                            and UsdGeom.Imageable(prim).ComputeVisibility()
+                            != UsdGeom.Tokens.invisible
+                        )
+                    if not rack_prim.IsValid() or visible_plate_count == 0:
+                        if not (1 <= self._pending_plate_count <= 4):
+                            raise RuntimeError(
+                                "plate-rack arm command received without a "
+                                "successful plate spawn command (expected 81..84)"
+                            )
+                        self.get_logger().warning(
+                            "[PlateRack] payload missing before arm start; "
+                            f"respawning count={self._pending_plate_count}"
+                        )
+                        spawn_plate_rack(
+                            self.stage,
+                            plate_count=self._pending_plate_count,
+                        )
+                        if not follow_plate_rack_transport(self.stage):
+                            raise RuntimeError(
+                                "plate rack recovery spawn could not be placed "
+                                "on the left tray"
+                            )
+                        rack_prim = self.stage.GetPrimAtPath(
+                            "/World/ServingPlateRack"
+                        )
+                    self.get_logger().info(
+                        "[PlateRack] arm preflight passed "
+                        f"count={self._pending_plate_count} "
+                        f"root={rack_prim.GetPath()}"
+                    )
+                    named_tasks.append(
+                        ("plate_rack", PlateRackPickPlace(
+                            self.stage, wait_for_start=bool(named_tasks)
+                        ))
+                    )
                 if not named_tasks:
                     raise ValueError(f"arm command contains no delivery: {arm_command}")
                 task = CommandServingSequence(named_tasks)
@@ -2902,6 +3123,20 @@ class NavBridge(Node):
                 remove_parking_brake(self.stage)
                 self.arm_status_pub.publish(Int32(data=3))
 
+        if (
+            self._plate_rack_in_transport
+            and 'follow_plate_rack_transport' in globals()
+            and (
+                self._active_serving_task is None
+                or self._active_serving_task.current_name != "plate_rack"
+            )
+        ):
+            if not follow_plate_rack_transport(self.stage):
+                self.get_logger().error(
+                    "[plate-rack] transport follow failed during navigation"
+                )
+                self._plate_rack_in_transport = False
+
         if self._active_serving_task is not None:
             self._target_vx = self._target_wz = 0.0
             self._cmd_vx = self._cmd_wz = 0.0
@@ -2913,6 +3148,10 @@ class NavBridge(Node):
             )
             if not self._serving_paused:
                 self._active_serving_task.step(self.articulation)
+            if self._active_serving_task.current_name == "plate_rack":
+                # PlateRackPickPlace now owns tray-follow and switches the rack
+                # to dynamic collision after tray deployment.
+                self._plate_rack_in_transport = False
             if self._active_serving_task.failed:
                 self._active_serving_task.close()
                 self._active_serving_task = None
@@ -2924,6 +3163,7 @@ class NavBridge(Node):
                 self._active_serving_task.close()
                 self._active_serving_task = None
                 self._spawned_serving_tasks = {}
+                self._pending_plate_count = 0
                 self._arm_returning_to_stow = True
                 self._arm_stow_started_at = time.monotonic()
                 self._arm_stow_settle_count = 0
@@ -3178,7 +3418,7 @@ class NavBridge(Node):
         tf.transform.translation.z = float(position[2])
         tf.transform.rotation.z = math.sin(yaw * 0.5)
         tf.transform.rotation.w = math.cos(yaw * 0.5)
-        self.tf_broadcaster.sendTransform(tf)
+        self.tf_pub.publish(TFMessage(transforms=[tf]))
 
         self._last_pose = (x, y, yaw)
 
@@ -3202,23 +3442,76 @@ def main():
                 flush=True,
             )
 
-    stage = open_restaurant_and_robot()
-    configure_joint_drives(stage)
-    configure_wheel_contact_material(stage)
-    articulation_path = find_articulation_path(stage)
-    configure_physics_stability(stage, articulation_path)
-    articulation, dof_names = initialize_robot(articulation_path)
+    multi_robot = os.environ.get("NAV_MULTI_ROBOT", "0") == "1"
+    robot_configs = (
+        [
+            {
+                "name": "robot1",
+                "root": "/World/NavRobot1",
+                "spawn": Gf.Vec3d(-0.90, 5.25, 0.01),
+            },
+            {
+                "name": "robot2",
+                "root": "/World/NavRobot2",
+                "spawn": Gf.Vec3d(0.90, 5.25, 0.01),
+            },
+        ]
+        if multi_robot
+        else [
+            {
+                "name": "",
+                "root": "/World/NavRobot",
+                "spawn": SPAWN_POSITION,
+            }
+        ]
+    )
 
-    # The robot USD already contains its D455 and RTX RPLIDAR.  Creating the
-    # old PhysX nav_lidar here produced a second white lidar body at the world
-    # origin, which looked like a detached M0609 link.
-    connect_embedded_sensor_ros(stage)
+    stage = None
+    robot_records = []
+    for index, config in enumerate(robot_configs):
+        set_robot_context(config["root"], config["spawn"])
+        stage = open_restaurant_and_robot(open_stage=index == 0)
+        configure_wheel_contact_material(stage)
+        configure_gripper_contact_material(stage)
+        articulation_path = find_articulation_path(stage)
+        configure_physics_stability(stage, articulation_path)
+        robot_records.append((config, articulation_path))
+
+    # The drive authoring pass may safely cover both complete robot
+    # articulations after they have been composed into the stage.
+    configure_joint_drives(stage)
+    initialized_records = []
+    for index, (config, articulation_path) in enumerate(robot_records):
+        set_robot_context(config["root"], config["spawn"])
+        articulation, dof_names = initialize_robot(
+            articulation_path,
+            name=config["name"] or "nav_ridgeback",
+        )
+        # Preserve each complete robot's embedded D455.  Only the first graph
+        # publishes the shared simulation clock.
+        connect_embedded_sensor_ros(
+            stage,
+            robot_root=config["root"],
+            robot_name=config["name"],
+            publish_clock=index == 0,
+        )
+        initialized_records.append((config, articulation, dof_names))
 
     if not rclpy.ok():
         rclpy.init(args=[])
-    bridge = NavBridge(articulation, dof_names, stage)
+    bridges = []
     executor = SingleThreadedExecutor()
-    executor.add_node(bridge)
+    for config, articulation, dof_names in initialized_records:
+        bridge = NavBridge(
+            articulation,
+            dof_names,
+            stage,
+            robot_name=config["name"],
+            robot_root=config["root"],
+        )
+        bridges.append(bridge)
+        executor.add_node(bridge)
+    bridge = bridges[0]
 
     timeline = omni.timeline.get_timeline_interface()
     if not timeline.is_playing():
@@ -3226,7 +3519,8 @@ def main():
 
     print(
         f"[nav_robot] domain={os.environ.get('ROS_DOMAIN_ID', '0')} "
-        f"spawn=({SPAWN_POSITION[0]:.2f},{SPAWN_POSITION[1]:.2f}) "
+        f"mode={'multi-integrated' if multi_robot else 'single-integrated'} "
+        f"robots={[(item['name'] or 'default', tuple(item['spawn'])) for item in robot_configs]} "
         f"yaw={SPAWN_YAW:.2f}",
         flush=True,
     )
@@ -3320,7 +3614,9 @@ def main():
                     crossing_pedestrian_controller = None
             try:
                 sim_time = timeline.get_current_time()
-                bridge.tick(float(sim_time))
+                for config, active_bridge in zip(robot_configs, bridges):
+                    set_robot_context(config["root"], config["spawn"])
+                    active_bridge.tick(float(sim_time))
             except Exception as exc:
                 print(f"[err] tick error: {exc}", flush=True)
     finally:
@@ -3329,7 +3625,8 @@ def main():
         if crossing_pedestrian_controller is not None:
             crossing_pedestrian_controller.shutdown()
         executor.shutdown()
-        bridge.destroy_node()
+        for active_bridge in bridges:
+            active_bridge.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
         simulation_app.close()

@@ -31,15 +31,24 @@ class IsaacSubsystemAdapterNode(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
         )
+        command_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
 
-        self._arm_trigger_pub = self.create_publisher(Int32, "/arm/trigger", status_qos)
-        self._spawn_trigger_pub = self.create_publisher(Int32, "/food_spawn/trigger", status_qos)
+        # Commands are events, not state.  TRANSIENT_LOCAL replays stale
+        # commands whenever Isaac reconnects and can spawn/serve the same
+        # payload repeatedly.  Only status topics should be latched.
+        self._arm_trigger_pub = self.create_publisher(Int32, "arm/trigger", command_qos)
+        self._spawn_trigger_pub = self.create_publisher(Int32, "food_spawn/trigger", command_qos)
 
         self._arm_status_sub = self.create_subscription(
-            Int32, "/arm/status", self._on_arm_status, status_qos, callback_group=self._cb_group
+            Int32, "arm/status", self._on_arm_status, status_qos, callback_group=self._cb_group
         )
         self._spawn_status_sub = self.create_subscription(
-            Int32, "/food_spawn/status", self._on_spawn_status, status_qos, callback_group=self._cb_group
+            Int32, "food_spawn/status", self._on_spawn_status, status_qos, callback_group=self._cb_group
         )
 
         self._arm_cond = threading.Condition()
@@ -48,10 +57,10 @@ class IsaacSubsystemAdapterNode(Node):
         self._spawn_last_status = 0
 
         self.create_service(
-            TaskCommand, "/arm/command", self._on_arm_command, callback_group=self._cb_group
+            TaskCommand, "arm/command", self._on_arm_command, callback_group=self._cb_group
         )
         self.create_service(
-            TaskCommand, "/food_spawn/command", self._on_spawn_command, callback_group=self._cb_group
+            TaskCommand, "food_spawn/command", self._on_spawn_command, callback_group=self._cb_group
         )
 
         self.get_logger().info(

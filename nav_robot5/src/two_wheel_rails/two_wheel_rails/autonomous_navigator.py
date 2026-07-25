@@ -232,14 +232,14 @@ class SimplifiedPathNavigator:
         self._costmap: OccupancyGrid | None = None
         self._costmap_sub = nav.create_subscription(
             OccupancyGrid,
-            "/global_costmap/costmap",
+            "global_costmap/costmap",
             self._on_costmap,
             1,
         )
 
         self._raw_odom_sub = nav.create_subscription(
             Odometry,
-            "/two_wheel/odom_raw",
+            "two_wheel/odom_raw",
             self._on_raw_odom,
             20,
         )
@@ -250,10 +250,10 @@ class SimplifiedPathNavigator:
             durability=DurabilityPolicy.VOLATILE,
         )
 
-        self._pub_mission_cmd = nav.create_publisher(StringMsg, "/two_wheel/mission_command", stage_qos)
+        self._pub_mission_cmd = nav.create_publisher(StringMsg, "two_wheel/mission_command", stage_qos)
         self._sub_mission_status = nav.create_subscription(
             StringMsg,
-            "/two_wheel/mission_status",
+            "two_wheel/mission_status",
             self._on_mission_status,
             stage_qos,
         )
@@ -266,10 +266,10 @@ class SimplifiedPathNavigator:
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
 
-        self._pub_l_cand_x = nav.create_publisher(NavPath, "/orthogonal_path/l_candidate_x_first", path_qos)
-        self._pub_l_cand_y = nav.create_publisher(NavPath, "/orthogonal_path/l_candidate_y_first", path_qos)
-        self._pub_selected = nav.create_publisher(NavPath, "/orthogonal_path/selected", path_qos)
-        self._pub_dock_approach = nav.create_publisher(NavPath, "/orthogonal_path/dock_approach", path_qos)
+        self._pub_l_cand_x = nav.create_publisher(NavPath, "orthogonal_path/l_candidate_x_first", path_qos)
+        self._pub_l_cand_y = nav.create_publisher(NavPath, "orthogonal_path/l_candidate_y_first", path_qos)
+        self._pub_selected = nav.create_publisher(NavPath, "orthogonal_path/selected", path_qos)
+        self._pub_dock_approach = nav.create_publisher(NavPath, "orthogonal_path/dock_approach", path_qos)
 
         # Run from the node's existing executor. No extra spin thread is created.
         # Once all inputs are ready, the timer cancels itself.

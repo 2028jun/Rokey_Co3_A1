@@ -129,7 +129,7 @@
                 <div class="form-section">
                     <label class="section-label">2. 추가 주문</label>
                     <div class="menu-grid">
-                        <div class="menu-card" id="menu-card-m5" style="grid-column: span 2;">
+                        <div class="menu-card" id="menu-card-m5">
                             <div class="menu-emoji">🍴</div>
                             <div class="menu-info">
                                 <span class="menu-name">식기도구 (수저통)</span>
@@ -139,6 +139,18 @@
                                 <button class="qty-btn" onclick="updateCart('m5', '식기도구 (수저통)', 0, -1)">-</button>
                                 <span class="qty-count" id="qty-m5">0</span>
                                 <button class="qty-btn" onclick="updateCart('m5', '식기도구 (수저통)', 0, 1)">+</button>
+                            </div>
+                        </div>
+                        <div class="menu-card" id="menu-card-m6">
+                            <div class="menu-emoji">🍽️</div>
+                            <div class="menu-info">
+                                <span class="menu-name">접시</span>
+                                <span class="menu-price">0원 (무료)</span>
+                            </div>
+                            <div class="qty-controls">
+                                <button class="qty-btn" onclick="updateCart('m6', '접시', 0, -1)">-</button>
+                                <span class="qty-count" id="qty-m6">0</span>
+                                <button class="qty-btn" onclick="updateCart('m6', '접시', 0, 1)">+</button>
                             </div>
                         </div>
                     </div>
@@ -317,6 +329,6 @@
 
     <!-- Scripts -->
     <script src="/js/robot_map.js"></script>
-    <script src="/js/app.js"></script>
+    <script src="/js/app.js?v=4"></script>
 </body>
 </html>
