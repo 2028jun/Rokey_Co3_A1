@@ -10,8 +10,6 @@
 
 _NAV_ROBOT5_TOOLS_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export NAV_ROBOT5_WS="${NAV_ROBOT5_WS:-$(dirname "$_NAV_ROBOT5_TOOLS_DIR")}"
-export ROS_DOMAIN_ID=102
-export NAV_ROBOT5_ROS_DOMAIN_ID=102
 export NAV_ROBOT5_ISAAC_PYTHON="${NAV_ROBOT5_ISAAC_PYTHON:-/home/rokey/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/python.sh}"
 
 # Older workspace scripts may already have t1/t2/t3 aliases in an interactive
@@ -20,8 +18,6 @@ export NAV_ROBOT5_ISAAC_PYTHON="${NAV_ROBOT5_ISAAC_PYTHON:-/home/rokey/dev_ws/is
 unalias t1 t2 t3 2>/dev/null || true
 
 _nav5_ws() {
-  export ROS_DOMAIN_ID=102
-  export NAV_ROBOT5_ROS_DOMAIN_ID=102
   if [[ ! -f "$NAV_ROBOT5_WS/install/setup.bash" ]]; then
     echo "[nav5] install 없음: cd $NAV_ROBOT5_WS && colcon build --packages-select two_wheel_rails" >&2
     return 1
@@ -34,8 +30,6 @@ _nav5_ws() {
 }
 
 t1() {
-  export ROS_DOMAIN_ID=102
-  export NAV_ROBOT5_ROS_DOMAIN_ID=102
   cd "$NAV_ROBOT5_WS" || return 1
   [[ -x "$NAV_ROBOT5_ISAAC_PYTHON" ]] || {
     echo "[t1] Isaac python 없음: $NAV_ROBOT5_ISAAC_PYTHON" >&2

@@ -340,9 +340,6 @@ class SlamPatrol(Node):
 
 
 def main(argv=None) -> int:
-    os.environ["ROS_DOMAIN_ID"] = os.environ.get(
-        "MAP_GEN_ROS_DOMAIN_ID", os.environ.get("ROS_DOMAIN_ID", "102")
-    )
     rclpy.init(args=None)
     node = None
     try:

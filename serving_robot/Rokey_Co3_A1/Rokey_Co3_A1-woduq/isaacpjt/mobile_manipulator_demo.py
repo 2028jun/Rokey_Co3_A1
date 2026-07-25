@@ -27,9 +27,9 @@ _ros_required = (
 if _ros_required:
     os.environ.setdefault("ROS_DISTRO", "humble")
     os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
-    os.environ["ROS_DOMAIN_ID"] = os.environ.get(
-        "MOBILE_DEMO_ROS_DOMAIN_ID", "102"
-    )
+    _mobile_domain_id = os.environ.get("MOBILE_DEMO_ROS_DOMAIN_ID")
+    if _mobile_domain_id:
+        os.environ["ROS_DOMAIN_ID"] = _mobile_domain_id
     _ld_paths = [path for path in os.environ.get("LD_LIBRARY_PATH", "").split(":") if path]
     _python_paths = [
         path

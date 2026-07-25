@@ -111,7 +111,6 @@ class TopicBridge(Node):
 
 
 def main() -> None:
-    os.environ.setdefault("ROS_DOMAIN_ID", "102")
     rclpy.init()
     node = TopicBridge()
     try:

@@ -45,7 +45,6 @@ source install/setup.bash
 ## 실행
 
 ```bash
-export ROS_DOMAIN_ID=102
 ros2 run hand_safety hand_detector_node
 ```
 
@@ -53,7 +52,7 @@ ros2 run hand_safety hand_detector_node
 사용합니다.
 
 ```bash
-export ROS_DOMAIN_ID=102
+# ROS_DOMAIN_ID는 각 PC의 ~/.bashrc 설정을 사용합니다.
 ```
 
 입력 토픽을 변경하는 예:
@@ -104,7 +103,6 @@ Manager와 detector를 항상 함께 실행하려면 워크스페이스 루트�
 
 ```bash
 source /opt/ros/humble/setup.bash
-export ROS_DOMAIN_ID=102
 source install/setup.bash
 ros2 launch serving_robot_manager vision_manager.launch.py
 ```

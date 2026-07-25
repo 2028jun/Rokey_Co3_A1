@@ -31,7 +31,9 @@ ISAAC_SIM_ROOT = os.environ.get(
 _ros_bridge_lib = Path(ISAAC_SIM_ROOT) / "exts/isaacsim.ros2.bridge/humble/lib"
 os.environ.setdefault("ROS_DISTRO", "humble")
 os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
-os.environ["ROS_DOMAIN_ID"] = os.environ.get("NAV_ROBOT_ROS_DOMAIN_ID", "102")
+_nav_domain_id = os.environ.get("NAV_ROBOT_ROS_DOMAIN_ID")
+if _nav_domain_id:
+    os.environ["ROS_DOMAIN_ID"] = _nav_domain_id
 _ld_paths = [path for path in os.environ.get("LD_LIBRARY_PATH", "").split(":") if path]
 _python_paths = [
     path
@@ -3223,7 +3225,7 @@ def main():
         timeline.play()
 
     print(
-        f"[nav_robot] domain={os.environ['ROS_DOMAIN_ID']} "
+        f"[nav_robot] domain={os.environ.get('ROS_DOMAIN_ID', '0')} "
         f"spawn=({SPAWN_POSITION[0]:.2f},{SPAWN_POSITION[1]:.2f}) "
         f"yaw={SPAWN_YAW:.2f}",
         flush=True,

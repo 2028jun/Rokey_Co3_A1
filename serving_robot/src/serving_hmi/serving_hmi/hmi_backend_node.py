@@ -603,7 +603,7 @@ def get_system_status_payload():
             "pose": ros_node.robot_pose if ros_node else {"x": -1.82, "y": -2.20, "yaw": 0.0},
             "parking_brake": ros_node.parking_brake if ros_node else True,
             "battery": ros_node.battery_level if ros_node else 100.0,
-            "domain_id": os.environ.get("ROS_DOMAIN_ID", "101")
+            "domain_id": os.environ.get("ROS_DOMAIN_ID", "0")
         },
         "camera_connected": camera_connected,
         "obstacle": (ros_node.obstacle_info if ros_node else {"active": False, "x": 0.0, "y": 2.8, "stop": False}),
@@ -814,7 +814,7 @@ def main():
     spin_thread.start()
     
     port = int(os.environ.get("HMI_PORT", 8000))
-    print(f"Starting Serving HMI Web Dashboard on http://0.0.0.0:{port} (ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '102')})")
+    print(f"Starting Serving HMI Web Dashboard on http://0.0.0.0:{port} (ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')})")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
 
 if __name__ == '__main__':

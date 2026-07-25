@@ -11,10 +11,6 @@ BASE_NAME="${1:-slam_map}"
 
 mkdir -p "$OUT_DIR"
 
-if [[ -z "${ROS_DOMAIN_ID:-}" ]]; then
-  export ROS_DOMAIN_ID="102"
-fi
-
 source /opt/ros/humble/setup.bash
 if [[ -f "$WS_ROOT/install/setup.bash" ]]; then
   # shellcheck source=/dev/null

@@ -33,7 +33,6 @@ def _load_params(b: Node) -> tuple[int, str, dict]:
 
 
 def main(argv=None) -> int:
-    os.environ.setdefault("ROS_DOMAIN_ID", "103")
     rclpy.init(args=None)
     node = None
     try:

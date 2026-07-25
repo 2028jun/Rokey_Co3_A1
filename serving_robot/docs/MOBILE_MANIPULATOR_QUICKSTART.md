@@ -32,8 +32,6 @@ ros2 run ridgeback_m0609_description validate_description.py
 ```bash
 source /opt/ros/humble/setup.bash
 source /home/rokey/cobot3_ws/install/setup.bash
-export ROS_DOMAIN_ID=102
-
 /home/rokey/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/python.sh \
   /home/rokey/cobot3_ws/isaacpjt/mobile_manipulator_demo.py
 ```

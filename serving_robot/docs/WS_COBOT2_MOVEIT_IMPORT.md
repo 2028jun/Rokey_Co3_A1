@@ -80,7 +80,7 @@ Isaac Sim 5.1 + Ridgeback 구조에 바로 사용할 수 없다.
 - `map -> odom -> ridgeback base -> arm mount -> M0609 -> rg2_tcp` TF 확정
 - Nav2 주행 중 팔 controller interlock과 운반 자세 정의
 - 주행 완료 후 MoveIt 동작을 시작하는 상태 머신
-- Isaac Sim `/clock`, 전체 노드 `use_sim_time`, `ROS_DOMAIN_ID=102` 검증
+- Isaac Sim `/clock`, 전체 노드 `use_sim_time`, 로컬 `ROS_DOMAIN_ID` 검증
 
 ## 재사용 가치가 높은 원본 코드
 

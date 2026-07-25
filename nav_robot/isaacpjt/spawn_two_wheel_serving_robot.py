@@ -9,8 +9,6 @@ from pathlib import Path
 
 import numpy as np
 
-os.environ.setdefault("ROS_DOMAIN_ID", "102")
-
 import spawn_jackal_fixed_route as diagnostic
 from kitchen_return_module import build_kitchen_route
 from table_route_module import build_table_route
