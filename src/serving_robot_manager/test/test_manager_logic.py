@@ -149,6 +149,23 @@ def test_unknown_kitchen_state_still_requests_return_navigation():
     manager._call_nav_command.assert_called_once_with(4)
 
 
+def test_plate_rack_shares_first_trip_and_encodes_plate_count():
+    """접시 랙이 첫 트립에 합쳐지고 스폰 명령에 수량이 보존되는지 확인한다."""
+    trips = ManagerNode._build_serve_queue(1, 0, 0, 2, 1, 3)
+
+    assert trips == [Trip(1, 2, True, 3)]
+    assert trips[0].arm_command() == 72
+    assert trips[0].spawn_command() == 352
+
+    for plate_count in range(1, 5):
+        plate_only = ManagerNode._build_serve_queue(
+            0, 0, 0, 0, 0, plate_count
+        )
+        assert plate_only == [Trip(None, 0, False, plate_count)]
+        assert plate_only[0].arm_command() == 40
+        assert plate_only[0].spawn_command() == 100 * plate_count
+
+
 def test_failure_requests_arm_and_navigation_pause():
     """실패 시 동작 중인 Arm과 Navigation에 pause를 보내는지 확인한다."""
     manager = _bare_manager(_State.ARM_SERVING)

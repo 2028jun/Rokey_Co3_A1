@@ -326,7 +326,9 @@ class NavigationSubsystemNode(Node):
 
     def _send_control(self, kind: str) -> None:
         msg = String()
-        msg.data = json.dumps({"kind": kind, "mission_id": ""})
+        msg.data = json.dumps(
+            {"kind": kind, "mission_id": self._last_mission_id}
+        )
         for _ in range(3):
             self._mission_command_pub.publish(msg)
 

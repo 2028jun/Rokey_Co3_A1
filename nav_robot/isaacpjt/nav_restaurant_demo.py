@@ -107,12 +107,22 @@ sys.path.insert(0, str(WORKSPACE / "isaacpjt/M0609/rmpflow"))
 try:
     from drink_serving import spawn_soda_cans
     from cutlery_serving import spawn_cutlery_box
-    from pizza_serving import TrayPizzaPickPlace
+    from plate_rack_serving import (
+        follow_plate_rack_transport,
+        spawn_plate_rack,
+    )
+    from pizza_serving import (
+        GRIP_CONTACT_DYNAMIC_FRICTION,
+        GRIP_CONTACT_STATIC_FRICTION,
+        GRIPPER_DRIVE_MAX_FORCE,
+        TrayPizzaPickPlace,
+    )
     from soda1_delivery import Soda1PickPlace
     from soda2_delivery import Soda2PickPlace
     from cutlery_pick_place import CutleryBoxPickPlace
+    from plate_rack_pick_place import PlateRackPickPlace
     print(
-        "[food_spawn] loaded pizza, soda1, soda2 and cutlery delivery modules",
+        "[food_spawn] loaded pizza, soda1, soda2, cutlery and plate-rack modules",
         flush=True,
     )
 except Exception as _food_import_exc:
@@ -666,6 +676,54 @@ def configure_wheel_contact_material(stage):
         )
 
 
+def configure_gripper_contact_material(stage):
+    """Bind the proven high-friction physics material to RG2 moving links."""
+    material = UsdShade.Material.Define(
+        stage, "/World/PhysicsMaterials/RG2Grip"
+    )
+    material_api = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
+    material_api.CreateStaticFrictionAttr(GRIP_CONTACT_STATIC_FRICTION)
+    material_api.CreateDynamicFrictionAttr(GRIP_CONTACT_DYNAMIC_FRICTION)
+    material_api.CreateRestitutionAttr(0.0)
+    physx_material = PhysxSchema.PhysxMaterialAPI.Apply(material.GetPrim())
+    physx_material.CreateFrictionCombineModeAttr("max")
+    physx_material.CreateRestitutionCombineModeAttr("min")
+
+    grip_link_names = {
+        "rg2_left_inner_knuckle",
+        "rg2_right_outer_knuckle",
+        "rg2_left_outer_knuckle",
+        "rg2_left_inner_finger",
+        "rg2_right_inner_finger",
+        "rg2_right_inner_knuckle",
+    }
+    bound_links = []
+    for prim in stage.Traverse():
+        if not str(prim.GetPath()).startswith(ROBOT_ROOT):
+            continue
+        if prim.GetName() not in grip_link_names:
+            continue
+        UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+            material,
+            bindingStrength=UsdShade.Tokens.strongerThanDescendants,
+            materialPurpose="physics",
+        )
+        bound_links.append(str(prim.GetPath()))
+
+    if len(bound_links) != len(grip_link_names):
+        raise RuntimeError(
+            "RG2 grip material setup incomplete: "
+            f"expected={len(grip_link_names)} bound={bound_links}"
+        )
+    print(
+        "[nav_robot] RG2 grip material "
+        f"static={GRIP_CONTACT_STATIC_FRICTION:.1f} "
+        f"dynamic={GRIP_CONTACT_DYNAMIC_FRICTION:.1f} "
+        f"links={len(bound_links)} max_force={GRIPPER_DRIVE_MAX_FORCE:.0f}N",
+        flush=True,
+    )
+
+
 def find_articulation_path(stage) -> str:
     for path in ARTICULATION_CANDIDATES:
         if stage.GetPrimAtPath(path).IsValid():
@@ -1004,7 +1062,7 @@ def create_sensor_static_tf(stage, lidar_path: str, camera_path: str, node: Node
 class CommandServingSequence:
     """Frame-driven composition of the already tested serving tasks."""
 
-    TRAY_TASK_NAMES = frozenset({"soda1", "soda2", "cutlery"})
+    TRAY_TASK_NAMES = frozenset({"soda1", "soda2", "cutlery", "plate_rack"})
     TRAY_EXTENSION = 0.25
     TRAY_TOLERANCE = 0.005
 
@@ -1056,6 +1114,12 @@ class CommandServingSequence:
         )
         error = float(np.max(np.abs(actual - self.TRAY_EXTENSION)))
         return error <= self.TRAY_TOLERANCE, actual, error
+
+    @property
+    def current_name(self):
+        if self.done or self.failed or self._index >= len(self._named_tasks):
+            return None
+        return self._named_tasks[self._index][0]
 
     def step(self, articulation):
         if self.done or self.failed:
@@ -1136,6 +1200,8 @@ class NavBridge(Node):
         self._tray_home_step = 0
         self._tray_home_start = None
         self._spawned_serving_tasks = {}
+        self._plate_rack_in_transport = False
+        self._pending_plate_count = 0
         self._direct_nav = None
         self._direct_nav_request = None
         self._active_two_wheel_mission_id = ""
@@ -1527,6 +1593,20 @@ class NavBridge(Node):
                 )
                 self._active_two_wheel_mission_id = ""
                 self._active_two_wheel_target = None
+            return
+
+        if kind in ("pause", "resume"):
+            # The ROS navigation subsystem can issue safety control before it
+            # has received the first mission-status echo.  In that short
+            # window its mission_id is empty; target the currently active
+            # Isaac mission instead of rejecting the safety command.
+            if not mission_id:
+                mission_id = self._active_two_wheel_mission_id
+            target = 99 if kind == "pause" else 98
+            if not mission_id or not self._queue_navigation(target):
+                self.get_logger().warning(
+                    f"[Mission RX] ignored {kind}: no active mission"
+                )
             return
 
         if not mission_id:
@@ -2695,7 +2775,24 @@ class NavBridge(Node):
                 f"Spawning requested payload command={pending_spawn} in Isaac Sim..."
             )
             try:
-                spawn_command = int(pending_spawn)
+                requested_spawn_command = int(pending_spawn)
+                # New combined encoding: hundreds digit is plate count and the
+                # lower two digits retain pizza/drink/cutlery.  Accept the old
+                # plate-only 81..84 values for compatibility with an already
+                # running manager during rollout.
+                if 81 <= requested_spawn_command <= 84:
+                    plate_count = requested_spawn_command - 80
+                    spawn_command = 0
+                else:
+                    plate_count, spawn_command = divmod(
+                        requested_spawn_command, 100
+                    )
+                if plate_count < 0 or plate_count > 4:
+                    raise ValueError(
+                        "unsupported plate count in food spawn command="
+                        f"{requested_spawn_command}"
+                    )
+                plate_rack_requested = plate_count > 0
                 if spawn_command >= 40:
                     cutlery_requested = True
                     remainder = spawn_command - 40
@@ -2725,6 +2822,7 @@ class NavBridge(Node):
                     "/World/PizzaBoardGripBlock",
                     "/World/ServingDrinks",
                     "/World/ServingCutlery",
+                    "/World/ServingPlateRack",
                 )
                 reused_payload_paths = set()
                 if pizza_requested:
@@ -2733,6 +2831,8 @@ class NavBridge(Node):
                     reused_payload_paths.add("/World/ServingDrinks")
                 if cutlery_requested:
                     reused_payload_paths.add("/World/ServingCutlery")
+                if plate_rack_requested:
+                    reused_payload_paths.add("/World/ServingPlateRack")
                 existing_payloads = [
                     path
                     for path in payload_paths
@@ -2762,6 +2862,25 @@ class NavBridge(Node):
                     spawn_soda_cans(self.stage, count=drink_count)
                 if cutlery_requested and 'spawn_cutlery_box' in globals():
                     spawn_cutlery_box(self.stage)
+                if plate_rack_requested and 'spawn_plate_rack' in globals():
+                    spawn_plate_rack(self.stage, plate_count=plate_count)
+                    self._plate_rack_in_transport = True
+                    self._pending_plate_count = plate_count
+                    rack_prim = self.stage.GetPrimAtPath(
+                        "/World/ServingPlateRack"
+                    )
+                    visible_plates = [
+                        str(prim.GetPath())
+                        for prim in Usd.PrimRange(rack_prim)
+                        if prim.GetName().startswith("Plate_")
+                        and UsdGeom.Imageable(prim).ComputeVisibility()
+                        != UsdGeom.Tokens.invisible
+                    ]
+                    self.get_logger().info(
+                        "[FoodSpawn][PlateRack] authored "
+                        f"count={plate_count} root_valid={rack_prim.IsValid()} "
+                        f"visible_plates={visible_plates}"
+                    )
                 if pizza_requested and 'TrayPizzaPickPlace' in globals():
                     # Constructor authors the physical dish at the kitchen.
                     # Keep this exact object for delivery: constructing it a
@@ -2786,11 +2905,16 @@ class NavBridge(Node):
                     missing_prims.append("/World/ServingDrinks")
                 if cutlery_requested and not self.stage.GetPrimAtPath("/World/ServingCutlery").IsValid():
                     missing_prims.append("/World/ServingCutlery")
+                if plate_rack_requested and not self.stage.GetPrimAtPath("/World/ServingPlateRack").IsValid():
+                    missing_prims.append("/World/ServingPlateRack")
 
                 if missing_prims:
                     raise RuntimeError(f"Food spawn missing required prims on Stage: {missing_prims}")
 
-                self.get_logger().info(f"[FoodSpawn] Successfully spawned and verified food prims for command={spawn_command}")
+                self.get_logger().info(
+                    "[FoodSpawn] Successfully spawned and verified food prims "
+                    f"for command={requested_spawn_command}"
+                )
                 self.spawn_status_pub.publish(Int32(data=2))  # 2 = COMPLETED
             except Exception as exc:
                 self.get_logger().exception(f"Food spawn execution error for command={pending_spawn}: {exc}")
@@ -2803,7 +2927,10 @@ class NavBridge(Node):
         if arm_command is not None:
             try:
                 cutlery_requested = arm_command >= 20
-                remainder = arm_command - (20 if cutlery_requested else 0)
+                plate_rack_requested = arm_command >= 40
+                remainder = arm_command - (40 if plate_rack_requested else 0)
+                cutlery_requested = remainder >= 20
+                remainder -= 20 if cutlery_requested else 0
                 pizza_requested = remainder >= 10
                 drink_count = remainder - (10 if pizza_requested else 0)
                 if drink_count > 2:
@@ -2835,6 +2962,51 @@ class NavBridge(Node):
                             self.stage, wait_for_start=bool(named_tasks)
                         ))
                     )
+                if plate_rack_requested:
+                    rack_prim = self.stage.GetPrimAtPath(
+                        "/World/ServingPlateRack"
+                    )
+                    visible_plate_count = 0
+                    if rack_prim.IsValid():
+                        visible_plate_count = sum(
+                            1
+                            for prim in Usd.PrimRange(rack_prim)
+                            if prim.GetName().startswith("Plate_")
+                            and UsdGeom.Imageable(prim).ComputeVisibility()
+                            != UsdGeom.Tokens.invisible
+                        )
+                    if not rack_prim.IsValid() or visible_plate_count == 0:
+                        if not (1 <= self._pending_plate_count <= 4):
+                            raise RuntimeError(
+                                "plate-rack arm command received without a "
+                                "successful plate spawn command (expected 81..84)"
+                            )
+                        self.get_logger().warning(
+                            "[PlateRack] payload missing before arm start; "
+                            f"respawning count={self._pending_plate_count}"
+                        )
+                        spawn_plate_rack(
+                            self.stage,
+                            plate_count=self._pending_plate_count,
+                        )
+                        if not follow_plate_rack_transport(self.stage):
+                            raise RuntimeError(
+                                "plate rack recovery spawn could not be placed "
+                                "on the left tray"
+                            )
+                        rack_prim = self.stage.GetPrimAtPath(
+                            "/World/ServingPlateRack"
+                        )
+                    self.get_logger().info(
+                        "[PlateRack] arm preflight passed "
+                        f"count={self._pending_plate_count} "
+                        f"root={rack_prim.GetPath()}"
+                    )
+                    named_tasks.append(
+                        ("plate_rack", PlateRackPickPlace(
+                            self.stage, wait_for_start=bool(named_tasks)
+                        ))
+                    )
                 if not named_tasks:
                     raise ValueError(f"arm command contains no delivery: {arm_command}")
                 task = CommandServingSequence(named_tasks)
@@ -2852,6 +3024,20 @@ class NavBridge(Node):
                 remove_parking_brake(self.stage)
                 self.arm_status_pub.publish(Int32(data=3))
 
+        if (
+            self._plate_rack_in_transport
+            and 'follow_plate_rack_transport' in globals()
+            and (
+                self._active_serving_task is None
+                or self._active_serving_task.current_name != "plate_rack"
+            )
+        ):
+            if not follow_plate_rack_transport(self.stage):
+                self.get_logger().error(
+                    "[plate-rack] transport follow failed during navigation"
+                )
+                self._plate_rack_in_transport = False
+
         if self._active_serving_task is not None:
             self._target_vx = self._target_wz = 0.0
             self._cmd_vx = self._cmd_wz = 0.0
@@ -2863,6 +3049,10 @@ class NavBridge(Node):
             )
             if not self._serving_paused:
                 self._active_serving_task.step(self.articulation)
+            if self._active_serving_task.current_name == "plate_rack":
+                # PlateRackPickPlace now owns tray-follow and switches the rack
+                # to dynamic collision after tray deployment.
+                self._plate_rack_in_transport = False
             if self._active_serving_task.failed:
                 self._active_serving_task.close()
                 self._active_serving_task = None
@@ -2874,6 +3064,7 @@ class NavBridge(Node):
                 self._active_serving_task.close()
                 self._active_serving_task = None
                 self._spawned_serving_tasks = {}
+                self._pending_plate_count = 0
                 self._arm_returning_to_stow = True
                 self._arm_stow_started_at = time.monotonic()
                 self._arm_stow_settle_count = 0
@@ -3155,6 +3346,7 @@ def main():
     stage = open_restaurant_and_robot()
     configure_joint_drives(stage)
     configure_wheel_contact_material(stage)
+    configure_gripper_contact_material(stage)
     articulation_path = find_articulation_path(stage)
     configure_physics_stability(stage, articulation_path)
     articulation, dof_names = initialize_robot(articulation_path)

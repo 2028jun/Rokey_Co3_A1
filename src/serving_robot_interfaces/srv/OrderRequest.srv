@@ -4,5 +4,6 @@ int32 pizza2_count
 int32 pizza3_count
 int32 drink_count
 int32 cutlery_count
+int32 plate_count
 ---
 bool success

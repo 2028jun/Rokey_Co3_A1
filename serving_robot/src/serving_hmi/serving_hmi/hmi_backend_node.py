@@ -390,7 +390,7 @@ class HMIBridgeNode(Node):
         if not self.manager_order_client.service_is_ready():
             return False, "Manager /manager/order service not ready"
 
-        pizza1, pizza2, pizza3, drink, cutlery = 0, 0, 0, 0, 0
+        pizza1, pizza2, pizza3, drink, cutlery, plate = 0, 0, 0, 0, 0, 0
         for item in items:
             menu_id = str(item.get("menu_id", "")).strip().lower()
             name = item.get("name", "").lower()
@@ -407,8 +407,11 @@ class HMIBridgeNode(Node):
                 drink += qty
             elif menu_id == "m5" or "cutlery" in name or "fork" in name or "spoon" in name:
                 cutlery += qty
+            elif (menu_id == "m6" or "plate rack" in name
+                  or "접시 트레이" in name or name == "접시"):
+                plate += qty
 
-        if not any((pizza1, pizza2, pizza3, drink, cutlery)):
+        if not any((pizza1, pizza2, pizza3, drink, cutlery, plate)):
             return False, "No supported menu items in order"
 
         hmi_table_number = int(table_num)
@@ -426,12 +429,13 @@ class HMIBridgeNode(Node):
         req.pizza3_count = pizza3
         req.drink_count = drink
         req.cutlery_count = cutlery
+        req.plate_count = plate
 
         print(
             "🚀 [HMI Backend] Sending OrderRequest to Manager: "
             f"HMI Table={hmi_table_number} -> route_id={manager_table_id}, "
             f"P1={pizza1}, P2={pizza2}, P3={pizza3}, "
-            f"Drink={drink}, Cutlery={cutlery}",
+            f"Drink={drink}, Cutlery={cutlery}, Plate={plate}",
             flush=True,
         )
         future = self.manager_order_client.call_async(req)
