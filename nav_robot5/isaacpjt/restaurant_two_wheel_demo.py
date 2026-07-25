@@ -23,7 +23,6 @@ ISAAC_SIM_ROOT = os.environ.get(
 _ros_bridge_lib = Path(ISAAC_SIM_ROOT) / "exts/isaacsim.ros2.bridge/humble/lib"
 os.environ.setdefault("ROS_DISTRO", "humble")
 os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
-os.environ["ROS_DOMAIN_ID"] = os.environ.get("ROS_DOMAIN_ID", "102")
 
 _ld_paths = [path for path in os.environ.get("LD_LIBRARY_PATH", "").split(":") if path]
 _python_paths = [
@@ -48,7 +47,6 @@ HEADLESS = os.environ.get("NAV_ROBOT5_HEADLESS", "0") == "1"
 simulation_app = SimulationApp({"headless": HEADLESS})
 
 import numpy as np
-import omni.graph.core as og
 import omni.kit.app
 import omni.kit.commands
 import omni.physx
@@ -94,8 +92,27 @@ if not ROBOT_USD.is_file():
     )
 ROBOT_ASSET_ROOT = "/two_wheel_ridgeback_serving_robot"
 
-SPAWN_POSITION = Gf.Vec3d(0.00, 5.25, 0.002)
-SPAWN_YAW = -math.pi / 2.0
+# Two serving robots share the kitchen nook widened in the restaurant USD
+# (BackWallLeft/Right doorway gap -1.8..1.8). Each robot gets its own prim
+# root, spawn slot, and ROS topic prefix; only robot1 publishes /clock.
+ROBOTS = [
+    {
+        "id": "robot1",
+        "root": "/World/NavRobot1",
+        "spawn_position": Gf.Vec3d(-0.90, 5.25, 0.002),
+        "spawn_yaw": -math.pi / 2.0,
+        "topic_prefix": "/robot1",
+        "publish_clock": True,
+    },
+    {
+        "id": "robot2",
+        "root": "/World/NavRobot2",
+        "spawn_position": Gf.Vec3d(0.90, 5.25, 0.002),
+        "spawn_yaw": -math.pi / 2.0,
+        "topic_prefix": "/robot2",
+        "publish_clock": False,
+    },
+]
 
 WHEEL_JOINTS = [
     "left_wheel_joint",
@@ -145,20 +162,27 @@ PRE_DOCK_POSITION_TOL = 0.030
 AXIS_CROSS_TRACK_GAIN = 0.60
 AXIS_CROSS_TRACK_MAX_CORRECTION = 0.12
 
-ROBOT_ROOT = "/World/NavRobot"
-ARTICULATION_CANDIDATES = [
-    f"{ROBOT_ROOT}/Robot/ridgeback_base_link",
-    f"{ROBOT_ROOT}/Robot",
-]
 BASE_LINK_NAME = "ridgeback_base_link"
-RAW_ODOM_TOPIC = "/two_wheel/odom_raw"
-RAW_SCAN_TOPIC = "/two_wheel/scan_raw"
-TELEPORT_TOPIC = "/two_wheel/teleport"
-MISSION_CMD_TOPIC = "/two_wheel/mission_command"
-MISSION_STATUS_TOPIC = "/two_wheel/mission_status"
-CMD_VEL_TOPIC = "/cmd_vel"
-DIRECT_CMD_VEL_TOPIC = "/two_wheel/direct_cmd_vel"
 EXTERNAL_CMD_TIMEOUT = 0.25
+
+
+def articulation_candidates(root: str) -> list[str]:
+    return [f"{root}/Robot/ridgeback_base_link", f"{root}/Robot"]
+
+
+def robot_topics(prefix: str) -> dict:
+    """Per-robot topic names. `prefix` (e.g. "/robot1") keeps each robot's raw
+    odom/scan/mission/cmd_vel channels distinct so both can coexist on one
+    ROS_DOMAIN_ID; `/clock` is shared and published once (see ROBOTS)."""
+    return {
+        "raw_odom": f"{prefix}/two_wheel/odom_raw",
+        "raw_scan": f"{prefix}/two_wheel/scan_raw",
+        "teleport": f"{prefix}/two_wheel/teleport",
+        "mission_cmd": f"{prefix}/two_wheel/mission_command",
+        "mission_status": f"{prefix}/two_wheel/mission_status",
+        "cmd_vel": f"{prefix}/cmd_vel",
+        "direct_cmd_vel": f"{prefix}/two_wheel/direct_cmd_vel",
+    }
 
 LIDAR_MIN_RANGE = 0.20
 LIDAR_MAX_RANGE = 12.0
@@ -205,34 +229,16 @@ def open_restaurant_and_robot():
         simulation_app.update()
 
     stage = context.get_stage()
-    spawn = UsdGeom.Xform.Define(stage, ROBOT_ROOT)
-    spawn.AddTranslateOp().Set(SPAWN_POSITION)
-    spawn.AddOrientOp().Set(yaw_to_quat(SPAWN_YAW))
-    robot = UsdGeom.Xform.Define(stage, f"{ROBOT_ROOT}/Robot")
-    robot.GetPrim().GetReferences().AddReference(
-        str(ROBOT_USD), Sdf.Path(ROBOT_ASSET_ROOT)
-    )
+    for robot_cfg in ROBOTS:
+        root = robot_cfg["root"]
+        spawn = UsdGeom.Xform.Define(stage, root)
+        spawn.AddTranslateOp().Set(robot_cfg["spawn_position"])
+        spawn.AddOrientOp().Set(yaw_to_quat(robot_cfg["spawn_yaw"]))
+        robot = UsdGeom.Xform.Define(stage, f"{root}/Robot")
+        robot.GetPrim().GetReferences().AddReference(
+            str(ROBOT_USD), Sdf.Path(ROBOT_ASSET_ROOT)
+        )
     return stage
-
-
-def create_clock_ros_graph():
-    keys = og.Controller.Keys
-    og.Controller.edit(
-        {"graph_path": f"{ROBOT_ROOT}/NavSensorsROS2", "evaluator_name": "execution"},
-        {
-            keys.CREATE_NODES: [
-                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
-                ("Context", "isaacsim.ros2.bridge.ROS2Context"),
-                ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
-                ("PublishClock", "isaacsim.ros2.bridge.ROS2PublishClock"),
-            ],
-            keys.CONNECT: [
-                ("OnPlaybackTick.outputs:tick", "PublishClock.inputs:execIn"),
-                ("Context.outputs:context", "PublishClock.inputs:context"),
-                ("ReadSimTime.outputs:simulationTime", "PublishClock.inputs:timeStamp"),
-            ],
-        },
-    )
 
 
 def configure_joint_drives(stage):
@@ -251,7 +257,7 @@ def configure_joint_drives(stage):
             drive.CreateTargetVelocityAttr(0.0)
 
 
-def configure_physics_stability(stage, articulation_path: str):
+def configure_physics_scene(stage):
     scene_prim = stage.GetPrimAtPath("/World/PhysicsScene")
     if not scene_prim.IsValid():
         raise RuntimeError("restaurant PhysicsScene is missing")
@@ -261,6 +267,8 @@ def configure_physics_stability(stage, articulation_path: str):
     physx_scene.CreateBroadphaseTypeAttr("MBP")
     physx_scene.CreateTimeStepsPerSecondAttr(120)
 
+
+def configure_articulation_physics(stage, articulation_path: str):
     articulation_api = PhysxSchema.PhysxArticulationAPI.Apply(
         stage.GetPrimAtPath(articulation_path)
     )
@@ -270,7 +278,7 @@ def configure_physics_stability(stage, articulation_path: str):
     articulation_api.CreateSleepThresholdAttr(0.05)
 
 
-def configure_wheel_contact_material(stage):
+def create_contact_materials(stage):
     tire = UsdShade.Material.Define(stage, "/World/PhysicsMaterials/Nav5Tire")
     tire_api = UsdPhysics.MaterialAPI.Apply(tire.GetPrim())
     tire_api.CreateStaticFrictionAttr(TIRE_STATIC_FRICTION)
@@ -288,7 +296,10 @@ def configure_wheel_contact_material(stage):
     PhysxSchema.PhysxMaterialAPI.Apply(
         caster.GetPrim()
     ).CreateFrictionCombineModeAttr("min")
+    return tire, caster
 
+
+def bind_wheel_contact_material(stage, robot_root: str, tire, caster, robot_id: str):
     link_materials = {
         "left_wheel_link": tire,
         "right_wheel_link": tire,
@@ -301,7 +312,7 @@ def configure_wheel_contact_material(stage):
         if (
             prim.GetName() == "collisions"
             and parent_name in link_materials
-            and str(prim.GetPath()).startswith(ROBOT_ROOT)
+            and str(prim.GetPath()).startswith(robot_root)
         ):
             UsdShade.MaterialBindingAPI.Apply(prim).Bind(
                 link_materials[parent_name],
@@ -311,29 +322,26 @@ def configure_wheel_contact_material(stage):
             bound[parent_name] += 1
     missing = [name for name, count in bound.items() if count != 1]
     if missing:
-        raise RuntimeError(f"wheel/caster collision material binding failed: {bound}")
-    print(f"[nav_robot5] contact materials ready: {bound}", flush=True)
+        raise RuntimeError(
+            f"[{robot_id}] wheel/caster collision material binding failed: {bound}"
+        )
+    print(f"[nav_robot5] {robot_id} contact materials ready: {bound}", flush=True)
 
 
-def find_articulation_path(stage) -> str:
-    for path in ARTICULATION_CANDIDATES:
+def find_articulation_path(stage, robot_root: str) -> str:
+    for path in articulation_candidates(robot_root):
         if stage.GetPrimAtPath(path).IsValid():
             return path
     for prim in stage.Traverse():
         path = str(prim.GetPath())
-        if path.startswith(ROBOT_ROOT) and prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+        if path.startswith(robot_root) and prim.HasAPI(UsdPhysics.ArticulationRootAPI):
             return path
-    raise RuntimeError("could not find robot articulation prim")
+    raise RuntimeError(f"could not find robot articulation prim under {robot_root}")
 
 
-def initialize_robot(articulation_path: str):
-    timeline = omni.timeline.get_timeline_interface()
-    timeline.play()
-    for _ in range(5):
-        simulation_app.update()
-
+def initialize_robot(articulation_path: str, robot_id: str):
     articulation = SingleArticulation(
-        prim_path=articulation_path, name="nav_ridgeback"
+        prim_path=articulation_path, name=f"nav_ridgeback_{robot_id}"
     )
     articulation.initialize()
     if not articulation.handles_initialized:
@@ -401,8 +409,20 @@ def build_stages_from_points(points: list[dict], current_x: float, current_y: fl
 
 
 class DiffNavBridge(Node):
-    def __init__(self, articulation, dof_names):
-        super().__init__("nav_robot_isaac_bridge")
+    def __init__(
+        self,
+        articulation,
+        dof_names,
+        robot_id: str,
+        robot_root: str,
+        topic_prefix: str,
+        publish_clock: bool,
+    ):
+        super().__init__(f"nav_robot_isaac_bridge_{robot_id}")
+        self.robot_id = robot_id
+        self.robot_root = robot_root
+        self.publish_clock = publish_clock
+        topics = robot_topics(topic_prefix)
         self.articulation = articulation
         self.dof_names = dof_names
         self.wheel_indices = np.asarray(
@@ -450,13 +470,13 @@ class DiffNavBridge(Node):
         )
 
         self.create_subscription(
-            StringMsg, MISSION_CMD_TOPIC, self._on_mission_command, stage_qos
+            StringMsg, topics["mission_cmd"], self._on_mission_command, stage_qos
         )
         self.create_subscription(
-            Twist, CMD_VEL_TOPIC, self._on_cmd_vel, stage_qos
+            Twist, topics["cmd_vel"], self._on_cmd_vel, stage_qos
         )
         self.create_subscription(
-            Twist, DIRECT_CMD_VEL_TOPIC, self._on_direct_cmd_vel, stage_qos
+            Twist, topics["direct_cmd_vel"], self._on_direct_cmd_vel, stage_qos
         )
 
         qos = QoSProfile(
@@ -465,13 +485,13 @@ class DiffNavBridge(Node):
             history=HistoryPolicy.KEEP_LAST,
         )
         self.create_subscription(
-            PoseStamped, TELEPORT_TOPIC, self._on_teleport, qos
+            PoseStamped, topics["teleport"], self._on_teleport, qos
         )
 
-        self.odom_pub = self.create_publisher(Odometry, RAW_ODOM_TOPIC, qos)
-        self.scan_pub = self.create_publisher(LaserScan, RAW_SCAN_TOPIC, 10)
-        self.clock_pub = self.create_publisher(Clock, "/clock", qos)
-        self.mission_status_pub = self.create_publisher(StringMsg, MISSION_STATUS_TOPIC, stage_qos)
+        self.odom_pub = self.create_publisher(Odometry, topics["raw_odom"], qos)
+        self.scan_pub = self.create_publisher(LaserScan, topics["raw_scan"], 10)
+        self.clock_pub = self.create_publisher(Clock, "/clock", qos) if publish_clock else None
+        self.mission_status_pub = self.create_publisher(StringMsg, topics["mission_status"], stage_qos)
 
     # ROS Callback: Thread-safe Push ONLY (NO articulation calls!)
     def _on_mission_command(self, msg: StringMsg):
@@ -1240,7 +1260,7 @@ class DiffNavBridge(Node):
             direction = (math.cos(world_angle), math.sin(world_angle), 0.0)
             hit = query.raycast_closest(origin, direction, LIDAR_MAX_RANGE)
             rigid_body = str(hit.get("rigidBody", "")) if hit["hit"] else ""
-            if hit["hit"] and not rigid_body.startswith(ROBOT_ROOT):
+            if hit["hit"] and not rigid_body.startswith(self.robot_root):
                 distance = float(hit["distance"])
             else:
                 distance = math.inf
@@ -1324,9 +1344,10 @@ class DiffNavBridge(Node):
         sec = int(sim_time_sec)
         nanosec = int((sim_time_sec - sec) * 1e9)
         stamp = RosTime(sec=sec, nanosec=nanosec)
-        clock = Clock()
-        clock.clock = stamp
-        self.clock_pub.publish(clock)
+        if self.publish_clock:
+            clock = Clock()
+            clock.clock = stamp
+            self.clock_pub.publish(clock)
         self._publish_scan(stamp, sim_time_sec, x, y, yaw)
 
         odom = Odometry()
@@ -1349,31 +1370,61 @@ class DiffNavBridge(Node):
 def main():
     stage = open_restaurant_and_robot()
     configure_joint_drives(stage)
-    configure_wheel_contact_material(stage)
-    articulation_path = find_articulation_path(stage)
-    configure_physics_stability(stage, articulation_path)
-    articulation, dof_names = initialize_robot(articulation_path)
+    configure_physics_scene(stage)
+    tire, caster = create_contact_materials(stage)
 
-    print(f"[nav_robot5] PhysX raycast {RAW_SCAN_TOPIC} ready", flush=True)
+    # All schema-level PhysX config (articulation solver/stabilization
+    # settings, contact materials) must be applied to BOTH robots before the
+    # timeline starts, exactly like the original single-robot script did --
+    # starting physics first and configuring articulation stability after
+    # left the not-yet-configured robot(s) running with default solver
+    # settings for several ticks, which was enough to send them falling
+    # through the floor (observed as runaway z in raw odom).
+    articulation_paths = {}
+    for robot_cfg in ROBOTS:
+        robot_id = robot_cfg["id"]
+        root = robot_cfg["root"]
+        articulation_path = find_articulation_path(stage, root)
+        bind_wheel_contact_material(stage, root, tire, caster, robot_id)
+        configure_articulation_physics(stage, articulation_path)
+        articulation_paths[robot_id] = articulation_path
+
+    timeline = omni.timeline.get_timeline_interface()
+    timeline.play()
+    for _ in range(5):
+        simulation_app.update()
 
     if not rclpy.ok():
         rclpy.init(args=[])
-    bridge = DiffNavBridge(articulation, dof_names)
+
+    bridges = []
+    for robot_cfg in ROBOTS:
+        robot_id = robot_cfg["id"]
+        root = robot_cfg["root"]
+        articulation_path = articulation_paths[robot_id]
+        articulation, dof_names = initialize_robot(articulation_path, robot_id)
+        bridge = DiffNavBridge(
+            articulation,
+            dof_names,
+            robot_id=robot_id,
+            robot_root=root,
+            topic_prefix=robot_cfg["topic_prefix"],
+            publish_clock=robot_cfg["publish_clock"],
+        )
+        bridges.append(bridge)
+        print(
+            f"[nav_robot5] {robot_id} bridge running; topics={robot_cfg['topic_prefix']} "
+            f"spawn=({robot_cfg['spawn_position'][0]:.2f},{robot_cfg['spawn_position'][1]:.2f})",
+            flush=True,
+        )
+
     executor = SingleThreadedExecutor()
-    executor.add_node(bridge)
+    for bridge in bridges:
+        executor.add_node(bridge)
     spin_thread = threading.Thread(target=executor.spin, name="nav_ros_spin", daemon=True)
     spin_thread.start()
 
-    timeline = omni.timeline.get_timeline_interface()
-    if not timeline.is_playing():
-        timeline.play()
-
-    print(
-        f"[nav_robot5] 2-wheel bridge running; "
-        f"Domain={os.environ['ROS_DOMAIN_ID']} "
-        f"spawn=({SPAWN_POSITION[0]:.2f},{SPAWN_POSITION[1]:.2f})",
-        flush=True,
-    )
+    print(f"[nav_robot5] 2-wheel bridge running; Domain={os.environ.get('ROS_DOMAIN_ID', '0')}", flush=True)
 
     sim_time = 0.0
     sim_dt = 1.0 / 60.0
@@ -1381,10 +1432,12 @@ def main():
         while simulation_app.is_running():
             simulation_app.update()
             sim_time += sim_dt
-            bridge.tick(sim_time)
+            for bridge in bridges:
+                bridge.tick(sim_time)
     finally:
         executor.shutdown()
-        bridge.destroy_node()
+        for bridge in bridges:
+            bridge.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
         simulation_app.close()

@@ -10,6 +10,7 @@ __pycache__/
 # Downloaded/source asset packs that are too large or reproducible.
 assets/nvidia_restaurant/
 assets/kenney_furniture/
+assets/Lightwheel_Kitchen/
 external/
 
 # A collected Isaac scene is 200+ MB. Required runtime subsets are force-added

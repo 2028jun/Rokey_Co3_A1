@@ -26,14 +26,31 @@ def Xform "World"
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 
+        def Cube "KitchenFloorPatch" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            # Main Floor only spans y in [-5, 5]. The two robots' kitchen
+            # wait/spawn poses sit at y=4.90..5.25, just past that edge --
+            # normally the (unresolved/missing in this checkout) Lightwheel
+            # Kitchen asset would provide floor collision there. This patch
+            # covers that gap directly so robots don't fall through the
+            # world at their kitchen dock/spawn position.
+            color3f[] primvars:displayColor = [(0.32, 0.34, 0.38)]
+            double size = 1
+            float3 xformOp:scale = (5.0, 1.8, 0.12)
+            double3 xformOp:translate = (0, 5.6, -0.06)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
         def Cube "BackWallLeft" (
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
             color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
             double size = 1
-            float3 xformOp:scale = (4.8, 0.16, 2.8)
-            double3 xformOp:translate = (-3.6, 5, 1.4)
+            float3 xformOp:scale = (4.2, 0.16, 2.8)
+            double3 xformOp:translate = (-3.9, 5, 1.4)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 
@@ -43,8 +60,8 @@ def Xform "World"
         {
             color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
             double size = 1
-            float3 xformOp:scale = (4.8, 0.16, 2.8)
-            double3 xformOp:translate = (3.6, 5, 1.4)
+            float3 xformOp:scale = (4.2, 0.16, 2.8)
+            double3 xformOp:translate = (3.9, 5, 1.4)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 

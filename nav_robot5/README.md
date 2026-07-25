@@ -1,7 +1,8 @@
 # nav_robot5 — 2륜 Ridgeback 레일 주행
 
 **고정 레일(`routes.yaml`)** + 2륜 직접 추종 + **횡오차(CTE)** 검증.
-저장소 루트에서 `source tools/aliases.sh` 후 `t1` / `t2` / `t3` 사용 (`ROS_DOMAIN_ID=102`).
+`~/.bashrc`에 설정된 머신별 `ROS_DOMAIN_ID`를 그대로 사용합니다 (저장소 코드에서 강제하지 않음).
+저장소 루트에서 `source tools/aliases.sh` 후 `t1` / `t2r` / `t3r` 사용.
 
 ## 1회 준비
 

@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<robot name="nav5_two_wheel_robot1">
+  <material name="nav5_blue"><color rgba="0.10 0.35 0.75 1.0"/></material>
+  <material name="nav5_dark"><color rgba="0.08 0.08 0.08 1.0"/></material>
+
+  <link name="ridgeback_base_link">
+    <visual>
+      <origin xyz="0 0 0.23" rpy="0 0 0"/>
+      <geometry><box size="0.84 0.70 0.36"/></geometry>
+      <material name="nav5_blue"/>
+    </visual>
+  </link>
+
+  <link name="left_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry><cylinder radius="0.10" length="0.07"/></geometry>
+      <material name="nav5_dark"/>
+    </visual>
+  </link>
+  <joint name="left_wheel_visual_joint" type="fixed">
+    <parent link="ridgeback_base_link"/>
+    <child link="left_wheel_link"/>
+    <origin xyz="0 0.315 0.10" rpy="0 0 0"/>
+  </joint>
+
+  <link name="right_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry><cylinder radius="0.10" length="0.07"/></geometry>
+      <material name="nav5_dark"/>
+    </visual>
+  </link>
+  <joint name="right_wheel_visual_joint" type="fixed">
+    <parent link="ridgeback_base_link"/>
+    <child link="right_wheel_link"/>
+    <origin xyz="0 -0.315 0.10" rpy="0 0 0"/>
+  </joint>
+
+  <link name="nav_lidar_link">
+    <visual>
+      <geometry><cylinder radius="0.06" length="0.08"/></geometry>
+      <material name="nav5_dark"/>
+    </visual>
+  </link>
+  <joint name="nav_lidar_fixed_joint" type="fixed">
+    <parent link="ridgeback_base_link"/>
+    <child link="nav_lidar_link"/>
+    <origin xyz="0.48 0 0.45" rpy="0 0 0"/>
+  </joint>
+</robot>

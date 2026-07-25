@@ -58,10 +58,12 @@ class RailNavigator:
         nav: BasicNavigator,
         tf_buffer,
         tracker: AmclPoseTracker,
+        base_link_frame: str = "ridgeback_base_link",
     ) -> None:
         self._nav = nav
         self._tf = tf_buffer
         self._tracker = tracker
+        self._base_link_frame = base_link_frame
         self._cfg = _load_rail_check()
         self._max_lat = float(self._cfg.get("max_lateral_error_m", 0.28))
         self._max_lat_dock = float(self._cfg.get("max_lateral_error_dock_m", 0.35))
@@ -81,10 +83,13 @@ class RailNavigator:
         self._spin_time = int(self._cfg.get("spin_time_allowance_sec", 30))
         self._spin_attempts = int(self._cfg.get("max_spin_attempts", 3))
         self._raw_pose: tuple[float, float, float] | None = None
+        # Relative topic names: namespace push-down (ros2 run ... --ros-args
+        # -r __ns:=/<robot_id>) resolves these to /<robot_id>/... to match
+        # the Isaac bridge's per-robot topics.
         self._raw_pose_sub = nav.create_subscription(
-            Odometry, "/two_wheel/odom_raw", self._on_raw_odom, 20
+            Odometry, "two_wheel/odom_raw", self._on_raw_odom, 20
         )
-        self._drive_pub = nav.create_publisher(Twist, "/cmd_vel", 10)
+        self._drive_pub = nav.create_publisher(Twist, "cmd_vel", 10)
 
     def _on_raw_odom(self, msg: Odometry) -> None:
         p = msg.pose.pose.position
@@ -100,72 +105,6 @@ class RailNavigator:
         for _ in range(8):
             self._drive_pub.publish(stop)
             rclpy.spin_once(self._nav, timeout_sec=0.03)
-
-    def _drive_waypoint(
-        self,
-        dest: Pose3,
-        leg: RailPolyline,
-        label: str,
-        max_lat: float,
-    ) -> bool:
-        """Forward-only differential-drive controller for the fixed rails."""
-        self._nav.cancelTask()
-        self._nav.result_future = None
-        target_x, target_y, _ = dest
-        start = time.monotonic()
-        last_log = start
-        max_cte = 0.0
-        timeout_sec = 15.0
-        if self._raw_pose is not None:
-            timeout_sec += math.hypot(
-                target_x - self._raw_pose[0], target_y - self._raw_pose[1]
-            ) / 0.10
-
-        while time.monotonic() - start < timeout_sec:
-            rclpy.spin_once(self._nav, timeout_sec=0.02)
-            pose = self._raw_pose
-            if pose is None:
-                time.sleep(0.05)
-                continue
-            x, y, yaw = pose
-            dx, dy = target_x - x, target_y - y
-            distance = math.hypot(dx, dy)
-            if distance <= 0.12:
-                self._stop_drive()
-                print(f"[{label}] WP OK pose=({x:.2f},{y:.2f})", flush=True)
-                return True
-
-            target_heading = math.atan2(dy, dx)
-            heading_error = normalize_angle(target_heading - yaw)
-            cmd = Twist()
-            cmd.angular.z = max(-0.50, min(0.50, 1.25 * heading_error))
-            if abs(heading_error) < 0.55:
-                speed = max(0.07, min(0.22, 0.55 * distance))
-                cmd.linear.x = speed * max(0.25, math.cos(heading_error))
-            self._drive_pub.publish(cmd)
-
-            cte = leg.cross_track_m(x, y)
-            max_cte = max(max_cte, cte)
-            now = time.monotonic()
-            if now - last_log >= self._log_period:
-                print(
-                    f"[{label}] pose=({x:.2f},{y:.2f}) dist={distance:.2f} "
-                    f"yaw_err={math.degrees(heading_error):.1f}° cte={cte:.2f}",
-                    flush=True,
-                )
-                last_log = now
-            if now - start > self._cte_grace and cte > max_lat + 0.12:
-                self._stop_drive()
-                print(
-                    f"[{label}] 레일 이탈 cte={cte:.2f} > {max_lat + 0.12:.2f}",
-                    flush=True,
-                )
-                return False
-            time.sleep(0.03)
-
-        self._stop_drive()
-        print(f"[{label}] WP timeout", flush=True)
-        return False
 
     def reverse_parking_exit(self, routes_data: dict, table_id: int) -> bool:
         """전방 주차 후 /cmd_vel 직선 후진으로 복도(x≈0) 진입 (Nav2 유턴 금지)."""
@@ -197,6 +136,7 @@ class RailNavigator:
                 self._tracker,
                 distance_m=backup_m,
                 speed_mps=self._backup_speed,
+                base_link_frame=self._base_link_frame,
             )
             print(
                 f"[park_out] open-loop 후진 traveled≈{traveled:.2f} m "
@@ -219,7 +159,7 @@ class RailNavigator:
             ):
                 ok = self._wait_simple_action("park_out")
 
-        xy = resolve_map_xy(self._nav, self._tf, self._tracker)
+        xy = resolve_map_xy(self._nav, self._tf, self._tracker, self._base_link_frame)
         if xy is None:
             print("[park_out] pose 없음 — 복귀 중단 (유턴 방지)", flush=True)
             return False
@@ -260,7 +200,7 @@ class RailNavigator:
         label = label or route_key
         poses = prune_poses(
             route_poses(routes_data, route_key),
-            resolve_map_xy(self._nav, self._tf, self._tracker),
+            resolve_map_xy(self._nav, self._tf, self._tracker, self._base_link_frame),
         )
         if not poses:
             return False
@@ -268,7 +208,7 @@ class RailNavigator:
             f"[{label}] 레일 {len(poses)} wp, Nav2 추종 "
             f"(복도 spine 일괄) + 구간별 횡오차 검사"
         )
-        prev_xy = resolve_map_xy(self._nav, self._tf, self._tracker)
+        prev_xy = resolve_map_xy(self._nav, self._tf, self._tracker, self._base_link_frame)
         if prev_xy is None:
             sp = routes_data.get("spawn") or routes_data.get("kitchen") or {}
             prev_xy = (float(sp.get("x", 0.0)), float(sp.get("y", 0.0)))
@@ -312,17 +252,10 @@ class RailNavigator:
         at_dock: bool = False,
     ) -> bool:
         ys = ", ".join(f"{d[1]:.2f}" for d in dests)
-        print(f"[{label}] 2륜 직접추종 {len(dests)} wp (y: {ys})")
-        ok = True
-        previous = self._raw_pose[:2] if self._raw_pose else leg.points[0]
-        for index, dest in enumerate(dests, 1):
-            waypoint_leg = RailPolyline(
-                f"{label}_{index}", (previous, (dest[0], dest[1]))
-            )
-            if not self._drive_waypoint(dest, waypoint_leg, f"{label}_{index}", max_lat):
-                ok = False
-                break
-            previous = (dest[0], dest[1])
+        print(f"[{label}] Nav2 goThroughPoses {len(dests)} wp (y: {ys})")
+        poses = [make_pose(self._nav, x, y, yaw) for x, y, yaw in dests]
+        self._nav.goThroughPoses(poses)
+        ok = self._wait_nav_cte(leg, label, max_lat, dest=dests[-1])
         if ok and at_dock:
             ok = self._align_yaw_at_dock(dests[-1][2], label)
         return ok
@@ -336,8 +269,10 @@ class RailNavigator:
         at_dock: bool,
     ) -> bool:
         max_lat = self._leg_max_lat(leg, at_dock=at_dock)
-        print(f"[{label}] 2륜 직접추종 → ({dest[0]:.2f}, {dest[1]:.2f})")
-        ok = self._drive_waypoint(dest, leg, label, max_lat)
+        print(f"[{label}] Nav2 goToPose → ({dest[0]:.2f}, {dest[1]:.2f})")
+        pose = make_pose(self._nav, dest[0], dest[1], dest[2])
+        self._nav.goToPose(pose)
+        ok = self._wait_nav_cte(leg, label, max_lat, dest=dest)
         if ok and at_dock:
             ok = self._align_yaw_at_dock(dest[2], label)
         return ok
@@ -391,7 +326,7 @@ class RailNavigator:
                 self._nav.cancelTask()
                 return False
 
-            xy = resolve_map_xy(self._nav, self._tf, self._tracker)
+            xy = resolve_map_xy(self._nav, self._tf, self._tracker, self._base_link_frame)
             if xy is not None and now - t0 >= self._cte_grace:
                 cte = leg.cross_track_m(xy[0], xy[1])
                 max_cte = max(max_cte, cte)
@@ -414,10 +349,10 @@ class RailNavigator:
             time.sleep(0.1)
 
         ok = self._nav.getResult() == TaskResult.SUCCEEDED
-        xy = resolve_map_xy(self._nav, self._tf, self._tracker)
+        xy = resolve_map_xy(self._nav, self._tf, self._tracker, self._base_link_frame)
         if xy:
             err = math.hypot(xy[0] - dest[0], xy[1] - dest[1])
-            yaw_now = resolve_map_yaw(self._nav, self._tf, self._tracker)
+            yaw_now = resolve_map_yaw(self._nav, self._tf, self._tracker, self._base_link_frame)
             yaw_err_s = ""
             if yaw_now is not None:
                 yaw_err_s = f" yaw_err={math.degrees(normalize_angle(dest[2] - yaw_now)):.1f}°"

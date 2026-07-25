@@ -16,8 +16,12 @@ from rclpy.time import Time
 from std_srvs.srv import Empty
 from tf2_ros import Buffer, TransformListener
 
-TELEPORT_TOPIC = "/two_wheel/teleport"
-DIRECT_CMD_VEL_TOPIC = "/two_wheel/direct_cmd_vel"
+# Relative (no leading slash): namespace push-down (ros2 run ... --ros-args
+# -r __ns:=/<robot_id>) prefixes these to match the Isaac bridge's per-robot
+# topics (see restaurant_two_wheel_demo.py robot_topics()).
+TELEPORT_TOPIC = "two_wheel/teleport"
+DIRECT_CMD_VEL_TOPIC = "two_wheel/direct_cmd_vel"
+DEFAULT_BASE_LINK_FRAME = "ridgeback_base_link"
 
 AMCL_POSE_QOS = QoSProfile(
     depth=10,
@@ -55,7 +59,7 @@ class AmclPoseTracker:
         self._xy: tuple[float, float] | None = None
         self._yaw: float | None = None
         self._sub = nav.create_subscription(
-            PoseWithCovarianceStamped, "/amcl_pose", self._on_amcl, AMCL_POSE_QOS
+            PoseWithCovarianceStamped, "amcl_pose", self._on_amcl, AMCL_POSE_QOS
         )
 
     def _on_amcl(self, msg: PoseWithCovarianceStamped) -> None:
@@ -86,7 +90,9 @@ def normalize_angle(rad: float) -> float:
 
 
 def lookup_map_yaw(
-    tf_buffer: Buffer, nav: BasicNavigator | None = None
+    tf_buffer: Buffer,
+    nav: BasicNavigator | None = None,
+    base_link_frame: str = DEFAULT_BASE_LINK_FRAME,
 ) -> float | None:
     stamps = []
     if nav is not None:
@@ -96,7 +102,7 @@ def lookup_map_yaw(
     for stamp in stamps:
         try:
             tf = tf_buffer.lookup_transform(
-                "map", "ridgeback_base_link", stamp, timeout=Duration(seconds=0.5)
+                "map", base_link_frame, stamp, timeout=Duration(seconds=0.5)
             )
             q = tf.transform.rotation
             return _quat_yaw(q.x, q.y, q.z, q.w)
@@ -109,15 +115,18 @@ def resolve_map_yaw(
     nav: BasicNavigator,
     tf_buffer: Buffer,
     tracker: AmclPoseTracker | None,
+    base_link_frame: str = DEFAULT_BASE_LINK_FRAME,
 ) -> float | None:
-    yaw = lookup_map_yaw(tf_buffer, nav)
+    yaw = lookup_map_yaw(tf_buffer, nav, base_link_frame)
     if yaw is not None:
         return yaw
     return tracker.yaw if tracker else None
 
 
 def lookup_map_xy(
-    tf_buffer: Buffer, nav: BasicNavigator | None = None
+    tf_buffer: Buffer,
+    nav: BasicNavigator | None = None,
+    base_link_frame: str = DEFAULT_BASE_LINK_FRAME,
 ) -> tuple[float, float] | None:
     stamps = []
     if nav is not None:
@@ -127,7 +136,7 @@ def lookup_map_xy(
     for stamp in stamps:
         try:
             tf = tf_buffer.lookup_transform(
-                "map", "ridgeback_base_link", stamp, timeout=Duration(seconds=0.5)
+                "map", base_link_frame, stamp, timeout=Duration(seconds=0.5)
             )
             return float(tf.transform.translation.x), float(tf.transform.translation.y)
         except Exception:
@@ -139,8 +148,9 @@ def resolve_map_xy(
     nav: BasicNavigator,
     tf_buffer: Buffer,
     tracker: AmclPoseTracker | None,
+    base_link_frame: str = DEFAULT_BASE_LINK_FRAME,
 ) -> tuple[float, float] | None:
-    xy = lookup_map_xy(tf_buffer, nav)
+    xy = lookup_map_xy(tf_buffer, nav, base_link_frame)
     return xy if xy is not None else (tracker.xy if tracker else None)
 
 
@@ -159,12 +169,13 @@ def wait_for_existing_localization(
     tf_buffer: Buffer,
     tracker: AmclPoseTracker,
     timeout_sec: float = 8.0,
+    base_link_frame: str = DEFAULT_BASE_LINK_FRAME,
 ) -> tuple[float, float, float] | None:
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
         _safe_spin_once(nav, timeout_sec=0.1)
-        xy = resolve_map_xy(nav, tf_buffer, tracker)
-        yaw = resolve_map_yaw(nav, tf_buffer, tracker)
+        xy = resolve_map_xy(nav, tf_buffer, tracker, base_link_frame)
+        yaw = resolve_map_yaw(nav, tf_buffer, tracker, base_link_frame)
         if xy is not None and yaw is not None:
             print(f"[localization] using current pose ({xy[0]:.2f}, {xy[1]:.2f}, {math.degrees(yaw):.1f}deg)", flush=True)
             return (xy[0], xy[1], yaw)
@@ -221,7 +232,7 @@ def teleport_to_spawn(nav: BasicNavigator, x: float, y: float, yaw: float) -> No
 
 
 def reinitialize_amcl(nav: BasicNavigator) -> None:
-    client = nav.create_client(Empty, "/reinitialize_global_localization")
+    client = nav.create_client(Empty, "reinitialize_global_localization")
     if not client.wait_for_service(timeout_sec=2.0):
         return
     future = client.call_async(Empty.Request())
@@ -239,6 +250,7 @@ def sync_spawn(
     x: float,
     y: float,
     yaw: float,
+    base_link_frame: str = DEFAULT_BASE_LINK_FRAME,
 ) -> bool:
     print(f"[sync] Isaac 텔레포트 + AMCL → ({x:.2f}, {y:.2f})")
     teleport_to_spawn(nav, x, y, yaw)
@@ -248,7 +260,7 @@ def sync_spawn(
     deadline = time.monotonic() + 40.0
     while time.monotonic() < deadline:
         _safe_spin_once(nav, timeout_sec=0.1)
-        xy = resolve_map_xy(nav, tf_buffer, tracker)
+        xy = resolve_map_xy(nav, tf_buffer, tracker, base_link_frame)
         if xy and math.hypot(xy[0] - x, xy[1] - y) < 0.65:
             print(f"[sync] OK ({xy[0]:.2f}, {xy[1]:.2f})")
             return True
@@ -263,6 +275,7 @@ def reverse_open_loop(
     distance_m: float,
     speed_mps: float,
     timeout_extra_sec: float = 10.0,
+    base_link_frame: str = DEFAULT_BASE_LINK_FRAME,
 ) -> tuple[bool, float]:
     """로봇 전방축 기준 직선 후진(linear.x<0)."""
     nav.cancelTask()
@@ -271,7 +284,7 @@ def reverse_open_loop(
 
     speed_mps = abs(float(speed_mps))
     distance_m = max(0.1, float(distance_m))
-    xy0 = resolve_map_xy(nav, tf_buffer, tracker)
+    xy0 = resolve_map_xy(nav, tf_buffer, tracker, base_link_frame)
     if xy0 is None:
         xy0 = (0.0, 0.0)
 
@@ -285,7 +298,7 @@ def reverse_open_loop(
     deadline = time.monotonic() + distance_m / speed_mps + timeout_extra_sec
     traveled = 0.0
     while time.monotonic() < deadline:
-        xy = resolve_map_xy(nav, tf_buffer, tracker)
+        xy = resolve_map_xy(nav, tf_buffer, tracker, base_link_frame)
         if xy is not None:
             traveled = math.hypot(xy[0] - xy0[0], xy[1] - xy0[1])
             if traveled >= distance_m * 0.92:

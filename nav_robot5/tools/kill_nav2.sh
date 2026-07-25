@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-102}"
 source /opt/ros/humble/setup.bash 2>/dev/null || true
 
 for pattern in \
