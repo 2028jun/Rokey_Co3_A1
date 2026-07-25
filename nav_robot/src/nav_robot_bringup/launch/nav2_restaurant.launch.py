@@ -17,7 +17,6 @@ from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
     OpaqueFunction,
-    SetEnvironmentVariable,
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
@@ -91,9 +90,6 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
-            SetEnvironmentVariable(
-                "ROS_DOMAIN_ID", os.environ.get("ROS_DOMAIN_ID", "102")
-            ),
             DeclareLaunchArgument("use_sim_time", default_value="true"),
             DeclareLaunchArgument("map", default_value=str(default_map)),
             DeclareLaunchArgument("autostart", default_value="true"),

@@ -21,7 +21,6 @@ _ros_bridge_lib = Path(
 if os.environ.get("MOBILE_DEMO_ROS_CAMERA", "1") == "1":
     os.environ.setdefault("ROS_DISTRO", "humble")
     os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
-    os.environ.setdefault("ROS_DOMAIN_ID", "102")
     _ld_paths = [path for path in os.environ.get("LD_LIBRARY_PATH", "").split(":") if path]
     _python_paths = [
         path

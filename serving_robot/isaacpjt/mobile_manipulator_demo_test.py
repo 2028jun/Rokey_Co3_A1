@@ -24,7 +24,6 @@ if (
 ):
     os.environ.setdefault("ROS_DISTRO", "humble")
     os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
-    os.environ.setdefault("ROS_DOMAIN_ID", "102")
     _ld_paths = [path for path in os.environ.get("LD_LIBRARY_PATH", "").split(":") if path]
     _python_paths = [
         path

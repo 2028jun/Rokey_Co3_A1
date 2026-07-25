@@ -74,7 +74,6 @@ Nav2 + Isaac이 떠 있는 상태에서:
 ```bash
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-export ROS_DOMAIN_ID=102
 rviz2
 ```
 
@@ -119,7 +118,6 @@ python3 tools/generate_placeholder_map.py
 ## Nav2에서 로드
 
 ```bash
-export ROS_DOMAIN_ID=102
 ros2 launch nav_robot_bringup nav2_restaurant.launch.py \
   map:=$PWD/maps/restaurant/map.yaml
 ```

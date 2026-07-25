@@ -7,7 +7,7 @@
 - Active branch at handoff: `woduq`
 - Isaac Sim: `5.1.0-rc.19` (metadata `5.1.0`)
 - ROS: ROS 2 Humble, Ubuntu Jammy
-- DDS domain: `ROS_DOMAIN_ID=102`
+- DDS domain: machine-local `ROS_DOMAIN_ID` from `~/.bashrc`
 - Robot: Ridgeback R100 + two food shelves + Doosan M0609 + fixed RG2 model
 - Restaurant: lightweight hall joined to the Lightwheel kitchen
 
@@ -64,7 +64,7 @@ normal placement point about `0.5–0.65 m` from the arm base.
 - The fixed view sees most of the tabletop and customer approach area. The M0609
   still masks a small right-edge region; use the wrist camera as the complementary view.
 
-ROS topics verified on domain 102:
+ROS topics must be verified on the machine-local domain:
 
 ```text
 /serving_robot/table_camera/color/image_raw
@@ -81,8 +81,6 @@ and saved successfully at 640x480.
 cd /home/rokey/cobot3_ws
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-export ROS_DOMAIN_ID=102
-
 /home/rokey/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/python.sh \
   isaacpjt/mobile_manipulator_demo.py --/log/level=error
 ```
@@ -96,7 +94,6 @@ Verify from another terminal:
 ```bash
 source /opt/ros/humble/setup.bash
 source /home/rokey/cobot3_ws/install/setup.bash
-export ROS_DOMAIN_ID=102
 ros2 topic list | grep /serving_robot/table_camera
 python3 /home/rokey/cobot3_ws/isaacpjt/capture_table_camera.py
 ```

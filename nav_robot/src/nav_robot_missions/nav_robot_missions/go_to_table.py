@@ -45,7 +45,6 @@ def main(argv=None) -> int:
 
 def _retired_main(argv=None) -> int:
     """Former standalone rail mission, retained only for source history."""
-    os.environ.setdefault("ROS_DOMAIN_ID", "103")
     rclpy.init(args=None)
     node = None
     try:

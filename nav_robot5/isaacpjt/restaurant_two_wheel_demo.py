@@ -23,7 +23,6 @@ ISAAC_SIM_ROOT = os.environ.get(
 _ros_bridge_lib = Path(ISAAC_SIM_ROOT) / "exts/isaacsim.ros2.bridge/humble/lib"
 os.environ.setdefault("ROS_DISTRO", "humble")
 os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
-os.environ["ROS_DOMAIN_ID"] = os.environ.get("ROS_DOMAIN_ID", "102")
 
 _ld_paths = [path for path in os.environ.get("LD_LIBRARY_PATH", "").split(":") if path]
 _python_paths = [
@@ -1370,7 +1369,7 @@ def main():
 
     print(
         f"[nav_robot5] 2-wheel bridge running; "
-        f"Domain={os.environ['ROS_DOMAIN_ID']} "
+        f"Domain={os.environ.get('ROS_DOMAIN_ID', '0')} "
         f"spawn=({SPAWN_POSITION[0]:.2f},{SPAWN_POSITION[1]:.2f})",
         flush=True,
     )

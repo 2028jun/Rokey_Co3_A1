@@ -13,9 +13,7 @@ AMCL / controller_server / bt_navigator는 포함하지 않습니다 — 아직 
   `robot_state_publisher`(+URDF)를 그대로 재사용합니다. `nav_restaurant_demo.py`가
   이미 `/two_wheel/scan_raw`, `/two_wheel/odom_raw`를 올바른 프레임
   (`ridgeback_base_link`)으로 발행하고 있어서 중복시키면 오히려 어긋날 위험이 있습니다.
-- ROS_DOMAIN_ID는 113이 아니라 **102**를 씁니다 (이 프로젝트의 Isaac이
-  102로 고정 발행하기 때문 — `nav_restaurant_demo.py`의
-  `NAV_ROBOT_ROS_DOMAIN_ID` 기본값과 동일).
+- ROS 도메인은 저장소에서 강제하지 않고 현재 셸의 `ROS_DOMAIN_ID`를 사용합니다.
 - `nav2_collision_monitor`는 **의도적으로 안 씁니다.** `NavBridge`가
   `cmd_vel`이 아니라 `cmd_vel_safe`만 구독하도록 바뀌어 있어서
   (`nav_restaurant_demo.py` 참고) 원래는 그 사이를 이어주려 했지만,
@@ -53,7 +51,6 @@ export NAV_TYPING_CUSTOMER=0
 ```bash
 # 1) Isaac Sim (기존과 동일하게 Play) -- 움직이는 사람 비활성화
 cd /home/rokey/cobot3_ws/nav_robot
-export NAV_ROBOT_ROS_DOMAIN_ID=102
 export NAV_CROSSING_PEDESTRIAN=0
 export NAV_TYPING_CUSTOMER=0
 export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$HOME/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/exts/isaacsim.ros2.bridge/humble/lib"
@@ -66,7 +63,6 @@ export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$HOME/dev_ws/isaac_sim/isaacsim/_build/
 cd /home/rokey/cobot3_ws
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-export ROS_DOMAIN_ID=102
 ros2 launch map_gen slam_mapping.launch.py rviz:=true
 ```
 
@@ -75,7 +71,6 @@ ros2 launch map_gen slam_mapping.launch.py rviz:=true
 cd /home/rokey/cobot3_ws
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-export ROS_DOMAIN_ID=102
 ros2 run map_gen slam_patrol
 ```
 

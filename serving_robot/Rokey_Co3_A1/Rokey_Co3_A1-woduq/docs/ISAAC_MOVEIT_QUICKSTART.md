@@ -32,7 +32,6 @@ sudo apt-get install -y ros-humble-moveit ros-humble-control-msgs ros-humble-xac
 ```bash
 cd /home/rokey/cobot3_ws
 source /opt/ros/humble/setup.bash
-export ROS_DOMAIN_ID=101
 colcon build --symlink-install \
   --packages-select m0609_isaac_description m0609_isaac_control m0609_rg2_moveit
 source install/setup.bash
@@ -43,7 +42,6 @@ source install/setup.bash
 터미널 1: Isaac Sim 전용 Python으로 시뮬레이터를 실행한다.
 
 ```bash
-export ROS_DOMAIN_ID=101
 /home/rokey/cobot3_ws/isaacpjt/M0609/run_moveit_bridge.sh
 ```
 
@@ -60,7 +58,6 @@ ISAAC_HEADLESS=1 ISAAC_TEST_STEPS=10 \
 cd /home/rokey/cobot3_ws
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-export ROS_DOMAIN_ID=101
 ros2 launch m0609_rg2_moveit moveit.launch.py
 ```
 
@@ -69,7 +66,6 @@ ros2 launch m0609_rg2_moveit moveit.launch.py
 ```bash
 source /opt/ros/humble/setup.bash
 source /home/rokey/cobot3_ws/install/setup.bash
-export ROS_DOMAIN_ID=101
 ros2 run m0609_isaac_control moveit_joint_test --plan-only
 ```
 

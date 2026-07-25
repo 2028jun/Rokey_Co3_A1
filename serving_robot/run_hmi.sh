@@ -12,12 +12,11 @@ else
     exit 1
 fi
 
-export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-102}
 export HMI_PORT=${HMI_PORT:-8000}
 
 echo "=========================================================="
 echo " Starting Pizza Serving Robot HMI Dashboard"
-echo " ROS_DOMAIN_ID : $ROS_DOMAIN_ID"
+echo " ROS_DOMAIN_ID : ${ROS_DOMAIN_ID:-0}"
 echo " HMI Web Access: http://localhost:$HMI_PORT"
 echo "=========================================================="
 

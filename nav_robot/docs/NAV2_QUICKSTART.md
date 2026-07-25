@@ -19,13 +19,11 @@ Nav2 full bringup **끄기**. Isaac만 + 미션.
 ```bash
 # T1 Isaac
 cd /home/rokey/cobot3_ws/nav_robot
-export NAV_ROBOT_ROS_DOMAIN_ID=102
 /home/rokey/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/python.sh \
   isaacpjt/nav_restaurant_demo.py
 
-# T2 integrated navigation command (ROS_DOMAIN_ID=102)
+# T2 integrated navigation command (inherits ROS_DOMAIN_ID from ~/.bashrc)
 source /opt/ros/humble/setup.bash && source install/setup.bash
-export ROS_DOMAIN_ID=102
 ros2 service call /navigation/command \
   serving_robot_interfaces/srv/TaskCommand \
   "{command: 2}"
@@ -59,7 +57,6 @@ ros2 launch nav_robot_bringup map_view.launch.py
 `nav_server_node`, `go_to_table`, `return_to_kitchen`를 모두 끄고 실행합니다.
 
 ```bash
-export ROS_DOMAIN_ID=102
 ros2 launch nav_robot_bringup nav2_restaurant.launch.py
 rviz2 -d /home/rokey/cobot3_ws/nav_robot/config/restaurant_map.rviz
 ```

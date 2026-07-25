@@ -52,7 +52,7 @@ ros2 run hand_safety hand_detector_node
 사용합니다.
 
 ```bash
-export ROS_DOMAIN_ID=101
+# ROS_DOMAIN_ID는 각 PC의 ~/.bashrc 설정을 사용합니다.
 ```
 
 입력 토픽을 변경하는 예:

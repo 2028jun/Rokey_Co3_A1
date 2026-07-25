@@ -5,9 +5,9 @@ import argparse
 import os
 import sys
 
-os.environ["ROS_DOMAIN_ID"] = os.environ.get(
-    "SERVING_ROBOT_ROS_DOMAIN_ID", "102"
-)
+_serving_domain_id = os.environ.get("SERVING_ROBOT_ROS_DOMAIN_ID")
+if _serving_domain_id:
+    os.environ["ROS_DOMAIN_ID"] = _serving_domain_id
 
 import rclpy
 from example_interfaces.srv import AddTwoInts
