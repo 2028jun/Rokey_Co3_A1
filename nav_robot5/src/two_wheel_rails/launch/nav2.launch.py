@@ -63,6 +63,9 @@ def generate_launch_description():
     rviz = LaunchConfiguration("rviz")
     rviz_config = LaunchConfiguration("rviz_config")
     robot_urdf = LaunchConfiguration("robot_urdf")
+    initial_pose_x = LaunchConfiguration("initial_pose_x")
+    initial_pose_y = LaunchConfiguration("initial_pose_y")
+    initial_pose_yaw = LaunchConfiguration("initial_pose_yaw")
     # robot_id matches namespace 1:1 in this setup ("robot1"/"robot2"); it
     # picks the routes/TF-frame prefix inside topic_bridge (see robot_id
     # ROS parameter in topic_bridge.py).
@@ -78,11 +81,20 @@ def generate_launch_description():
     # (nav2_util::getCurrentPose) silently fall back to a hardcoded
     # "base_link"-style default rather than reading robot_base_frame, so a
     # per-robot-prefixed frame name breaks bt_navigator's own TF lookups.
+    # amcl's initial_pose.{x,y,yaw} are also shared in nav2_params.yaml by
+    # default; override them per launch so each robot's AMCL starts seeded
+    # at its own real spawn instead of both starting at the same point
+    # (which a symmetric room can let AMCL resolve to the wrong robot's
+    # side of). t2r passes these in from routes.yaml/routes_robot2.yaml's
+    # own spawn/kitchen entry -- not duplicated here.
     param_rewrites = {
         "use_sim_time": use_sim_time,
         "autostart": autostart,
         "default_nav_to_pose_bt_xml": bt_xml_file,
         "default_nav_through_poses_bt_xml": bt_through_xml_file,
+        "x": initial_pose_x,
+        "y": initial_pose_y,
+        "yaw": initial_pose_yaw,
     }
 
     # navigation_launch.py (nav2_bringup) applies its own root_key=namespace
@@ -232,6 +244,21 @@ def generate_launch_description():
                 "robot_urdf",
                 default_value=default_urdf,
                 description="Per-robot URDF (frame names prefixed by robot id)",
+            ),
+            DeclareLaunchArgument(
+                "initial_pose_x",
+                default_value="-0.90",
+                description="AMCL initial pose x (t2r passes this from routes*.yaml spawn)",
+            ),
+            DeclareLaunchArgument(
+                "initial_pose_y",
+                default_value="5.25",
+                description="AMCL initial pose y (t2r passes this from routes*.yaml spawn)",
+            ),
+            DeclareLaunchArgument(
+                "initial_pose_yaw",
+                default_value="-1.5707963267948966",
+                description="AMCL initial pose yaw (t2r passes this from routes*.yaml spawn)",
             ),
             grouped_nodes,
         ]

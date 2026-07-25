@@ -56,11 +56,30 @@ t2r() {
     return 2
   fi
   shift
-  echo "[t2r] nav_robot5  robot_id=$robot_id  ROS_DOMAIN_ID=$ROS_DOMAIN_ID"
+
+  # Read this robot's own AMCL seed straight from the same routes file
+  # rail_mission uses (routes.yaml for robot1, routes_robot2.yaml for
+  # robot2) -- single source of truth, no coordinates duplicated here.
+  local routes_file="$NAV_ROBOT5_WS/src/two_wheel_rails/config/routes.yaml"
+  [[ "$robot_id" != "robot1" ]] && routes_file="$NAV_ROBOT5_WS/src/two_wheel_rails/config/routes_${robot_id}.yaml"
+  local spawn_xyz
+  spawn_xyz="$(python3 -c "
+import sys, yaml
+with open('$routes_file', encoding='utf-8') as f:
+    data = yaml.safe_load(f)
+spawn = data.get('spawn') or data.get('kitchen')
+print(spawn['x'], spawn['y'], spawn['yaw'])
+")" || { echo "[t2r] ${routes_file}에서 spawn 못 읽음" >&2; return 1; }
+  read -r spawn_x spawn_y spawn_yaw <<< "$spawn_xyz"
+
+  echo "[t2r] nav_robot5  robot_id=$robot_id  ROS_DOMAIN_ID=$ROS_DOMAIN_ID  initial_pose=($spawn_x,$spawn_y,$spawn_yaw)"
   exec ros2 launch two_wheel_rails nav2.launch.py \
     "namespace:=$robot_id" \
     "robot_urdf:=$NAV_ROBOT5_WS/src/two_wheel_rails/urdf/two_wheel_robot_${robot_id}.urdf" \
     "map:=$NAV_ROBOT5_WS/maps/restaurant/map.yaml" \
+    "initial_pose_x:=$spawn_x" \
+    "initial_pose_y:=$spawn_y" \
+    "initial_pose_yaw:=$spawn_yaw" \
     "$@"
 }
 
