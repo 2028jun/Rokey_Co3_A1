@@ -3,7 +3,7 @@
 
 Layout (world / map frame):
   - Dining floor ~12 x 10 m centered at origin (walls at x=±6, y=±5)
-  - Center doorway in the back wall at y=5 (|x| < ~1.2)
+  - Center doorway in the back wall at y=5 (|x| < ~2.0)
   - Lightwheel kitchen asset translated to y≈7.44 (extends beyond dining)
   - Tables at (±3.2, -2.2) and (±3.2, 0.7); docks at (±1.82, same y)
 
@@ -92,9 +92,9 @@ def main() -> int:
     # Front walls y=-5 (gap near x=0 for entrance ~|x|<1.0)
     fill_rect(grid, origin_x, origin_y, res, height, width, -6.0, -5.08, -1.0, -4.92, 0)
     fill_rect(grid, origin_x, origin_y, res, height, width, 1.0, -5.08, 6.0, -4.92, 0)
-    # Back walls y=5 (kitchen doorway |x|<1.2)
-    fill_rect(grid, origin_x, origin_y, res, height, width, -6.0, 4.92, -1.2, 5.08, 0)
-    fill_rect(grid, origin_x, origin_y, res, height, width, 1.2, 4.92, 6.0, 5.08, 0)
+    # Back walls y=5 (kitchen doorway |x|<2.0)
+    fill_rect(grid, origin_x, origin_y, res, height, width, -6.0, 4.92, -2.0, 5.08, 0)
+    fill_rect(grid, origin_x, origin_y, res, height, width, 2.0, 4.92, 6.0, 5.08, 0)
 
     # Tables (approx footprints) — centers from USDA TableSet_00..03
     tables = [
@@ -118,8 +118,8 @@ def main() -> int:
 
     # Kitchen zone (y>5): keep a center aisle free for dock/egress; mark flanks occupied.
     # Approximate counters left/right of the service aisle.
-    fill_rect(grid, origin_x, origin_y, res, height, width, -6.0, 5.2, -1.5, 9.2, 0)
-    fill_rect(grid, origin_x, origin_y, res, height, width, 1.5, 5.2, 6.0, 9.2, 0)
+    fill_rect(grid, origin_x, origin_y, res, height, width, -6.0, 5.2, -2.0, 9.2, 0)
+    fill_rect(grid, origin_x, origin_y, res, height, width, 2.0, 5.2, 6.0, 9.2, 0)
     # Far kitchen back wall
     fill_rect(grid, origin_x, origin_y, res, height, width, -6.0, 9.2, 6.0, 9.4, 0)
 
@@ -129,7 +129,8 @@ def main() -> int:
         (1.82, -2.20),
         (-1.82, 0.70),
         (1.82, 0.70),
-        (0.21, 5.25),
+        (-1.0, 5.25),
+        (1.0, 5.25),
         (0.0, 4.20),
         (0.0, 2.50),
         (0.0, 0.70),
@@ -138,7 +139,7 @@ def main() -> int:
         clear_disk(grid, origin_x, origin_y, res, height, width, dx, dy, 1.05, wall)
 
     # Keep kitchen doorway + center aisle open (wide enough for footprint+inflation)
-    fill_rect(grid, origin_x, origin_y, res, height, width, -1.15, 4.5, 1.15, 7.2, 254)
+    fill_rect(grid, origin_x, origin_y, res, height, width, -1.95, 4.5, 1.95, 7.2, 254)
     fill_rect(grid, origin_x, origin_y, res, height, width, -0.7, -3.0, 0.7, 5.5, 254)
 
     pgm = out_dir / "map.pgm"

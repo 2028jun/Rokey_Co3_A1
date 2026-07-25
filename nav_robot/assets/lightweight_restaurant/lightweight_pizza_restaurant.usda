@@ -32,8 +32,9 @@ def Xform "World"
         {
             color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
             double size = 1
-            float3 xformOp:scale = (4.8, 0.16, 2.8)
-            double3 xformOp:translate = (-3.6, 5, 1.4)
+            # Doorway widened to |x|<2.0 (4.0 m). Was |x|<1.2 (2.4 m).
+            float3 xformOp:scale = (4.0, 0.16, 2.8)
+            double3 xformOp:translate = (-4.0, 5, 1.4)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 
@@ -43,8 +44,8 @@ def Xform "World"
         {
             color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
             double size = 1
-            float3 xformOp:scale = (4.8, 0.16, 2.8)
-            double3 xformOp:translate = (3.6, 5, 1.4)
+            float3 xformOp:scale = (4.0, 0.16, 2.8)
+            double3 xformOp:translate = (4.0, 5, 1.4)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 

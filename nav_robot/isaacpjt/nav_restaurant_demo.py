@@ -117,7 +117,26 @@ except Exception as _food_import_exc:
     print(f"[warn] food spawn module import: {_food_import_exc}", flush=True)
 
 from kitchen_return_module import build_kitchen_route
+from multi_robot_specs import ROBOT_SPECS, RobotSpec
 from table_route_module import build_table_route
+
+
+def active_robot_specs() -> tuple[RobotSpec, ...]:
+    """NAV_ROBOT_COUNT=1 keeps robot1 only; default is both wait slots."""
+    count = int(os.environ.get("NAV_ROBOT_COUNT", "2"))
+    if count <= 1:
+        return (ROBOT_SPECS[0],)
+    return ROBOT_SPECS
+
+
+_ACTIVE_SPECS: tuple[RobotSpec, ...] | None = None
+
+
+def _specs() -> tuple[RobotSpec, ...]:
+    global _ACTIVE_SPECS
+    if _ACTIVE_SPECS is None:
+        _ACTIVE_SPECS = active_robot_specs()
+    return _ACTIVE_SPECS
 
 
 _package_roots = [
@@ -209,15 +228,13 @@ def import_robot_usd():
             flush=True,
         )
 
-# Spawn exactly on the restaurant centreline.  With yaw=-90 deg this makes the
-# table-row approach an actual straight line to x=0 instead of a diagonal from
-# the former x=0.21 offset.
+# Kitchen wait slot for the primary (robot1). Dual layout uses ROBOT_SPECS.
 SPAWN_POSITION = Gf.Vec3d(
-    float(os.environ.get("NAV_SPAWN_X", "0.00")),
-    float(os.environ.get("NAV_SPAWN_Y", "5.25")),
-    float(os.environ.get("NAV_SPAWN_Z", "0.01")),
+    float(os.environ.get("NAV_SPAWN_X", str(ROBOT_SPECS[0].spawn_x))),
+    float(os.environ.get("NAV_SPAWN_Y", str(ROBOT_SPECS[0].spawn_y))),
+    float(os.environ.get("NAV_SPAWN_Z", str(ROBOT_SPECS[0].spawn_z))),
 )
-SPAWN_YAW = float(os.environ.get("NAV_SPAWN_YAW", str(-math.pi / 2.0)))
+SPAWN_YAW = float(os.environ.get("NAV_SPAWN_YAW", str(ROBOT_SPECS[0].spawn_yaw)))
 
 WHEEL_JOINTS = ["left_wheel_joint", "right_wheel_joint"]
 ARM_JOINTS = [f"joint_{index}" for index in range(1, 7)]
@@ -250,13 +267,17 @@ TRAY_DRIVE_DAMPING = 500.0
 TRAY_DRIVE_MAX_FORCE = 400.0
 TRAY_RETRACT_STEPS = 360
 
-ROBOT_ROOT = "/World/NavRobot"
+# Primary robot root used by NavBridge / embedded sensors (robot1).
+ROBOT_ROOT = ROBOT_SPECS[0].root
 ARTICULATION_CANDIDATES = [
     f"{ROBOT_ROOT}/Robot/ridgeback_base_link",
     f"{ROBOT_ROOT}/Robot",
 ]
 BASE_LINK_NAME = "ridgeback_base_link"
-TABLE_CAMERA_PATH = f"{ROBOT_ROOT}/Robot/ridgeback_base_link/ridgeback_base_link/fixed_table_depth_camera/realsense_d455/RSD455/Camera_Pseudo_Depth"
+TABLE_CAMERA_PATH = (
+    f"{ROBOT_ROOT}/Robot/ridgeback_base_link/ridgeback_base_link/"
+    "fixed_table_depth_camera/realsense_d455/RSD455/Camera_Pseudo_Depth"
+)
 FRONT_LIDAR_TRANSLATION = Gf.Vec3d(0.40, 0.0, 0.33)
 FRONT_LIDAR_CONFIG = "RPLIDAR_S2E"
 FRONT_LIDAR_FRAME = "base_scan"
@@ -306,7 +327,42 @@ def yaw_to_quat(yaw: float) -> Gf.Quatf:
     )
 
 
-def attach_m0609_visuals(stage):
+def _prim_paths(stage) -> set[str]:
+    return {str(prim.GetPath()) for prim in stage.Traverse()}
+
+
+def _log_world_children(stage, label: str) -> None:
+    world = stage.GetPrimAtPath("/World")
+    names = [child.GetName() for child in world.GetChildren()] if world.IsValid() else []
+    print(f"[{label}] /World children={names}", flush=True)
+
+
+def _find_link_under_root(stage, robot_root: str, link_name: str):
+    """Match a named link prim only under ``robot_root`` (not other robots)."""
+    root_prim = stage.GetPrimAtPath(robot_root)
+    if not root_prim.IsValid():
+        return None
+    matches = [
+        prim
+        for prim in Usd.PrimRange(root_prim)
+        if prim.GetName() == link_name
+        and str(prim.GetPath()).startswith(f"{robot_root}/")
+    ]
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def attach_m0609_visuals(stage, robot_root: str):
+    """Replace broken arm-link visual refs with payload paths inside m0609 USD.
+
+    Important: reference only ``/World/m0609/<link>/visuals`` *inside* the
+    collected file.  Never reference the file's defaultPrim ``/World`` — that
+    would also compose red_block / GroundPlane / extra RealSense into the stage.
+
+    Deinstance before SetReferences so dual-robot composition does not share a
+    mutable visual prototype across ``/World/robot1`` and ``/World/robot2``.
+    """
     if not M0609_VISUAL_USD.is_file():
         print(f"[warn] M0609 visual USD missing at {M0609_VISUAL_USD}", flush=True)
         return
@@ -314,16 +370,21 @@ def attach_m0609_visuals(stage):
     wanted = ["base_link", *(f"link_{index}" for index in range(1, 7))]
     attached = []
     for link_name in wanted:
-        matches = [
-            prim
-            for prim in stage.Traverse()
-            if prim.GetName() == link_name
-            and str(prim.GetPath()).startswith(ROBOT_ROOT)
-        ]
-        if len(matches) != 1:
+        link_prim = _find_link_under_root(stage, robot_root, link_name)
+        if link_prim is None:
+            print(
+                f"[warn] M0609 link match fail root={robot_root} "
+                f"link={link_name}",
+                flush=True,
+            )
             continue
-        visual_path = matches[0].GetPath().AppendChild("visuals")
+        visual_path = link_prim.GetPath().AppendChild("visuals")
         visual_prim = stage.OverridePrim(visual_path)
+        # Break shared instance prototypes before retargeting references.
+        if visual_prim.IsInstanceable():
+            visual_prim.SetInstanceable(False)
+        visual_prim.GetReferences().ClearReferences()
+        # Payload path inside m0609_gripper.usd — does not create /World/m0609.
         visual_prim.GetReferences().SetReferences(
             [
                 Sdf.Reference(
@@ -334,7 +395,8 @@ def attach_m0609_visuals(stage):
         )
         attached.append(str(visual_path))
     print(
-        f"[nav_robot] attached M0609 visual meshes from {M0609_VISUAL_USD} links={len(attached)}",
+        f"[nav_robot] attached M0609 visuals root={robot_root} "
+        f"links={len(attached)} usd={M0609_VISUAL_USD}",
         flush=True,
     )
 
@@ -361,20 +423,12 @@ def attach_m0609_visuals(stage):
     )
     dark_material = UsdShade.Material(material_prim)
     darkened = []
-    # Override every M0609 visual link.  Binding at each ``visuals`` prim with
-    # stronger-than-descendants also covers the meshes nested below it (for
-    # example the wrist/end-effector geometry under the final arm link).
     for link_name in wanted:
-        matches = [
-            prim
-            for prim in stage.Traverse()
-            if prim.GetName() == link_name
-            and str(prim.GetPath()).startswith(ROBOT_ROOT)
-        ]
-        if len(matches) != 1:
+        link_prim = _find_link_under_root(stage, robot_root, link_name)
+        if link_prim is None:
             continue
         visual_prim = stage.GetPrimAtPath(
-            matches[0].GetPath().AppendChild("visuals")
+            link_prim.GetPath().AppendChild("visuals")
         )
         if not visual_prim.IsValid():
             continue
@@ -384,107 +438,76 @@ def attach_m0609_visuals(stage):
         )
         darkened.append(str(visual_prim.GetPath()))
     print(
-        f"[vision-safety] dark material bound to all M0609 arm visuals: "
-        f"{darkened}",
+        f"[vision-safety] dark material root={robot_root} "
+        f"visuals={len(darkened)}",
         flush=True,
     )
 
 
-def attach_fixed_table_depth_camera(stage):
-    base_path = Sdf.Path(f"{ROBOT_ROOT}/Robot/ridgeback_base_link/ridgeback_base_link")
-    if not stage.GetPrimAtPath(base_path).IsValid():
+def sanitize_embedded_rsd455(stage, robot_root: str) -> None:
+    """Keep D455 welded to the mast: strip nested rigid-body physics.
+
+    The Isaac ``rsd455.usd`` authors ``PhysicsRigidBodyAPI`` / PhysX rigid-body
+    schemas on ``/Root/RSD455``.  Nested under the mobile-base articulation that
+    becomes a detachable dynamic body.  With two robots the PhysX pose of that
+    body can desync from the USD xform stack and render as a RealSense Case at
+    the dining-hall origin while Prim paths still look correct under each mast.
+
+    ``UsdPhysics.RigidBodyAPI`` alone is not enough to check — the composed prim
+    often keeps ``PhysxRigidBodyAPI`` + ``physics:rigidBodyEnabled=true``.
+    """
+    rsd_path = (
+        f"{robot_root}/Robot/ridgeback_base_link/ridgeback_base_link/"
+        "fixed_table_depth_camera/realsense_d455/RSD455"
+    )
+    rsd_prim = stage.GetPrimAtPath(rsd_path)
+    if not rsd_prim.IsValid():
         return
-    assembly_path = base_path.AppendChild("fixed_table_depth_camera")
-    UsdGeom.Xform.Define(stage, assembly_path)
-
-    mast = UsdGeom.Cylinder.Define(stage, assembly_path.AppendChild("mast"))
-    mast.CreateRadiusAttr(0.018)
-    mast.CreateHeightAttr(0.935)
-    mast.CreateAxisAttr(UsdGeom.Tokens.z)
-    mast.AddTranslateOp().Set(Gf.Vec3f(-0.25, 0.285, 1.3225))
-    mast.CreateDisplayColorAttr([Gf.Vec3f(0.12, 0.15, 0.18)])
-    UsdPhysics.CollisionAPI.Apply(mast.GetPrim())
-
-    boom = UsdGeom.Cylinder.Define(stage, assembly_path.AppendChild("boom"))
-    boom.CreateRadiusAttr(0.018)
-    boom.CreateHeightAttr(0.215)
-    boom.CreateAxisAttr(UsdGeom.Tokens.z)
-    boom.AddTranslateOp().Set(Gf.Vec3f(-0.25, 0.3925, 1.79))
-    boom.AddRotateXOp().Set(90.0)
-    boom.CreateDisplayColorAttr([Gf.Vec3f(0.12, 0.15, 0.18)])
-    UsdPhysics.CollisionAPI.Apply(boom.GetPrim())
-
-    if D455_ASSET_USD.is_file():
-        camera_position = Gf.Vec3d(-0.25, 0.50, 1.85)
-        table_target = Gf.Vec3d(1.00, 0.15, 0.74)
-        desired_camera_to_base = Gf.Matrix4d().SetLookAt(
-            camera_position, table_target, Gf.Vec3d(0.0, 0.0, 1.0)
-        ).GetInverse()
-
-        d455_stage = Usd.Stage.Open(str(D455_ASSET_USD))
-        source_color_camera = d455_stage.GetPrimAtPath(
-            "/Root/RSD455/Camera_OmniVision_OV9782_Color"
+    stripped = 0
+    touched = []
+    for prim in Usd.PrimRange(rsd_prim):
+        changed = False
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            prim.RemoveAPI(UsdPhysics.RigidBodyAPI)
+            changed = True
+        if prim.HasAPI(PhysxSchema.PhysxRigidBodyAPI):
+            prim.RemoveAPI(PhysxSchema.PhysxRigidBodyAPI)
+            changed = True
+        if prim.HasAPI(UsdPhysics.MassAPI):
+            prim.RemoveAPI(UsdPhysics.MassAPI)
+            changed = True
+        if prim.HasAPI(UsdPhysics.CollisionAPI):
+            prim.RemoveAPI(UsdPhysics.CollisionAPI)
+            changed = True
+        enabled = prim.GetAttribute("physics:rigidBodyEnabled")
+        if enabled and enabled.IsValid():
+            enabled.Set(False)
+            changed = True
+        if changed:
+            stripped += 1
+            touched.append(str(prim.GetPath()))
+    if stripped:
+        print(
+            f"[nav_robot] stripped rigid-body/collision under {rsd_path} "
+            f"n={stripped} roots_touched={touched[:8]}",
+            flush=True,
         )
-        if source_color_camera.IsValid():
-            camera_to_sensor = UsdGeom.Xformable(source_color_camera).GetLocalTransformation()
-            source_rsd = d455_stage.GetPrimAtPath("/Root/RSD455")
-            rsd_to_sensor = UsdGeom.Xformable(source_rsd).GetLocalTransformation()
-            camera_to_outer_mount = camera_to_sensor * rsd_to_sensor
-            sensor_to_base = camera_to_outer_mount.GetInverse() * desired_camera_to_base
-            sensor_path = assembly_path.AppendChild("realsense_d455")
-            sensor_mount = UsdGeom.Xform.Define(stage, sensor_path)
-            sensor_mount.MakeMatrixXform().Set(sensor_to_base)
-
-            rsd_path = sensor_path.AppendChild("RSD455")
-            rsd_prim = stage.OverridePrim(rsd_path)
-            rsd_prim.GetReferences().SetReferences(
-                [Sdf.Reference(str(D455_ASSET_USD), Sdf.Path("/Root/RSD455"))]
-            )
-            print("[nav_robot] attached fixed table depth camera mast & D455 sensor", flush=True)
 
 
-def attach_front_rplidar_ros2(stage):
-    global _front_lidar_render_product, _front_lidar_writer
-    try:
-        import omni.replicator.core as rep
-        base_path = Sdf.Path(f"{ROBOT_ROOT}/Robot/ridgeback_base_link/ridgeback_base_link")
-        base_prim = stage.GetPrimAtPath(base_path)
-        if not base_prim.IsValid():
-            return
-        mount_path = base_prim.GetPath().AppendChild(FRONT_LIDAR_FRAME)
-        mount = UsdGeom.Xform.Define(stage, mount_path)
-        mount.AddTranslateOp().Set(FRONT_LIDAR_TRANSLATION)
-
-        status, lidar_prim = omni.kit.commands.execute(
-            "IsaacSensorCreateRtxLidar",
-            path="/RPLIDAR_S2E",
-            parent=str(mount_path),
-            config=FRONT_LIDAR_CONFIG,
-            translation=Gf.Vec3d(0.0, 0.0, 0.0),
-            orientation=Gf.Quatd(1.0, 0.0, 0.0, 0.0),
-            visibility=True,
-        )
-        if status and lidar_prim is not None:
-            _front_lidar_render_product = rep.create.render_product(
-                lidar_prim.GetPath(), [1, 1], name="FrontRPLidarNav"
-            )
-            _front_lidar_writer = rep.writers.get("RtxLidarROS2PublishLaserScan")
-            _front_lidar_writer.initialize(
-                topicName=FRONT_LIDAR_TOPIC,
-                frameId=FRONT_LIDAR_FRAME,
-            )
-            _front_lidar_writer.attach([_front_lidar_render_product])
-            print("[nav_robot] attached front RPLIDAR S2E on /scan", flush=True)
-    except Exception as exc:
-        print(f"[warn] RPLIDAR S2E setup: {exc}", flush=True)
-
-
-def add_parking_brake(stage, articulation_path):
-    pass
-
-
-def remove_parking_brake(stage):
-    pass
+def spawn_serving_robot(stage, spec: RobotSpec) -> None:
+    """Reference the same nav_robot robot USD under an exclusive root prim."""
+    spawn = UsdGeom.Xform.Define(stage, spec.root)
+    spawn.AddTranslateOp().Set(
+        Gf.Vec3d(spec.spawn_x, spec.spawn_y, spec.spawn_z)
+    )
+    spawn.AddOrientOp().Set(yaw_to_quat(spec.spawn_yaw))
+    robot = UsdGeom.Xform.Define(stage, f"{spec.root}/Robot")
+    robot_prim = robot.GetPrim()
+    # Dual references of the same USD must not share instance prototypes.
+    robot_prim.SetInstanceable(False)
+    robot_prim.GetReferences().AddReference(
+        str(ROBOT_USD), Sdf.Path(ROBOT_ASSET_ROOT)
+    )
 
 
 def open_restaurant_and_robot():
@@ -501,39 +524,103 @@ def open_restaurant_and_robot():
         simulation_app.update()
 
     stage = context.get_stage()
-    spawn = UsdGeom.Xform.Define(stage, ROBOT_ROOT)
-    spawn.AddTranslateOp().Set(SPAWN_POSITION)
-    spawn.AddOrientOp().Set(yaw_to_quat(SPAWN_YAW))
-    robot = UsdGeom.Xform.Define(stage, f"{ROBOT_ROOT}/Robot")
-    robot.GetPrim().GetReferences().AddReference(
-        str(ROBOT_USD), Sdf.Path(ROBOT_ASSET_ROOT)
-    )
-    for _ in range(5):
-        simulation_app.update()
-    robot_scope = f"{ROBOT_ROOT}/Robot/"
-    composed_names = {
-        prim.GetName()
-        for prim in stage.Traverse()
-        if str(prim.GetPath()).startswith(robot_scope)
-    }
-    missing_tray_prims = set(SLIDING_TRAY_JOINTS) - composed_names
-    if missing_tray_prims:
-        raise RuntimeError(
-            "loaded robot USD is the obsolete fixed/notched tray model; "
-            f"missing sliding tray joints={sorted(missing_tray_prims)} "
-            f"usd={ROBOT_USD}"
+    specs = _specs()
+    debug = os.environ.get("NAV_ROBOT_PRIM_DEBUG", "0") == "1"
+
+    before = _prim_paths(stage)
+    if debug:
+        print("[BEFORE ROBOTS]", flush=True)
+        for path in sorted(before):
+            if path.startswith("/World"):
+                print(path, flush=True)
+        _log_world_children(stage, "BEFORE ROBOTS")
+
+    for spec in specs:
+        before_one = _prim_paths(stage)
+        spawn_serving_robot(stage, spec)
+        for _ in range(5):
+            simulation_app.update()
+        after_one = _prim_paths(stage)
+        new_one = sorted(after_one - before_one)
+        outside = [path for path in new_one if not path.startswith(f"{spec.root}")]
+        if outside:
+            print(
+                f"[ERROR] {spec.robot_id} created prims outside {spec.root}: "
+                f"{outside[:40]}",
+                flush=True,
+            )
+        if debug:
+            print(f"[AFTER {spec.robot_id.upper()}]", flush=True)
+            for path in new_one:
+                print(path, flush=True)
+            print(
+                f"[NEW PRIMS CREATED BY {spec.robot_id.upper()}] "
+                f"count={len(new_one)} outside_root={len(outside)}",
+                flush=True,
+            )
+
+        robot_scope = f"{spec.root}/Robot/"
+        composed_names = {
+            prim.GetName()
+            for prim in stage.Traverse()
+            if str(prim.GetPath()).startswith(robot_scope)
+        }
+        missing_tray_prims = set(SLIDING_TRAY_JOINTS) - composed_names
+        if missing_tray_prims:
+            raise RuntimeError(
+                "loaded robot USD is the obsolete fixed/notched tray model; "
+                f"robot={spec.robot_id} "
+                f"missing sliding tray joints={sorted(missing_tray_prims)} "
+                f"usd={ROBOT_USD}"
+            )
+
+        # Visual fix only — does not add a second arm articulation.
+        attach_m0609_visuals(stage, robot_root=spec.root)
+        sanitize_embedded_rsd455(stage, robot_root=spec.root)
+        print(
+            f"[nav_robot] spawned {spec.robot_id} root={spec.root} "
+            f"usd={ROBOT_USD} pose=({spec.spawn_x:.2f},{spec.spawn_y:.2f})",
+            flush=True,
         )
+
+    after = _prim_paths(stage)
+    leaked = sorted(
+        path
+        for path in (after - before)
+        if not any(path.startswith(spec.root) for spec in specs)
+        and path not in ("/World/Looks", "/World/Looks/M0609DarkSafety")
+        and not path.startswith("/World/Looks/")
+    )
+    if leaked:
+        print(f"[WARN] prims created outside robot roots: {leaked[:50]}", flush=True)
+    if debug:
+        _log_world_children(stage, "AFTER ROBOTS")
+        for path in (
+            "/World/m0609",
+            "/World/red_block",
+            "/World/GroundPlane",
+            "/World/NavRobot",
+        ):
+            print(
+                f"[debug] {path} valid={stage.GetPrimAtPath(path).IsValid()}",
+                flush=True,
+            )
+
     print(
-        f"[nav_robot] verified v2 sliding-tray USD={ROBOT_USD}",
+        f"[nav_robot] restaurant={RESTAURANT_USD} "
+        f"robot_usd={ROBOT_USD} robots={[s.robot_id for s in specs]}",
         flush=True,
     )
-    # Keep the two-wheel robot's physics/articulation layers, but replace the
-    # imported M0609 visual references with the canonical collected visual
-    # asset.  Without this composition fix link_2's visual pieces can resolve
-    # at the layer origin even though the physical link/joint poses are valid.
-    attach_m0609_visuals(stage)
-    print("[nav_robot] using embedded D455 and RPLIDAR sensor layer", flush=True)
+    print("[nav_robot] using embedded D455 and RPLIDAR from robot USD only", flush=True)
     return stage
+
+
+def add_parking_brake(stage, articulation_path):
+    pass
+
+
+def remove_parking_brake(stage):
+    pass
 
 
 def configure_joint_drives(stage):
@@ -583,7 +670,7 @@ def configure_physics_stability(stage, articulation_path: str):
     )
 
 
-def configure_wheel_contact_material(stage):
+def configure_wheel_contact_material(stage, robot_root: str = ROBOT_ROOT):
     """Bind moderate tire friction so the two drive wheels grip the floor."""
     material = UsdShade.Material.Define(
         stage, "/World/PhysicsMaterials/RidgebackTire"
@@ -602,7 +689,7 @@ def configure_wheel_contact_material(stage):
         if (
             prim.GetName() == "collisions"
             and prim.GetParent().GetName() in wheel_links
-            and str(prim.GetPath()).startswith(ROBOT_ROOT)
+            and str(prim.GetPath()).startswith(f"{robot_root}/")
         ):
             binding_api = UsdShade.MaterialBindingAPI.Apply(prim)
             binding_api.Bind(
@@ -621,13 +708,14 @@ def configure_wheel_contact_material(stage):
             )
             for prim in stage.Traverse()
             if any(link in str(prim.GetPath()) for link in wheel_links)
+            and str(prim.GetPath()).startswith(f"{robot_root}/")
         ]
         raise RuntimeError(
             "expected two wheel colliders for tire material, got "
-            f"{bound_colliders}; candidates={wheel_candidates}"
+            f"{bound_colliders}; root={robot_root} candidates={wheel_candidates}"
         )
     print(
-        "[nav_robot] tire contact material "
+        f"[nav_robot] tire contact material root={robot_root} "
         f"static={TIRE_STATIC_FRICTION:.2f} "
         f"dynamic={TIRE_DYNAMIC_FRICTION:.2f} "
         f"colliders={len(bound_colliders)}",
@@ -650,7 +738,7 @@ def configure_wheel_contact_material(stage):
         if (
             prim.GetName() == "collisions"
             and prim.GetParent().GetName() in caster_links
-            and str(prim.GetPath()).startswith(ROBOT_ROOT)
+            and str(prim.GetPath()).startswith(f"{robot_root}/")
         ):
             UsdShade.MaterialBindingAPI.Apply(prim).Bind(
                 caster_material,
@@ -660,20 +748,26 @@ def configure_wheel_contact_material(stage):
             caster_colliders.append(str(prim.GetPath()))
     if len(caster_colliders) != 2:
         raise RuntimeError(
-            f"expected two caster colliders, got {caster_colliders}"
+            f"expected two caster colliders root={robot_root}, "
+            f"got {caster_colliders}"
         )
 
 
-def find_articulation_path(stage) -> str:
-    for path in ARTICULATION_CANDIDATES:
+def find_articulation_path(stage, robot_root: str = ROBOT_ROOT) -> str:
+    candidates = [
+        f"{robot_root}/Robot/ridgeback_base_link",
+        f"{robot_root}/Robot",
+    ]
+    for path in candidates:
         if stage.GetPrimAtPath(path).IsValid():
             return path
-    # Fallback: first articulation root under NavRobot
     for prim in stage.Traverse():
         path = str(prim.GetPath())
-        if path.startswith(ROBOT_ROOT) and prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+        if path.startswith(f"{robot_root}/") and prim.HasAPI(
+            UsdPhysics.ArticulationRootAPI
+        ):
             return path
-    raise RuntimeError("could not find robot articulation prim")
+    raise RuntimeError(f"could not find robot articulation prim under {robot_root}")
 
 
 def log_arm_chain(stage, label):
@@ -855,7 +949,7 @@ def create_depth_camera(stage, parent_path: str) -> str:
 def create_sensor_ros_graph(lidar_path: str, camera_path: str):
     keys = og.Controller.Keys
     og.Controller.edit(
-        {"graph_path": "/World/NavRobot/NavSensorsROS2", "evaluator_name": "execution"},
+        {"graph_path": f"{ROBOT_ROOT}/NavSensorsROS2", "evaluator_name": "execution"},
         {
             keys.CREATE_NODES: [
                 ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
@@ -1773,7 +1867,7 @@ class NavBridge(Node):
         robot_prefix = (
             str(self.articulation.prim_path)
             if hasattr(self.articulation, "prim_path")
-            else "/World/NavRobot"
+            else ROBOT_ROOT
         )
 
         ranges = []
@@ -2102,7 +2196,8 @@ class NavBridge(Node):
         if (
             target == 4
             and self._navigation_location == 4
-            and math.hypot(x - 0.0, y - 5.25) <= 0.10
+            and math.hypot(x - float(SPAWN_POSITION[0]), y - float(SPAWN_POSITION[1]))
+            <= 0.10
         ):
             self._direct_nav = None
             self._cmd_vx = self._cmd_wz = 0.0
@@ -3152,19 +3247,32 @@ def main():
 
     stage = open_restaurant_and_robot()
     configure_joint_drives(stage)
-    configure_wheel_contact_material(stage)
-    articulation_path = find_articulation_path(stage)
-    configure_physics_stability(stage, articulation_path)
-    articulation, dof_names = initialize_robot(articulation_path)
 
-    # The robot USD already contains its D455 and RTX RPLIDAR.  Creating the
-    # old PhysX nav_lidar here produced a second white lidar body at the world
-    # origin, which looked like a detached M0609 link.
+    specs = _specs()
+    primary_art = None
+    primary_dofs = None
+    for index, spec in enumerate(specs):
+        configure_wheel_contact_material(stage, robot_root=spec.root)
+        articulation_path = find_articulation_path(stage, robot_root=spec.root)
+        configure_physics_stability(stage, articulation_path)
+        articulation, dof_names = initialize_robot(articulation_path)
+        # Articulation init can rematerialize nested sensor physics schemas.
+        sanitize_embedded_rsd455(stage, robot_root=spec.root)
+        print(
+            f"[nav_robot] articulation ready {spec.robot_id} "
+            f"path={articulation_path}",
+            flush=True,
+        )
+        if index == 0:
+            primary_art = articulation
+            primary_dofs = dof_names
+
+    # Sensors / NavBridge stay on robot1 only (no ROS multiplex in this change).
     connect_embedded_sensor_ros(stage)
 
     if not rclpy.ok():
         rclpy.init(args=[])
-    bridge = NavBridge(articulation, dof_names, stage)
+    bridge = NavBridge(primary_art, primary_dofs, stage)
     executor = SingleThreadedExecutor()
     executor.add_node(bridge)
 
@@ -3172,10 +3280,13 @@ def main():
     if not timeline.is_playing():
         timeline.play()
 
+    spawn_summary = ", ".join(
+        f"{spec.robot_id}=({spec.spawn_x:.2f},{spec.spawn_y:.2f})"
+        for spec in specs
+    )
     print(
         f"[nav_robot] domain={os.environ['ROS_DOMAIN_ID']} "
-        f"spawn=({SPAWN_POSITION[0]:.2f},{SPAWN_POSITION[1]:.2f}) "
-        f"yaw={SPAWN_YAW:.2f}",
+        f"NAV_ROBOT_COUNT={len(specs)} {spawn_summary}",
         flush=True,
     )
     print(
