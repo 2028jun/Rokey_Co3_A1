@@ -151,9 +151,19 @@ class RailNavigator:
             ):
                 ok = self._wait_simple_action("park_out")
         elif not ok:
-            print("[park_out] open-loop 부족 — Nav2 BackUp 1회 시도", flush=True)
+            # Cover what open-loop actually fell short by, not a flat half
+            # of the total distance -- a fixed half-distance retry doesn't
+            # add up to backup_m when open-loop stalls early (observed:
+            # traveled=0.23m of a 1.50m target, then a flat 0.75m retry
+            # still left the robot ~0.2m short of the aisle tolerance).
+            remaining = max(0.3, backup_m - traveled)
+            print(
+                f"[park_out] open-loop 부족(traveled={traveled:.2f}m) — "
+                f"남은 {remaining:.2f}m Nav2 BackUp 시도",
+                flush=True,
+            )
             if self._nav.backup(
-                backup_dist=backup_m * 0.5,
+                backup_dist=remaining,
                 backup_speed=self._backup_speed,
                 time_allowance=self._backup_time,
             ):
