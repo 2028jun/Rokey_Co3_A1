@@ -67,7 +67,7 @@ class TopicBridge(Node):
         # back to a hardcoded "base_link"-style default rather than reading
         # robot_base_frame, so matching the plain frame name avoids TF lookup
         # failures in bt_navigator regardless of which robot this is.
-        self.base_link = "ridgeback_base_link"
+        self.base_link = "base_link"
         self.lidar_frame = "nav_lidar_link"
 
         # tf2_ros.TransformBroadcaster hardcodes the absolute "/tf" topic,

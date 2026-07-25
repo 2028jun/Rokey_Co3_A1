@@ -21,7 +21,7 @@ from tf2_ros import Buffer, TransformListener
 # topics (see restaurant_two_wheel_demo.py robot_topics()).
 TELEPORT_TOPIC = "two_wheel/teleport"
 DIRECT_CMD_VEL_TOPIC = "two_wheel/direct_cmd_vel"
-DEFAULT_BASE_LINK_FRAME = "ridgeback_base_link"
+DEFAULT_BASE_LINK_FRAME = "base_link"
 
 AMCL_POSE_QOS = QoSProfile(
     depth=10,

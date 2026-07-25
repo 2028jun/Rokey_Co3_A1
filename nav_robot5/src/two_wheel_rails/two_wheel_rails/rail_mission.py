@@ -64,7 +64,7 @@ def main() -> None:
     # (nav2_util::getCurrentPose) fall back to a hardcoded default frame
     # name rather than reading robot_base_frame, so all robots must share
     # the same plain frame name.
-    base_link_frame = "ridgeback_base_link"
+    base_link_frame = "base_link"
     routes = load_routes(_routes_path(args.robot_id))
     if args.list_routes:
         for key in sorted((routes.get("routes") or {}).keys()):

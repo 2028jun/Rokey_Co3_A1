@@ -58,7 +58,7 @@ class RailNavigator:
         nav: BasicNavigator,
         tf_buffer,
         tracker: AmclPoseTracker,
-        base_link_frame: str = "ridgeback_base_link",
+        base_link_frame: str = "base_link",
     ) -> None:
         self._nav = nav
         self._tf = tf_buffer
