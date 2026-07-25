@@ -1253,6 +1253,7 @@ class NavBridge(Node):
         self._direct_nav_request = None
         self._active_two_wheel_mission_id = ""
         self._active_two_wheel_target = None
+        self._active_two_wheel_goal = None
         self._navigation_paused = False
         self._navigation_pause_started = None
         self._navigation_location = 4
@@ -1647,6 +1648,7 @@ class NavBridge(Node):
                 )
                 self._active_two_wheel_mission_id = ""
                 self._active_two_wheel_target = None
+                self._active_two_wheel_goal = None
             return
 
         if kind in ("pause", "resume"):
@@ -1761,6 +1763,18 @@ class NavBridge(Node):
 
         points = payload.get("points", [])
         dock = payload.get("dock", payload.get("goal"))
+        self._active_two_wheel_goal = None
+        if target in (0, 1, 2, 3, 4) and isinstance(dock, dict):
+            try:
+                self._active_two_wheel_goal = (
+                    float(dock["x"]),
+                    float(dock["y"]),
+                    float(dock.get("yaw", -math.pi / 2.0)),
+                )
+            except (KeyError, TypeError, ValueError):
+                self.get_logger().warning(
+                    f"[Mission RX] invalid target dock; using default: {dock}"
+                )
         self.get_logger().info(
             f"[Mission RX] id={mission_id} target={target} "
             f"points={len(points) if isinstance(points, list) else '?'} "
@@ -1780,6 +1794,7 @@ class NavBridge(Node):
             )
             self._active_two_wheel_mission_id = ""
             self._active_two_wheel_target = None
+            self._active_two_wheel_goal = None
 
     def _on_navigation_trigger(self, msg: Int32):
         self._queue_navigation(int(msg.data))
@@ -2276,6 +2291,11 @@ class NavBridge(Node):
         return np.clip(wheels, -8.0, 8.0)
 
     def _start_direct_navigation(self, target, x, y, yaw):
+        kitchen_dock = self._active_two_wheel_goal or (
+            0.0,
+            5.25,
+            -math.pi / 2.0,
+        )
         # The manager deliberately sends target=4 again at the beginning of a
         # new order even after the previous return already reported kitchen.
         # Treat that verification request as an arrival acknowledgement.  A
@@ -2283,7 +2303,7 @@ class NavBridge(Node):
         if (
             target == 4
             and self._navigation_location == 4
-            and math.hypot(x - 0.0, y - 5.25) <= 0.10
+            and math.hypot(x - kitchen_dock[0], y - kitchen_dock[1]) <= 0.10
         ):
             self._direct_nav = None
             self._cmd_vx = self._cmd_wz = 0.0
@@ -2301,15 +2321,21 @@ class NavBridge(Node):
                 )
                 self._active_two_wheel_mission_id = ""
                 self._active_two_wheel_target = None
+                self._active_two_wheel_goal = None
             self.get_logger().info(
                 "already at kitchen; acknowledged redundant target=4 "
                 "without moving"
             )
             return
         stages = (
-            build_kitchen_route(x, y)
+            build_kitchen_route(x, y, kitchen_dock=kitchen_dock)
             if target == 4
-            else build_table_route(target, x, y)
+            else build_table_route(
+                target,
+                x,
+                y,
+                table_dock=self._active_two_wheel_goal,
+            )
         )
 
         # Normalize only the first kitchen translation after park-out.
@@ -2401,6 +2427,7 @@ class NavBridge(Node):
                 )
         self._active_two_wheel_mission_id = ""
         self._active_two_wheel_target = None
+        self._active_two_wheel_goal = None
 
     def _finish_direct_navigation(self, success, reason=""):
         mission = self._direct_nav
@@ -2447,6 +2474,7 @@ class NavBridge(Node):
             self.get_logger().error(
                 f"direct navigation failed target={target}: {reason}"
             )
+        self._active_two_wheel_goal = None
 
     def _update_direct_navigation(self, x, y, yaw):
         mission = self._direct_nav

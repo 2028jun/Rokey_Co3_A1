@@ -11,8 +11,11 @@
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <depend>serving_robot_interfaces</depend>
+  <exec_depend>ament_index_python</exec_depend>
   <exec_depend>hand_safety</exec_depend>
   <exec_depend>nav_robot_missions</exec_depend>
+  <exec_depend>two_wheel_rails</exec_depend>
+  <exec_depend>rviz2</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
 

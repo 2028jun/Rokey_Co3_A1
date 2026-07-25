@@ -33,6 +33,7 @@ UI가 /manager/order로 주문(테이블 번호, 피자1~3 개수, 음료 개수
 - 대기열에 있던 주문이 실패로 함께 취소되면 /manager/order_cancelled로 테이블 번호를 알린다.
 """
 
+import json
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Optional
@@ -41,7 +42,7 @@ import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import Bool, Int32
+from std_msgs.msg import Bool, Int32, String
 from std_srvs.srv import Trigger
 
 from serving_robot_interfaces.srv import OrderRequest, TaskCommand
@@ -91,6 +92,7 @@ PLATE_COUNT_MAX = 4
 MAX_TRIPS_PER_ORDER = 20
 MAX_PENDING_ORDERS = 10
 COMPLETED_DISPLAY_SEC = 1.5  # 완료 상태를 최소 이 정도는 유지한 뒤 다음 단계로 넘어간다.
+NAVIGATION_HANDOFF_DELAY_SEC = 1.0  # 완료 발행 후 Navigation worker가 정리될 시간을 준다.
 
 
 @dataclass
@@ -174,6 +176,10 @@ class ManagerNode(Node):
             'safety_cmd_timeout_sec', 5.0).value
         self._hand_safety_heartbeat_sec = self.declare_parameter(
             'hand_safety_heartbeat_sec', 2.0).value
+        self._navigation_only = bool(
+            self.declare_parameter('navigation_only', False).value)
+        self._require_navigation_ready = bool(
+            self.declare_parameter('require_navigation_ready', False).value)
         timeout_parameters = {
             'state_timeout_sec': self._state_timeout_sec,
             'navigation_timeout_sec': self._navigation_timeout_sec,
@@ -207,6 +213,9 @@ class ManagerNode(Node):
 
         self._nav_status = None
         self._nav_location = None
+        self._nav_detail_state = None
+        self._nav_detail_phase = None
+        self._navigation_initialized = False
         self._nav_moving_confirmed = False
         self._nav_command_accepted = False
         self._nav_command_epoch = 0
@@ -232,45 +241,65 @@ class ManagerNode(Node):
         self._safety_command_epoch = 0
         self._state_deadline = None
         self._completed_advance_timer = None
+        self._navigation_handoff_timer = None
+        self._order_service = None
 
         # All endpoints are relative.  At the root namespace this preserves
         # the legacy API; under /robot1 or /robot2 it creates an independent
         # worker state machine for that robot.
+        status_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
         self._arm_client = self.create_client(TaskCommand, 'arm/command')
         self._nav_client = self.create_client(TaskCommand, 'navigation/command')
         self._spawn_client = self.create_client(TaskCommand, 'food_spawn/command')
 
         self.create_subscription(Int32, 'arm/status', self._on_arm_status, 10)
-        self.create_subscription(Int32, 'navigation/status', self._on_nav_status, 10)
         self.create_subscription(
-            Int32, 'navigation/current_location', self._on_nav_location, 10)
-        self.create_subscription(Int32, 'food_spawn/status', self._on_spawn_status, 10)
+            Int32, 'navigation/status', self._on_nav_status, status_qos)
+        self.create_subscription(
+            Int32, 'navigation/current_location', self._on_nav_location, status_qos)
+        self.create_subscription(
+            String, 'navigation/detail', self._on_nav_detail, status_qos)
+        self.create_subscription(
+            Int32, 'food_spawn/status', self._on_spawn_status, 10)
         self.create_subscription(Bool, 'hand_safety/intrusion', self._on_hand_intrusion, 10)
         self.create_subscription(
             Bool, 'serving_robot/emergency_stop', self._on_emergency_stop, 10)
 
         # 늦게 연결된 UI도 마지막 시스템 상태를 즉시 받을 수 있게 상태 토픽은 latched QoS로
         # 발행한다. 일반 volatile 구독자와도 현재 이후의 발행은 호환된다.
-        status_qos = QoSProfile(
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-        )
         self._system_status_pub = self.create_publisher(
             Int32, 'system/status', status_qos)
         self._table_arrived_pub = self.create_publisher(
             Bool, 'serving_robot/table_arrived', status_qos)
         self._order_cancelled_pub = self.create_publisher(Int32, 'manager/order_cancelled', 10)
-        self.create_service(OrderRequest, 'manager/order', self._on_order_request)
         self.create_service(Trigger, 'manager/reset_fault', self._on_reset_fault)
 
         self.create_timer(1.0, self._check_timeouts)
 
         self._publish_system_status()
+        self._maybe_enable_order_service()
 
     # ------------------------------------------------------------------
     # 주문 접수 (UI -> Manager)
     # ------------------------------------------------------------------
+    def _maybe_enable_order_service(self):
+        if getattr(self, '_order_service', None) is not None:
+            return
+        if self._require_navigation_ready and not (
+                self._navigation_initialized
+                and
+                self._nav_status == NAV_STATUS_ARRIVED
+                and self._nav_location == NAV_LOCATION_KITCHEN):
+            return
+        self._order_service = self.create_service(
+            OrderRequest, 'manager/order', self._on_order_request)
+        self.get_logger().info(
+            '✅ 주문 서비스 준비 완료: Navigation 초기 위치가 주방으로 확인됐습니다.')
+
     def _on_order_request(self, request, response):
         self.get_logger().info(
             f'📥 [수신/RECV Service] /manager/order -> Table={request.table_id}, '
@@ -319,12 +348,19 @@ class ManagerNode(Node):
             response.success = False
             return response
 
-        if not (self._arm_client.service_is_ready()
-                and self._nav_client.service_is_ready()
-                and self._spawn_client.service_is_ready()):
-            self.get_logger().error('❌ [REJECT] Arm/Navigation/음식 스폰 서비스가 준비되지 않아 주문을 거부합니다.')
+        navigation_ready = self._nav_client.service_is_ready()
+        serving_ready = (self._arm_client.service_is_ready()
+                         and self._spawn_client.service_is_ready())
+        if not navigation_ready or (not self._navigation_only and not serving_ready):
+            required = 'Navigation' if self._navigation_only else 'Arm/Navigation/음식 스폰'
+            self.get_logger().error(
+                f'❌ [REJECT] {required} 서비스가 준비되지 않아 주문을 거부합니다.')
             response.success = False
             return response
+
+        if self._navigation_only:
+            # 주행 검증에서는 주문 품목 수와 무관하게 테이블을 한 번 왕복한다.
+            serve_queue = [Trip(None, 0, False)]
 
         if self._state == _State.IDLE:
             response.success = True
@@ -350,11 +386,11 @@ class ManagerNode(Node):
             response.message = 'FAILED 상태가 아니어서 초기화하지 않았습니다.'
             return response
         active_subsystems = []
-        if self._arm_status == ARM_STATUS_WORKING:
+        if not self._navigation_only and self._arm_status == ARM_STATUS_WORKING:
             active_subsystems.append('Arm')
         if self._nav_status == NAV_STATUS_MOVING:
             active_subsystems.append('Navigation')
-        if self._spawn_status == SPAWN_STATUS_WORKING:
+        if not self._navigation_only and self._spawn_status == SPAWN_STATUS_WORKING:
             active_subsystems.append('Food spawn')
         if active_subsystems:
             response.success = False
@@ -449,6 +485,14 @@ class ManagerNode(Node):
                 COMPLETED_DISPLAY_SEC, self._advance_after_completed_delay)
             return
         self._current_trip = self._serve_queue.pop(0)
+        if self._navigation_only:
+            self.get_logger().info(
+                f'🚚 [NAVIGATION ONLY] 테이블 {self._table_id} 왕복 주행 시작')
+            self._state = _State.MOVING_TO_TABLE
+            self._set_state_deadline()
+            self._publish_system_status()
+            self._call_nav_command(self._table_id)
+            return
         self._state = _State.SPAWNING
         self._set_state_deadline()
         self._publish_system_status()
@@ -476,6 +520,8 @@ class ManagerNode(Node):
     def _call_nav_command(self, command):
         self._nav_status = None
         self._nav_location = None
+        self._nav_detail_state = None
+        self._nav_detail_phase = None
         self._nav_moving_confirmed = False
         self._nav_command_accepted = False
         self._nav_command_epoch += 1
@@ -516,6 +562,7 @@ class ManagerNode(Node):
         self.get_logger().info(f'📥 [수신/RECV Response] Navigation 명령 수락 확인: command={command}')
         self._check_table_arrival()
         self._check_kitchen_arrival()
+        self._maybe_enable_order_service()
 
     def _call_arm_command(self, command):
         self._arm_working_confirmed = False
@@ -663,6 +710,7 @@ class ManagerNode(Node):
             return
         self._check_table_arrival()
         self._check_kitchen_arrival()
+        self._maybe_enable_order_service()
 
     def _on_nav_location(self, msg):
         prev_location = getattr(self, "_nav_location", None)
@@ -672,22 +720,61 @@ class ManagerNode(Node):
             self.get_logger().info(f'📥 [수신/RECV Topic] /navigation/current_location = {msg.data} ({loc_name})')
         self._check_table_arrival()
         self._check_kitchen_arrival()
+        self._maybe_enable_order_service()
+
+    def _on_nav_detail(self, msg):
+        try:
+            detail = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        self._nav_detail_state = detail.get('state')
+        self._nav_detail_phase = detail.get('phase')
+        if (self._nav_detail_state == 'SUCCEEDED'
+                and self._nav_detail_phase == 'initialized'):
+            self._navigation_initialized = True
+            self._maybe_enable_order_service()
+        self._check_table_arrival()
+        self._check_kitchen_arrival()
 
     def _check_table_arrival(self):
         if (self._state == _State.MOVING_TO_TABLE
                 and self._nav_command_accepted
                 and self._nav_moving_confirmed
                 and self._nav_status == NAV_STATUS_ARRIVED
-                and self._nav_location == self._table_id):
-            self.get_logger().info(f'🎯 [ARRIVED] 테이블 {self._table_id} 도착 확인 완료 -> 서빙 시작')
-            self._begin_arm_serving()
+                and self._nav_location == self._table_id
+                and self._nav_detail_state == 'SUCCEEDED'
+                and self._nav_detail_phase == 'completed'):
+            if self._navigation_only:
+                self.get_logger().info(
+                    f'🎯 [ARRIVED] 테이블 {self._table_id} 도착 확인 완료 -> 주방 복귀 준비')
+                if self._navigation_handoff_timer is None:
+                    self._navigation_handoff_timer = self.create_timer(
+                        NAVIGATION_HANDOFF_DELAY_SEC,
+                        self._finish_navigation_only_table_stop,
+                    )
+            else:
+                self.get_logger().info(
+                    f'🎯 [ARRIVED] 테이블 {self._table_id} 도착 확인 완료 -> 서빙 시작')
+                self._begin_arm_serving()
+
+    def _finish_navigation_only_table_stop(self):
+        timer = self._navigation_handoff_timer
+        if timer is None:
+            return
+        timer.cancel()
+        self._navigation_handoff_timer = None
+        if self._state != _State.MOVING_TO_TABLE:
+            return
+        self._return_to_kitchen_for_next_trip()
 
     def _check_kitchen_arrival(self):
         if (self._state == _State.RETURNING_TO_KITCHEN
                 and self._nav_command_accepted
                 and self._nav_moving_confirmed
                 and self._nav_status == NAV_STATUS_ARRIVED
-                and self._nav_location == NAV_LOCATION_KITCHEN):
+                and self._nav_location == NAV_LOCATION_KITCHEN
+                and self._nav_detail_state == 'SUCCEEDED'
+                and self._nav_detail_phase == 'completed'):
             self.get_logger().info('🏠 [ARRIVED] 주방 대기 위치 도착 확인 완료')
             self._start_next_trip()
 
@@ -881,6 +968,10 @@ class ManagerNode(Node):
         if self._completed_advance_timer is not None:
             self._completed_advance_timer.cancel()
             self._completed_advance_timer = None
+        handoff_timer = getattr(self, '_navigation_handoff_timer', None)
+        if handoff_timer is not None:
+            handoff_timer.cancel()
+            self._navigation_handoff_timer = None
 
     def _fail(self):
         if self._state == _State.FAILED:
@@ -902,8 +993,9 @@ class ManagerNode(Node):
 
     def _send_best_effort_stop(self, failed_state):
         """동작 중일 수 있는 하위 노드에 응답을 기다리지 않고 정지 명령을 보낸다."""
-        if (failed_state in (_State.ARM_SERVING, _State.ARM_PAUSED)
-                or self._arm_status == ARM_STATUS_WORKING):
+        if (not self._navigation_only
+                and (failed_state in (_State.ARM_SERVING, _State.ARM_PAUSED)
+                     or self._arm_status == ARM_STATUS_WORKING)):
             self._call_emergency_command(self._arm_client, 'Arm', ARM_CMD_PAUSE)
         if (failed_state in (_State.RETURNING_TO_KITCHEN, _State.MOVING_TO_TABLE)
                 or self._nav_status == NAV_STATUS_MOVING):

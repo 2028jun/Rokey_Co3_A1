@@ -9,6 +9,8 @@ without duplicate calls or static sleep delays.
 from __future__ import annotations
 
 import json
+import time
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -26,8 +28,12 @@ class NavigationAutoInitializerNode(Node):
         self._has_clock = False
         self._initialized = False
         self._attempt_in_progress = False
+        self._attempt_deadline = None
         self._max_retries = 10
         self._retry_count = 0
+        self._attempt_timeout_sec = float(
+            self.declare_parameter("initialization_timeout_sec", 90.0).value
+        )
 
         status_qos = QoSProfile(
             depth=1,
@@ -63,7 +69,16 @@ class NavigationAutoInitializerNode(Node):
             if state == "SUCCEEDED" and phase == "initialized":
                 if not self._initialized:
                     self._initialized = True
+                    self._attempt_in_progress = False
+                    self._attempt_deadline = None
                     self.get_logger().info("✅ Navigation is fully initialized and ready! (phase=initialized, state=SUCCEEDED)")
+            elif state == "FAILED" and self._attempt_in_progress:
+                self._attempt_in_progress = False
+                self._attempt_deadline = None
+                reason = detail.get("reason", "unknown failure")
+                self.get_logger().warning(
+                    f"Navigation initialization failed: {reason}. Retrying..."
+                )
         except Exception:
             pass
 
@@ -72,7 +87,16 @@ class NavigationAutoInitializerNode(Node):
             return
 
         if self._attempt_in_progress:
-            return
+            if (
+                self._attempt_deadline is None
+                or time.monotonic() < self._attempt_deadline
+            ):
+                return
+            self.get_logger().warning(
+                "Navigation initialization status timed out. Retrying..."
+            )
+            self._attempt_in_progress = False
+            self._attempt_deadline = None
 
         if not self._has_clock:
             self.get_logger().info("Waiting for /clock...", throttle_duration_sec=5.0)
@@ -88,6 +112,7 @@ class NavigationAutoInitializerNode(Node):
             return
 
         self._attempt_in_progress = True
+        self._attempt_deadline = time.monotonic() + self._attempt_timeout_sec
         self._retry_count += 1
         self.get_logger().info(f"🚀 Calling /navigation/initialize (attempt {self._retry_count}/{self._max_retries})...")
 
@@ -102,10 +127,12 @@ class NavigationAutoInitializerNode(Node):
                 self.get_logger().info(f"Received initialization response: {res.message}. Validating localization status...")
             else:
                 self.get_logger().warning(f"Initialization request returned failure: {res.message}")
+                self._attempt_in_progress = False
+                self._attempt_deadline = None
         except Exception as exc:
             self.get_logger().error(f"Initialization service call failed with exception: {exc}")
-        finally:
             self._attempt_in_progress = False
+            self._attempt_deadline = None
 
 
 def main(args=None) -> None:

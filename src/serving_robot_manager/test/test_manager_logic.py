@@ -3,7 +3,7 @@
 from unittest.mock import Mock
 
 from rclpy.time import Time
-from std_msgs.msg import Int32
+from std_msgs.msg import Int32, String
 from std_srvs.srv import Trigger
 
 from serving_robot_interfaces.srv import TaskCommand
@@ -16,6 +16,7 @@ from serving_robot_manager.manager_node import (
     Trip,
     _State,
 )
+from serving_robot_manager.fleet_manager_node import FleetManager
 
 
 class _FinishedFuture:
@@ -32,8 +33,26 @@ class _FinishedFuture:
 def _bare_manager(state=_State.IDLE):
     manager = ManagerNode.__new__(ManagerNode)
     manager._state = state
+    manager._navigation_only = False
+    manager._require_navigation_ready = False
+    manager._navigation_initialized = False
+    manager._nav_detail_state = None
+    manager._nav_detail_phase = None
+    manager._order_service = object()
     manager.get_logger = Mock(return_value=Mock())
     return manager
+
+
+def _order_request(table_id):
+    request = type('OrderRequest', (), {})()
+    request.table_id = table_id
+    request.pizza1_count = 1
+    request.pizza2_count = 0
+    request.pizza3_count = 0
+    request.drink_count = 0
+    request.cutlery_count = 0
+    request.plate_count = 0
+    return request
 
 
 def test_working_status_does_not_create_idle_deadline():
@@ -149,6 +168,141 @@ def test_unknown_kitchen_state_still_requests_return_navigation():
     manager._call_nav_command.assert_called_once_with(4)
 
 
+def test_navigation_only_trip_drives_to_table_without_spawn_or_arm():
+    """주행 전용 트립은 스폰·팔 없이 테이블 도착 후 즉시 주방으로 복귀한다."""
+    manager = _bare_manager()
+    manager._navigation_only = True
+    manager._serve_queue = [Trip(1, 2, True)]
+    manager._table_id = 2
+    manager._set_state_deadline = Mock()
+    manager._publish_system_status = Mock()
+    manager._call_nav_command = Mock()
+    handoff_timer = Mock()
+    manager._navigation_handoff_timer = None
+    manager.create_timer = Mock(return_value=handoff_timer)
+
+    manager._start_next_trip()
+
+    assert manager._state == _State.MOVING_TO_TABLE
+    manager._call_nav_command.assert_called_once_with(2)
+
+    manager._nav_command_accepted = True
+    manager._nav_moving_confirmed = True
+    manager._nav_status = 2
+    manager._nav_location = 2
+    manager._nav_detail_state = 'SUCCEEDED'
+    manager._nav_detail_phase = 'completed'
+    manager._return_to_kitchen_for_next_trip = Mock()
+    manager._check_table_arrival()
+
+    manager._return_to_kitchen_for_next_trip.assert_not_called()
+    manager._finish_navigation_only_table_stop()
+
+    handoff_timer.cancel.assert_called_once_with()
+    manager._return_to_kitchen_for_next_trip.assert_called_once_with()
+
+
+def test_isaac_arrival_alone_does_not_complete_navigation():
+    """Isaac 중복 ARRIVED만으로는 subsystem 완료 전이를 시작하지 않는다."""
+    manager = _bare_manager(_State.MOVING_TO_TABLE)
+    manager._navigation_only = True
+    manager._table_id = 1
+    manager._nav_command_accepted = True
+    manager._nav_moving_confirmed = True
+    manager._nav_status = 2
+    manager._nav_location = 1
+    manager._nav_detail_state = None
+    manager._nav_detail_phase = None
+    manager._navigation_handoff_timer = None
+    manager.create_timer = Mock(return_value=Mock())
+
+    manager._check_table_arrival()
+    manager.create_timer.assert_not_called()
+
+    manager._on_nav_detail(String(
+        data='{"state": "SUCCEEDED", "phase": "completed"}'))
+    manager.create_timer.assert_called_once()
+
+
+def test_order_service_waits_for_navigation_initialization():
+    """멀티 모드 주문 서비스는 주방 초기화 완료 후에만 열린다."""
+    manager = _bare_manager()
+    manager._require_navigation_ready = True
+    manager._order_service = None
+    manager._navigation_initialized = False
+    manager._nav_status = None
+    manager._nav_location = None
+    manager._nav_detail_state = None
+    manager._nav_detail_phase = None
+    manager.create_service = Mock(return_value=object())
+
+    manager._maybe_enable_order_service()
+    manager.create_service.assert_not_called()
+
+    manager._nav_location = 4
+    manager._nav_status = 2
+    manager._maybe_enable_order_service()
+    manager.create_service.assert_not_called()
+
+    manager._on_nav_detail(String(
+        data='{"state": "SUCCEEDED", "phase": "initialized"}'
+    ))
+
+    manager.create_service.assert_called_once()
+    assert manager._order_service is not None
+
+
+def test_fleet_assigns_second_order_to_robot2_while_robot1_is_reserved():
+    """첫 주문 직후 들어온 두 번째 주문은 robot1이 아니라 robot2에 배정한다."""
+    fleet = FleetManager.__new__(FleetManager)
+    fleet._robots = ['robot1', 'robot2']
+    fleet._serialize_shared_payloads = False
+    fleet._states = {'robot1': 0, 'robot2': 0}
+    fleet._reserved = set()
+    fleet.get_logger = Mock(return_value=Mock())
+    accepted = type('Response', (), {'success': True})()
+    fleet._clients = {
+        'robot1': Mock(service_is_ready=Mock(return_value=True)),
+        'robot2': Mock(service_is_ready=Mock(return_value=True)),
+    }
+    for client in fleet._clients.values():
+        client.call_async.return_value = _FinishedFuture(accepted)
+
+    first_response = type('Response', (), {'success': False})()
+    second_response = type('Response', (), {'success': False})()
+    fleet._on_order(_order_request(0), first_response)
+    fleet._on_order(_order_request(1), second_response)
+
+    assert first_response.success is True
+    assert second_response.success is True
+    fleet._clients['robot1'].call_async.assert_called_once()
+    fleet._clients['robot2'].call_async.assert_called_once()
+
+
+def test_fleet_assigns_order_to_robot2_while_robot1_is_driving():
+    """robot1이 주행 중이면 다음 주문은 남은 유휴 robot2에 배정한다."""
+    fleet = FleetManager.__new__(FleetManager)
+    fleet._robots = ['robot1', 'robot2']
+    fleet._serialize_shared_payloads = False
+    fleet._states = {'robot1': 3, 'robot2': 0}
+    fleet._reserved = set()
+    fleet.get_logger = Mock(return_value=Mock())
+    accepted = type('Response', (), {'success': True})()
+    fleet._clients = {
+        'robot1': Mock(service_is_ready=Mock(return_value=True)),
+        'robot2': Mock(service_is_ready=Mock(return_value=True)),
+    }
+    for client in fleet._clients.values():
+        client.call_async.return_value = _FinishedFuture(accepted)
+
+    response = type('Response', (), {'success': False})()
+    fleet._on_order(_order_request(1), response)
+
+    assert response.success is True
+    fleet._clients['robot1'].call_async.assert_not_called()
+    fleet._clients['robot2'].call_async.assert_called_once()
+
+
 def test_plate_rack_shares_first_trip_and_encodes_plate_count():
     """접시 랙이 첫 트립에 합쳐지고 스폰 명령에 수량이 보존되는지 확인한다."""
     trips = ManagerNode._build_serve_queue(1, 0, 0, 2, 1, 3)
@@ -255,15 +409,21 @@ def test_normal_single_trip_reaches_completed():
     manager._on_nav_status(Int32(data=NAV_STATUS_MOVING))
     manager._on_nav_location(Int32(data=4))
     manager._on_nav_status(Int32(data=2))
+    manager._on_nav_detail(String(
+        data='{"state": "SUCCEEDED", "phase": "completed"}'))
     manager._on_spawn_status(Int32(data=SPAWN_STATUS_WORKING))
     manager._on_spawn_status(Int32(data=SPAWN_STATUS_COMPLETED))
     manager._on_nav_status(Int32(data=NAV_STATUS_MOVING))
     manager._on_nav_location(Int32(data=2))
     manager._on_nav_status(Int32(data=2))
+    manager._on_nav_detail(String(
+        data='{"state": "SUCCEEDED", "phase": "completed"}'))
     manager._on_arm_status(Int32(data=ARM_STATUS_WORKING))
     manager._on_arm_status(Int32(data=2))
     manager._on_nav_status(Int32(data=NAV_STATUS_MOVING))
     manager._on_nav_location(Int32(data=4))
     manager._on_nav_status(Int32(data=2))
+    manager._on_nav_detail(String(
+        data='{"state": "SUCCEEDED", "phase": "completed"}'))
 
     assert manager._state == _State.COMPLETED

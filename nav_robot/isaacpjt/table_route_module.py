@@ -18,9 +18,14 @@ TABLE_DOCKS = {
 }
 
 
-def build_table_route(table_id: int, x: float, y: float):
+def build_table_route(
+    table_id: int,
+    x: float,
+    y: float,
+    table_dock=None,
+):
     """Return axis-aligned stages from the current pose to a table dock."""
-    goal_x, goal_y, goal_yaw = TABLE_DOCKS[table_id]
+    goal_x, goal_y, goal_yaw = table_dock or TABLE_DOCKS[table_id]
     stages = []
 
     # If a command is issued while docked, back out to the centre aisle first.

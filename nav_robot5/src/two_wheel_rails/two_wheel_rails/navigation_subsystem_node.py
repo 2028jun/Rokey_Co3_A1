@@ -180,8 +180,6 @@ class NavigationSubsystemNode(Node):
         self._tf_buffer = tf_buffer
         self._tracker = tracker
         self._controller = SimplifiedPathNavigator(nav, tf_buffer, tracker)
-        if hasattr(self, "_executor_ref") and self._executor_ref is not None:
-            self._executor_ref.add_node(nav)
 
     def _run_initialize(self) -> None:
         try:
@@ -406,7 +404,6 @@ def main(args=None) -> None:
     node = NavigationSubsystemNode()
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
-    node._executor_ref = executor
     try:
         executor.spin()
     except KeyboardInterrupt:

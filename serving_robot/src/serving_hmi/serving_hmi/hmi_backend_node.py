@@ -47,6 +47,14 @@ order_manager = OrderManager()
 class HMIBridgeNode(Node):
     def __init__(self):
         super().__init__('serving_hmi_bridge_node')
+
+        self.declare_parameter('robot_namespace', 'robot1')
+        robot_namespace = str(
+            self.get_parameter('robot_namespace').value
+        ).strip('/')
+        topic_prefix = f'/{robot_namespace}' if robot_namespace else ''
+        self.camera_topic = f'{topic_prefix}/camera/color/image_raw'
+        self.odom_topic = f'{topic_prefix}/nav_robot/odom'
         
         # System status state
         self.last_clock_time = 0.0
@@ -122,13 +130,13 @@ class HMIBridgeNode(Node):
         self.last_camera_error_time = 0.0
         self.camera_sub = self.create_subscription(
             Image,
-            '/camera/color/image_raw',
+            self.camera_topic,
             self.table_camera_callback,
             qos_profile_sensor_data
         )
         self.odom_sub = self.create_subscription(
             Odometry,
-            '/nav_robot/odom',
+            self.odom_topic,
             self.odom_callback,
             qos_profile_sensor_data,
         )
@@ -163,7 +171,10 @@ class HMIBridgeNode(Node):
 
         # Periodic timer for checking liveness and driving mock navigation (20 Hz)
         self.create_timer(0.05, self.check_liveness_timer)
-        self.get_logger().info("HMI ROS 2 Bridge Node initialized.")
+        self.get_logger().info(
+            "HMI ROS 2 Bridge Node initialized: "
+            f"camera={self.camera_topic}, odom={self.odom_topic}"
+        )
 
     def set_hand_test_visible(self, visible: bool):
         if not hasattr(self, 'hand_test_client'):
