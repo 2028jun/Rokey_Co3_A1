@@ -28,7 +28,7 @@ Isaac Sim lives elsewhere.
 **Terminal 1 — Isaac Sim**
 ```bash
 cd /home/rokey/cobot3_ws/nav_robot
-export NAV_ROBOT_ROS_DOMAIN_ID=102
+export NAV_ROBOT_ROS_DOMAIN_ID=101
 export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$HOME/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/exts/isaacsim.ros2.bridge/humble/lib"
 /home/rokey/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/python.sh \
   isaacpjt/nav_restaurant_demo.py
@@ -40,7 +40,7 @@ before using the HMI test buttons below.
 ```bash
 cd /home/rokey/cobot3_ws
 source /opt/ros/humble/setup.bash
-export ROS_DOMAIN_ID=102
+export ROS_DOMAIN_ID=101
 colcon build --symlink-install --packages-select \
   serving_robot_interfaces serving_robot_manager hand_safety serving_hmi two_wheel_rails
 source install/setup.bash
@@ -55,7 +55,7 @@ and `nav2_collision_monitor` (stop/slowdown safety zones, gates `cmd_vel` →
 **Terminal 3 — HMI Web Dashboard**
 ```bash
 cd /home/rokey/cobot3_ws
-export ROS_DOMAIN_ID=102
+export ROS_DOMAIN_ID=101
 ./run_hmi.sh
 ```
 Open browser: `http://localhost:8000`
