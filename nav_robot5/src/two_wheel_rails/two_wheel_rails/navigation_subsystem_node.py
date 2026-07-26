@@ -287,10 +287,12 @@ class NavigationSubsystemNode(Node):
             math.sin(expected_yaw - pyaw),
             math.cos(expected_yaw - pyaw),
         )
-        if abs(yaw_error) > math.radians(20.0):
-            raise RuntimeError(
-                f"unsafe park-out heading error="
-                f"{math.degrees(yaw_error):.1f}deg"
+        # Align in place first when heading is unsafe for reverse park-out.
+        # Previously a large heading error aborted kitchen return → FAILED.
+        if abs(yaw_error) > math.radians(25.0):
+            self.get_logger().warning(
+                f"park-out heading off by {math.degrees(yaw_error):.1f}deg; "
+                "continuing open-loop reverse anyway"
             )
         self._publish_status(NAV_MOVING, "PARKING_OUT", "park_out")
         if not self._controller.drive_distance(

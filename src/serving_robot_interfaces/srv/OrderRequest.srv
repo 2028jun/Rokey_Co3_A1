@@ -5,5 +5,7 @@ int32 pizza3_count
 int32 drink_count
 int32 cutlery_count
 int32 plate_count
+string preferred_robot
 ---
 bool success
+string assigned_robot

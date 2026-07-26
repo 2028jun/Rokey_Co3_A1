@@ -1,5 +1,6 @@
 """Manager 노드의 상태 전이 안전장치 회귀 테스트."""
 
+import time
 from unittest.mock import Mock
 
 from rclpy.time import Time
@@ -39,11 +40,15 @@ def _bare_manager(state=_State.IDLE):
     manager._nav_detail_state = None
     manager._nav_detail_phase = None
     manager._order_service = object()
+    manager._table_id = None
+    manager._occupancy_phase = 'clear'
+    manager._table_occupancy_pub = Mock()
+    manager.get_namespace = Mock(return_value='/robot1')
     manager.get_logger = Mock(return_value=Mock())
     return manager
 
 
-def _order_request(table_id):
+def _order_request(table_id, preferred_robot=''):
     request = type('OrderRequest', (), {})()
     request.table_id = table_id
     request.pizza1_count = 1
@@ -52,6 +57,7 @@ def _order_request(table_id):
     request.drink_count = 0
     request.cutlery_count = 0
     request.plate_count = 0
+    request.preferred_robot = preferred_robot
     return request
 
 
@@ -258,25 +264,28 @@ def test_fleet_assigns_second_order_to_robot2_while_robot1_is_reserved():
     fleet._robots = ['robot1', 'robot2']
     fleet._serialize_shared_payloads = False
     fleet._states = {'robot1': 0, 'robot2': 0}
-    fleet._reserved = set()
+    fleet._reserved = {}
+    fleet._table_claims = {}
     fleet.get_logger = Mock(return_value=Mock())
     accepted = type('Response', (), {'success': True})()
-    fleet._clients = {
+    fleet._order_clients = {
         'robot1': Mock(service_is_ready=Mock(return_value=True)),
         'robot2': Mock(service_is_ready=Mock(return_value=True)),
     }
-    for client in fleet._clients.values():
+    for client in fleet._order_clients.values():
         client.call_async.return_value = _FinishedFuture(accepted)
 
-    first_response = type('Response', (), {'success': False})()
-    second_response = type('Response', (), {'success': False})()
+    first_response = type('Response', (), {'success': False, 'assigned_robot': ''})()
+    second_response = type('Response', (), {'success': False, 'assigned_robot': ''})()
     fleet._on_order(_order_request(0), first_response)
     fleet._on_order(_order_request(1), second_response)
 
     assert first_response.success is True
     assert second_response.success is True
-    fleet._clients['robot1'].call_async.assert_called_once()
-    fleet._clients['robot2'].call_async.assert_called_once()
+    assert first_response.assigned_robot == 'robot1'
+    assert second_response.assigned_robot == 'robot2'
+    fleet._order_clients['robot1'].call_async.assert_called_once()
+    fleet._order_clients['robot2'].call_async.assert_called_once()
 
 
 def test_fleet_assigns_order_to_robot2_while_robot1_is_driving():
@@ -285,22 +294,364 @@ def test_fleet_assigns_order_to_robot2_while_robot1_is_driving():
     fleet._robots = ['robot1', 'robot2']
     fleet._serialize_shared_payloads = False
     fleet._states = {'robot1': 3, 'robot2': 0}
-    fleet._reserved = set()
+    fleet._reserved = {}
+    fleet._table_claims = {}
     fleet.get_logger = Mock(return_value=Mock())
     accepted = type('Response', (), {'success': True})()
-    fleet._clients = {
+    fleet._order_clients = {
         'robot1': Mock(service_is_ready=Mock(return_value=True)),
         'robot2': Mock(service_is_ready=Mock(return_value=True)),
     }
-    for client in fleet._clients.values():
+    for client in fleet._order_clients.values():
         client.call_async.return_value = _FinishedFuture(accepted)
 
-    response = type('Response', (), {'success': False})()
+    response = type('Response', (), {'success': False, 'assigned_robot': ''})()
     fleet._on_order(_order_request(1), response)
 
     assert response.success is True
-    fleet._clients['robot1'].call_async.assert_not_called()
-    fleet._clients['robot2'].call_async.assert_called_once()
+    assert response.assigned_robot == 'robot2'
+    fleet._order_clients['robot1'].call_async.assert_not_called()
+    fleet._order_clients['robot2'].call_async.assert_called_once()
+
+
+def test_fleet_respects_preferred_robot():
+    """preferred_robot이 지정되면 해당 로봇만 배정한다."""
+    fleet = FleetManager.__new__(FleetManager)
+    fleet._robots = ['robot1', 'robot2']
+    fleet._serialize_shared_payloads = False
+    fleet._states = {'robot1': 0, 'robot2': 0}
+    fleet._reserved = {}
+    fleet._table_claims = {}
+    fleet.get_logger = Mock(return_value=Mock())
+    accepted = type('Response', (), {'success': True})()
+    fleet._order_clients = {
+        'robot1': Mock(service_is_ready=Mock(return_value=True)),
+        'robot2': Mock(service_is_ready=Mock(return_value=True)),
+    }
+    for client in fleet._order_clients.values():
+        client.call_async.return_value = _FinishedFuture(accepted)
+
+    response = type('Response', (), {'success': False, 'assigned_robot': ''})()
+    fleet._on_order(_order_request(0, preferred_robot='robot2'), response)
+
+    assert response.success is True
+    assert response.assigned_robot == 'robot2'
+    fleet._order_clients['robot1'].call_async.assert_not_called()
+    fleet._order_clients['robot2'].call_async.assert_called_once()
+
+
+def test_fleet_rejects_busy_preferred_robot():
+    """지정 로봇이 busy면 주문을 거부한다."""
+    fleet = FleetManager.__new__(FleetManager)
+    fleet._robots = ['robot1', 'robot2']
+    fleet._serialize_shared_payloads = False
+    fleet._states = {'robot1': 3, 'robot2': 0}
+    fleet._reserved = {}
+    fleet._table_claims = {}
+    fleet.get_logger = Mock(return_value=Mock())
+    fleet._order_clients = {
+        'robot1': Mock(service_is_ready=Mock(return_value=True)),
+        'robot2': Mock(service_is_ready=Mock(return_value=True)),
+    }
+
+    response = type('Response', (), {'success': True, 'assigned_robot': 'x'})()
+    fleet._on_order(_order_request(0, preferred_robot='robot1'), response)
+
+    assert response.success is False
+    assert response.assigned_robot == ''
+    fleet._order_clients['robot1'].call_async.assert_not_called()
+    fleet._order_clients['robot2'].call_async.assert_not_called()
+
+
+def test_path_clearance_detects_crossing_segments():
+    from serving_robot_manager.path_yield_coordinator_node import (
+        _path_clearance,
+        _trim_horizon,
+        PathYieldCoordinator,
+        RobotIntent,
+    )
+
+    a = [(0.0, 5.0), (0.0, 0.0)]
+    b = [(0.0, 0.0), (0.0, 5.0)]
+    assert _path_clearance(a, b) < 0.1
+
+    far = [(3.0, 5.0), (3.0, 0.0)]
+    assert _path_clearance(a, far) > 2.0
+
+    trimmed = _trim_horizon([(0.0, 0.0), (0.0, 10.0)], 2.5)
+    assert abs(trimmed[-1][1] - 2.5) < 0.05
+
+    coord = PathYieldCoordinator.__new__(PathYieldCoordinator)
+    # Earlier order has higher priority (more positive / less negative).
+    coord._intents = {
+        "robot1": RobotIntent("robot1", priority=-100.0),
+        "robot2": RobotIntent("robot2", priority=-101.0),
+    }
+    assert coord._choose_yielder("robot1", "robot2") == "robot2"
+
+
+def test_far_shared_aisle_does_not_path_conflict():
+    """멀리 있는 두 로봇은 통로 polyline이 겹쳐도 pause 하지 않는다."""
+    from serving_robot_manager.path_yield_coordinator_node import (
+        PathYieldCoordinator,
+        RobotIntent,
+    )
+    import time
+
+    coord = PathYieldCoordinator.__new__(PathYieldCoordinator)
+    coord._clearance_m = 0.55
+    coord._pose_clearance_m = 0.90
+    coord._horizon_m = 1.6
+    coord._engage_m = 2.0
+    coord._intent_stale_sec = 3.0
+    now = time.monotonic()
+    coord._intents = {
+        "robot1": RobotIntent(
+            "robot1",
+            priority=-100.0,
+            active=True,
+            phase="approaching",
+            table_id=0,
+            pose_xy=(0.0, 4.5),
+            polyline=[(0.0, 4.5), (0.0, -2.2), (-1.7, -2.2)],
+            updated_at=now,
+        ),
+        "robot2": RobotIntent(
+            "robot2",
+            priority=-101.0,
+            active=True,
+            phase="approaching",
+            table_id=1,
+            pose_xy=(0.0, -1.0),
+            polyline=[(0.0, -1.0), (0.0, -2.2), (1.7, -2.2)],
+            updated_at=now,
+        ),
+    }
+    assert coord._conflict("robot1", "robot2") is False
+
+
+def test_near_shared_aisle_path_conflicts():
+    from serving_robot_manager.path_yield_coordinator_node import (
+        PathYieldCoordinator,
+        RobotIntent,
+    )
+    import time
+
+    coord = PathYieldCoordinator.__new__(PathYieldCoordinator)
+    coord._clearance_m = 0.55
+    coord._pose_clearance_m = 0.90
+    coord._horizon_m = 1.6
+    coord._engage_m = 2.0
+    coord._intent_stale_sec = 3.0
+    now = time.monotonic()
+    coord._intents = {
+        "robot1": RobotIntent(
+            "robot1",
+            priority=-100.0,
+            active=True,
+            phase="approaching",
+            table_id=0,
+            pose_xy=(0.0, 1.0),
+            polyline=[(0.0, 1.0), (0.0, -2.2), (-1.7, -2.2)],
+            updated_at=now,
+        ),
+        "robot2": RobotIntent(
+            "robot2",
+            priority=-101.0,
+            active=True,
+            phase="approaching",
+            table_id=1,
+            pose_xy=(0.0, 0.2),
+            polyline=[(0.0, 0.2), (0.0, -2.2), (1.7, -2.2)],
+            updated_at=now,
+        ),
+    }
+    assert coord._conflict("robot1", "robot2") is True
+
+
+def test_stationary_occupy_does_not_path_conflict_other_table():
+    """다른 테이블로 가는 로봇은 docked peer의 stale path에 막히지 않는다."""
+    from serving_robot_manager.path_yield_coordinator_node import (
+        PathYieldCoordinator,
+        RobotIntent,
+    )
+    import time
+
+    coord = PathYieldCoordinator.__new__(PathYieldCoordinator)
+    coord._clearance_m = 0.65
+    coord._pose_clearance_m = 1.25
+    coord._horizon_m = 2.8
+    coord._engage_m = 2.0
+    coord._intent_stale_sec = 3.0
+    now = time.monotonic()
+    # robot1 finished approach to table 0 but still advertises old aisle path.
+    coord._intents = {
+        "robot1": RobotIntent(
+            "robot1",
+            priority=-100.0,
+            active=True,
+            phase="occupying",
+            table_id=0,
+            pose_xy=(-1.7, -2.2),
+            polyline=[(0.0, 4.0), (0.0, -2.2), (-1.7, -2.2)],
+            updated_at=now,
+        ),
+        "robot2": RobotIntent(
+            "robot2",
+            priority=-101.0,
+            active=True,
+            phase="returning",
+            table_id=1,
+            pose_xy=(0.4, 1.0),
+            polyline=[(0.4, 1.0), (0.4, 4.5)],
+            updated_at=now,
+        ),
+    }
+    assert coord._conflict("robot1", "robot2") is False
+
+
+def test_same_table_occupying_conflicts_with_approaching():
+    from serving_robot_manager.path_yield_coordinator_node import (
+        PathYieldCoordinator,
+        RobotIntent,
+    )
+    import time
+
+    coord = PathYieldCoordinator.__new__(PathYieldCoordinator)
+    coord._clearance_m = 0.65
+    coord._pose_clearance_m = 1.25
+    coord._horizon_m = 2.8
+    coord._intent_stale_sec = 3.0
+    now = time.monotonic()
+    coord._intents = {
+        "robot1": RobotIntent(
+            "robot1",
+            priority=-100.0,
+            active=True,
+            phase="occupying",
+            table_id=0,
+            pose_xy=(-1.7, -2.2),
+            updated_at=now,
+        ),
+        "robot2": RobotIntent(
+            "robot2",
+            priority=-101.0,
+            active=True,
+            phase="approaching",
+            table_id=0,
+            pose_xy=(0.0, 2.0),
+            polyline=[(0.0, -2.2), (-1.7, -2.2)],
+            updated_at=now,
+        ),
+    }
+    assert coord._conflict("robot1", "robot2") is True
+    assert coord._choose_yielder("robot1", "robot2") == "robot2"
+
+
+def test_different_tables_no_same_table_conflict():
+    from serving_robot_manager.path_yield_coordinator_node import (
+        PathYieldCoordinator,
+        RobotIntent,
+    )
+    import time
+
+    coord = PathYieldCoordinator.__new__(PathYieldCoordinator)
+    coord._clearance_m = 0.65
+    coord._pose_clearance_m = 1.25
+    coord._horizon_m = 2.8
+    coord._intent_stale_sec = 3.0
+    now = time.monotonic()
+    coord._intents = {
+        "robot1": RobotIntent(
+            "robot1",
+            priority=-100.0,
+            active=True,
+            phase="occupying",
+            table_id=0,
+            pose_xy=(-1.7, -2.2),
+            updated_at=now,
+        ),
+        "robot2": RobotIntent(
+            "robot2",
+            priority=-101.0,
+            active=True,
+            phase="approaching",
+            table_id=2,
+            pose_xy=(0.4, 3.0),
+            polyline=[(0.4, 0.7), (1.7, 0.7)],
+            updated_at=now,
+        ),
+    }
+    assert coord._same_table_conflict(
+        coord._intents["robot1"], coord._intents["robot2"]
+    ) is False
+
+
+def test_manager_publishes_occupancy_phases():
+    manager = _bare_manager(_State.MOVING_TO_TABLE)
+    manager._table_id = 1
+    manager._occupancy_phase = 'clear'
+    manager._publish_table_occupancy('approaching')
+    assert manager._occupancy_phase == 'approaching'
+    manager._table_occupancy_pub.publish.assert_called()
+    payload = manager._table_occupancy_pub.publish.call_args.args[0].data
+    assert '"phase": "approaching"' in payload or '"phase":"approaching"' in payload
+    assert '"table_id": 1' in payload or '"table_id":1' in payload
+
+    manager._publish_table_occupancy('clear')
+    assert manager._occupancy_phase == 'clear'
+
+
+def test_fleet_tracks_table_claims_without_blocking_dispatch():
+    fleet = FleetManager.__new__(FleetManager)
+    fleet._robots = ['robot1', 'robot2']
+    fleet._serialize_shared_payloads = False
+    fleet._states = {'robot1': 4, 'robot2': 0}
+    fleet._reserved = {}
+    fleet._table_claims = {}
+    fleet.get_logger = Mock(return_value=Mock())
+    accepted = type('Response', (), {'success': True})()
+    fleet._order_clients = {
+        'robot1': Mock(service_is_ready=Mock(return_value=True)),
+        'robot2': Mock(service_is_ready=Mock(return_value=True)),
+    }
+    for client in fleet._order_clients.values():
+        client.call_async.return_value = _FinishedFuture(accepted)
+
+    fleet._on_table_occupancy(String(
+        data='{"table_id": 0, "robot_id": "robot1", "phase": "serving"}'
+    ))
+    assert fleet._table_owner(0) == 'robot1'
+
+    response = type('Response', (), {'success': False, 'assigned_robot': ''})()
+    fleet._on_order(_order_request(0), response)
+    assert response.success is True
+    assert response.assigned_robot == 'robot2'
+    fleet.get_logger().warning.assert_called()
+
+
+def test_fleet_expires_stuck_reservation_so_idle_peer_gets_orders():
+    """예약이 sticky로 남으면 idle 로봇 주문이 전부 거부되던 회귀를 막는다."""
+    fleet = FleetManager.__new__(FleetManager)
+    fleet._robots = ['robot1', 'robot2']
+    fleet._serialize_shared_payloads = False
+    fleet._states = {'robot1': 1, 'robot2': 0}
+    # Pretend robot2 was reserved long ago and never cleared.
+    fleet._reserved = {'robot2': time.monotonic() - 10.0}
+    fleet._table_claims = {}
+    fleet.get_logger = Mock(return_value=Mock())
+    accepted = type('Response', (), {'success': True})()
+    fleet._order_clients = {
+        'robot1': Mock(service_is_ready=Mock(return_value=True)),
+        'robot2': Mock(service_is_ready=Mock(return_value=True)),
+    }
+    for client in fleet._order_clients.values():
+        client.call_async.return_value = _FinishedFuture(accepted)
+
+    response = type('Response', (), {'success': False, 'assigned_robot': ''})()
+    fleet._on_order(_order_request(1, preferred_robot='robot2'), response)
+    assert response.success is True
+    assert response.assigned_robot == 'robot2'
 
 
 def test_plate_rack_shares_first_trip_and_encodes_plate_count():

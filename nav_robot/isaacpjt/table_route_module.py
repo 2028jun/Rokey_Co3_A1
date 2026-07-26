@@ -23,20 +23,26 @@ def build_table_route(
     x: float,
     y: float,
     table_dock=None,
+    aisle_x: float = 0.0,
 ):
-    """Return axis-aligned stages from the current pose to a table dock."""
+    """Return axis-aligned stages from the current pose to a table dock.
+
+    aisle_x shifts the shared corridor so robot1/robot2 can pass instead of
+    meeting head-on on x=0.
+    """
     goal_x, goal_y, goal_yaw = table_dock or TABLE_DOCKS[table_id]
+    aisle = float(aisle_x)
     stages = []
 
-    # If a command is issued while docked, back out to the centre aisle first.
-    if abs(x) > 0.10:
-        outward_yaw = 0.0 if x > 0.0 else math.pi
+    # If a command is issued while docked, back out to this robot's aisle lane.
+    if abs(x - aisle) > 0.10:
+        outward_yaw = 0.0 if x > aisle else math.pi
         stages.extend(
             [
                 {"kind": "pivot", "yaw": outward_yaw},
                 {
                     "kind": "axis_x",
-                    "value": 0.0,
+                    "value": aisle,
                     "speed": -BACKOUT_SPEED,
                     "yaw": outward_yaw,
                 },

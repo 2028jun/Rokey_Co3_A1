@@ -9,7 +9,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <link rel="stylesheet" href="/css/styles.css?v=3">
+    <link rel="stylesheet" href="/css/styles.css?v=5">
 </head>
 <body>
     <div class="app-container">
@@ -167,6 +167,20 @@
                     </div>
                 </div>
 
+                <!-- Step 4: Select Robot (minimal) -->
+                <div class="form-section">
+                    <label class="section-label">4. 로봇 선택</label>
+                    <div class="table-grid" id="robot-select-grid">
+                        <button type="button" class="table-btn robot-btn selected" data-robot="auto" onclick="selectRobot('auto', this)">Auto</button>
+                        <button type="button" class="table-btn robot-btn" data-robot="robot1" onclick="selectRobot('robot1', this)">Robot 1</button>
+                        <button type="button" class="table-btn robot-btn" data-robot="robot2" onclick="selectRobot('robot2', this)">Robot 2</button>
+                    </div>
+                    <div class="robot-availability" id="robot-availability">
+                        <span id="robot1-avail">Robot1: -</span>
+                        <span id="robot2-avail">Robot2: -</span>
+                    </div>
+                </div>
+
                 <!-- Selected Summary & Submit -->
                 <div class="order-summary-box">
                     <div class="summary-row">
@@ -180,6 +194,10 @@
                     <div class="summary-row">
                         <span>목적지 테이블:</span>
                         <strong id="summary-table-num" class="highlight-text">Table 1</strong>
+                    </div>
+                    <div class="summary-row">
+                        <span>배정 로봇:</span>
+                        <strong id="summary-robot" class="highlight-text">Auto</strong>
                     </div>
                     <button class="submit-order-btn" onclick="submitOrder()">
                         <i class="fa-solid fa-paper-plane"></i> 로봇 서빙 주문 전송
@@ -329,6 +347,6 @@
 
     <!-- Scripts -->
     <script src="/js/robot_map.js"></script>
-    <script src="/js/app.js?v=4"></script>
+    <script src="/js/app.js?v=5"></script>
 </body>
 </html>

@@ -106,7 +106,12 @@ class RvizTfAggregator(Node):
         # links ourselves so both models are visible before AMCL initializes.
         # Any AMCL map->odom transform is filtered in _relay() to avoid two TF
         # authorities publishing the same combined child frame.
+        #
+        # Republish periodically: a single startup publish can be lost when
+        # /clock is not ready yet (use_sim_time) or a duplicate aggregator
+        # races TransientLocal static TF, leaving RViz without a `map` frame.
         self._publish_absolute_odom_roots()
+        self.create_timer(2.0, self._publish_absolute_odom_roots)
 
     def _relay_map(self, msg: OccupancyGrid) -> None:
         out = copy.deepcopy(msg)
@@ -128,19 +133,23 @@ class RvizTfAggregator(Node):
 
     def _publish_absolute_odom_roots(self) -> None:
         transforms = []
-        stamp = self.get_clock().now().to_msg()
+        # stamp=0 is the durable convention for static TF and avoids depending
+        # on /clock being available at aggregator startup.
+        zero = TransformStamped().header.stamp
         for robot in self._robots:
             item = TransformStamped()
-            item.header.stamp = stamp
+            item.header.stamp = zero
             item.header.frame_id = "map"
             item.child_frame_id = f"{robot}/odom"
             item.transform.rotation.w = 1.0
             transforms.append(item)
         self._static_pub.publish(TFMessage(transforms=transforms))
-        self.get_logger().info(
-            "combined RViz TF roots ready: "
-            + ", ".join(f"map->{robot}/odom" for robot in self._robots)
-        )
+        if not getattr(self, "_logged_odom_roots", False):
+            self._logged_odom_roots = True
+            self.get_logger().info(
+                "combined RViz TF roots ready: "
+                + ", ".join(f"map->{robot}/odom" for robot in self._robots)
+            )
 
     @staticmethod
     def _frame(frame: str, robot: str) -> str:

@@ -138,6 +138,14 @@ def generate_launch_description():
             condition=IfCondition(enable_serving),
         ),
         Node(
+            package="serving_robot_manager",
+            executable="path_yield_coordinator_node",
+            name="path_yield_coordinator",
+            output="screen",
+            parameters=[{"use_sim_time": use_sim_time}],
+            condition=IfCondition(enable_serving),
+        ),
+        Node(
             package="two_wheel_rails", executable="rviz_tf_aggregator",
             name="rviz_tf_aggregator", output="screen",
             parameters=[{"use_sim_time": use_sim_time}],

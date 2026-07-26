@@ -23,7 +23,8 @@ class NavigationAutoInitializerNode(Node):
     def __init__(self) -> None:
         super().__init__("navigation_auto_initializer")
 
-        self.declare_parameter("use_sim_time", True)
+        # use_sim_time comes from launch params; do not redeclare
+        # (ParameterAlreadyDeclaredException kills the node at startup).
 
         self._has_clock = False
         self._initialized = False

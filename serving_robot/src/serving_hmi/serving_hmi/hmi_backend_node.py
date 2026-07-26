@@ -64,6 +64,17 @@ class HMIBridgeNode(Node):
         
         self.last_robot_status_recv_time = 0.0
         self.robot_connected = False
+        self._robot_status_codes = {"robot1": None, "robot2": None}
+        self._robot_status_labels = {
+            0: "IDLE",
+            1: "RETURNING TO KITCHEN",
+            2: "PREPARING FOOD (SPAWNING)",
+            3: "NAVIGATING TO TABLE",
+            4: "ARM SERVING FOOD",
+            5: "PAUSED (SAFETY HAND INTRUSION)",
+            6: "COMPLETED",
+            7: "SYSTEM FAILED (RESET REQUIRED)",
+        }
         
         # Drive mode: 'MOCK' (standalone virtual simulator) vs 'LIVE' (Isaac Sim / Real Robot ROS 2)
         self.drive_mode = "MOCK"
@@ -148,6 +159,13 @@ class HMIBridgeNode(Node):
             self.system_status_callback,
             status_qos
         )
+        for robot_name in ("robot1", "robot2"):
+            self.create_subscription(
+                Int32,
+                f'/{robot_name}/system/status',
+                lambda msg, name=robot_name: self._on_robot_fleet_status(name, msg),
+                status_qos,
+            )
         self.order_cancelled_sub = self.create_subscription(
             Int32,
             '/manager/order_cancelled',
@@ -346,18 +364,40 @@ class HMIBridgeNode(Node):
         except Exception as e:
             self.get_logger().warn(f"Failed to parse robot status msg: {e}")
 
+    def _on_robot_fleet_status(self, robot_name: str, msg: Int32):
+        code = int(msg.data)
+        self._robot_status_codes[robot_name] = code
+        self.robot_connected = True
+        self.last_robot_status_recv_time = time.time()
+        if self.drive_mode != "LIVE":
+            self.drive_mode = "LIVE"
+            print(
+                f"📡 [HMI Backend] {robot_name} status={code} -> DRIVE MODE LIVE",
+                flush=True,
+            )
+
+    def fleet_robot_snapshot(self) -> dict:
+        snapshot = {}
+        for name in ("robot1", "robot2"):
+            code = self._robot_status_codes.get(name)
+            if code is None:
+                snapshot[name] = {
+                    "state": "UNKNOWN",
+                    "state_code": None,
+                    "available": False,
+                }
+                continue
+            available = code in (0, 6)  # IDLE, COMPLETED
+            snapshot[name] = {
+                "state": self._robot_status_labels.get(code, f"STATE_{code}"),
+                "state_code": code,
+                "available": available,
+            }
+        return snapshot
+
     def system_status_callback(self, msg: Int32):
         status_code = msg.data
-        status_map = {
-            0: "IDLE",
-            1: "RETURNING TO KITCHEN",
-            2: "PREPARING FOOD (SPAWNING)",
-            3: "NAVIGATING TO TABLE",
-            4: "ARM SERVING FOOD",
-            5: "PAUSED (SAFETY HAND INTRUSION)",
-            6: "COMPLETED",
-            7: "SYSTEM FAILED (RESET REQUIRED)"
-        }
+        status_map = self._robot_status_labels
         self.robot_state = status_map.get(status_code, f"STATE_{status_code}")
         self.robot_connected = True
         self.last_robot_status_recv_time = time.time()
@@ -395,7 +435,9 @@ class HMIBridgeNode(Node):
                     f"Manager cancelled queued HMI order {order.order_id}")
                 return
 
-    def send_order_to_manager(self, order_id: str, table_num: int, items: list):
+    def send_order_to_manager(
+        self, order_id: str, table_num: int, items: list, preferred_robot: str = ""
+    ):
         if not ORDER_REQUEST_SRV_AVAILABLE or not hasattr(self, 'manager_order_client'):
             return False, "OrderRequest srv not loaded"
         if not self.manager_order_client.service_is_ready():
@@ -429,6 +471,12 @@ class HMIBridgeNode(Node):
         if not 1 <= hmi_table_number <= 4:
             return False, f"Invalid HMI table number: {hmi_table_number}"
 
+        preferred = str(preferred_robot or "").strip().lower()
+        if preferred in ("", "auto", "any"):
+            preferred = ""
+        elif preferred not in ("robot1", "robot2"):
+            return False, f"Invalid preferred_robot: {preferred_robot}"
+
         # The web UI labels tables 1..4, while manager/axis routes use the
         # zero-based IDs 0..3. Keep the user-facing number unchanged and only
         # translate at the ROS service boundary.
@@ -441,10 +489,12 @@ class HMIBridgeNode(Node):
         req.drink_count = drink
         req.cutlery_count = cutlery
         req.plate_count = plate
+        req.preferred_robot = preferred
 
         print(
             "🚀 [HMI Backend] Sending OrderRequest to Manager: "
             f"HMI Table={hmi_table_number} -> route_id={manager_table_id}, "
+            f"preferred={preferred or 'auto'}, "
             f"P1={pizza1}, P2={pizza2}, P3={pizza3}, "
             f"Drink={drink}, Cutlery={cutlery}, Plate={plate}",
             flush=True,
@@ -459,7 +509,11 @@ class HMIBridgeNode(Node):
         try:
             response = future.result()
             if response is not None and response.success:
-                self.get_logger().info(f"Manager accepted HMI order {order_id}")
+                assigned = getattr(response, "assigned_robot", "") or ""
+                self.get_logger().info(
+                    f"Manager accepted HMI order {order_id}"
+                    + (f" -> {assigned}" if assigned else "")
+                )
                 return
             reason = "manager rejected the order"
         except Exception as exc:
@@ -603,6 +657,14 @@ def get_system_status_payload():
         and ros_node.last_camera_recv_time > 0.0
         and time.time() - ros_node.last_camera_recv_time <= 2.0
     )
+    robots = (
+        ros_node.fleet_robot_snapshot()
+        if ros_node
+        else {
+            "robot1": {"state": "UNKNOWN", "state_code": None, "available": False},
+            "robot2": {"state": "UNKNOWN", "state_code": None, "available": False},
+        }
+    )
     return {
         "type": "SYSTEM_STATUS",
         "timestamp": time.time(),
@@ -620,6 +682,7 @@ def get_system_status_payload():
             "battery": ros_node.battery_level if ros_node else 100.0,
             "domain_id": os.environ.get("ROS_DOMAIN_ID", "0")
         },
+        "robots": robots,
         "camera_connected": camera_connected,
         "obstacle": (ros_node.obstacle_info if ros_node else {"active": False, "x": 0.0, "y": 2.8, "stop": False}),
         "camera_image": (
@@ -664,14 +727,20 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif msg_type == "CREATE_ORDER":
                     table_num = int(data.get("table_number", 1))
                     items = data.get("items", [])
+                    preferred_robot = str(data.get("preferred_robot", "auto") or "auto")
                     new_order = order_manager.create_order(table_num, items)
-                    print(f"[HMI Backend] NEW ORDER CREATED: {new_order.order_id} for Table {table_num}. Total items: {len(items)}")
+                    print(
+                        f"[HMI Backend] NEW ORDER CREATED: {new_order.order_id} "
+                        f"for Table {table_num} robot={preferred_robot}. "
+                        f"Total items: {len(items)}"
+                    )
                     
                     # Publish order to ROS 2 topic with quantities and total price
                     order_payload = {
                         "action": "NEW_ORDER",
                         "order_id": new_order.order_id,
                         "table_number": new_order.table_number,
+                        "preferred_robot": preferred_robot,
                         "items": [f"{item.name} x{item.quantity}" for item in new_order.items],
                         "total_price": new_order.total_price,
                         "status": new_order.status
@@ -679,7 +748,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     if ros_node:
                         if ros_node.drive_mode == "LIVE":
                             sent, msg = ros_node.send_order_to_manager(
-                                new_order.order_id, table_num, items)
+                                new_order.order_id, table_num, items, preferred_robot)
                             if not sent:
                                 order_manager.update_status(
                                     new_order.order_id, OrderStatus.CANCELLED)

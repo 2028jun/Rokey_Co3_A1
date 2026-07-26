@@ -105,13 +105,13 @@ except (ImportError, ModuleNotFoundError) as _task_command_import_error:
 sys.path.insert(0, str(SERVING_WORKSPACE / "isaacpjt"))
 sys.path.insert(0, str(SERVING_WORKSPACE / "isaacpjt/M0609/rmpflow"))
 sys.path.insert(0, str(WORKSPACE / "isaacpjt/M0609/rmpflow"))
+# Defaults when serving food modules cannot be imported (nav-only path).
+GRIP_CONTACT_STATIC_FRICTION = float(os.environ.get("NAV_GRIP_STATIC_FRICTION", "6.0"))
+GRIP_CONTACT_DYNAMIC_FRICTION = float(os.environ.get("NAV_GRIP_DYNAMIC_FRICTION", "5.0"))
+GRIPPER_DRIVE_MAX_FORCE = float(os.environ.get("NAV_GRIPPER_DRIVE_MAX_FORCE", "40.0"))
 try:
     from drink_serving import spawn_soda_cans
     from cutlery_serving import spawn_cutlery_box
-    from plate_rack_serving import (
-        follow_plate_rack_transport,
-        spawn_plate_rack,
-    )
     from pizza_serving import (
         GRIP_CONTACT_DYNAMIC_FRICTION,
         GRIP_CONTACT_STATIC_FRICTION,
@@ -121,9 +121,16 @@ try:
     from soda1_delivery import Soda1PickPlace
     from soda2_delivery import Soda2PickPlace
     from cutlery_pick_place import CutleryBoxPickPlace
-    from plate_rack_pick_place import PlateRackPickPlace
+    try:
+        from plate_rack_serving import (
+            follow_plate_rack_transport,
+            spawn_plate_rack,
+        )
+        from plate_rack_pick_place import PlateRackPickPlace
+    except ImportError as _plate_exc:
+        print(f"[warn] plate-rack module import: {_plate_exc}", flush=True)
     print(
-        "[food_spawn] loaded pizza, soda1, soda2, cutlery and plate-rack modules",
+        "[food_spawn] loaded pizza, soda1, soda2, cutlery modules",
         flush=True,
     )
 except Exception as _food_import_exc:
@@ -276,6 +283,10 @@ FRONT_LIDAR_FRAME = "base_scan"
 FRONT_LIDAR_TOPIC = "/scan"
 
 LIDAR_MIN_RANGE = 0.20
+PEER_HARD_STOP_M = 1.10
+# Corridor half-separation so simultaneous trips do not share the spine.
+FLEET_AISLE_OFFSET_M = 0.55
+FLEET_PASS_EXTRA_M = 0.30
 LIDAR_MAX_RANGE = 12.0
 LIDAR_SAMPLES = 180
 LIDAR_PERIOD_SEC = 0.10
@@ -1264,6 +1275,8 @@ class NavBridge(Node):
         self._hand_test_controller = None
         self._obstacle_stop = False
         self._obstacle_stop_started = None
+        self._obstacle_stop_from_peer = False
+        self._peer_hit_this_scan = False
         self._clearance_start = None
         self._obstacle_scale = 1.0
         self._last_scan_time = 0.0
@@ -1319,9 +1332,10 @@ class NavBridge(Node):
         # Subsystems Services & Publishers for Manager Node
         self.spawn_status_pub = self.create_publisher(Int32, "food_spawn/status", transient_local_qos)
         self.arm_status_pub = self.create_publisher(Int32, "arm/status", transient_local_qos)
-        self.navigation_status_pub = self.create_publisher(
-            Int32, "navigation/status", transient_local_qos
-        )
+        # navigation/status Int32 is owned ONLY by navigation_subsystem.
+        # Isaac used to also publish it (plus a 1Hz MOVING/ARRIVED heartbeat),
+        # which made manager treat mid-attempt failures / idle gaps as terminal
+        # ARRIVED/FAILED and cancelled orders. Keep location for TF-less HMI.
         self.navigation_location_pub = self.create_publisher(
             Int32, "navigation/current_location", transient_local_qos
         )
@@ -1348,6 +1362,19 @@ class NavBridge(Node):
             self._on_two_wheel_mission_command,
             mission_qos,
         )
+        # Fleet right-of-way: later order yields when lidar sees the peer robot.
+        self._fleet_priorities = {}
+        self._fleet_active = {}
+        self._fleet_phases = {}
+        self._my_fleet_priority = None
+        self._peer_swerve_wz = 0.0
+        for peer in ("robot1", "robot2"):
+            self.create_subscription(
+                String,
+                f"/{peer}/fleet/intent",
+                lambda msg, name=peer: self._on_fleet_intent(name, msg),
+                mission_qos,
+            )
 
         self._obstacle_test_controller = None
         self.create_service(
@@ -1398,7 +1425,6 @@ class NavBridge(Node):
         }
         self._publish_static_sensor_tf()
         self.navigation_location_pub.publish(Int32(data=4))
-        self.navigation_status_pub.publish(Int32(data=2))
         subsystem_services = (
             ", /food_spawn/command, /arm/command"
             if TaskCommand is not None
@@ -1406,8 +1432,8 @@ class NavBridge(Node):
         )
         print(
             f"[ros] active services: /navigation/command{subsystem_services}\n"
-            "[ros] active status topics: /navigation/status, "
-            "/food_spawn/status, /arm/status",
+            "[ros] status: navigation/status owned by ROS subsystem only; "
+            "Isaac publishes location + two_wheel/mission_status",
             flush=True,
         )
 
@@ -1697,6 +1723,8 @@ class NavBridge(Node):
                 if not busy:
                     self._active_two_wheel_mission_id = mission_id
                     self._active_two_wheel_target = None
+                    self._navigation_paused = False
+                    self._navigation_pause_started = None
                     self._direct_nav = dict(
                         mode="park_out",
                         target=None,
@@ -1704,6 +1732,7 @@ class NavBridge(Node):
                         distance=distance,
                         speed=min(speed, 0.20),
                         stage_start=time.monotonic(),
+                        wall_start=time.monotonic(),
                         last_log=0.0,
                     )
                     self._target_vx = 0.0
@@ -1760,6 +1789,9 @@ class NavBridge(Node):
 
         self._active_two_wheel_mission_id = mission_id
         self._active_two_wheel_target = target
+        # A fresh mission must not inherit a stale path-yield pause.
+        self._navigation_paused = False
+        self._navigation_pause_started = None
 
         points = payload.get("points", [])
         dock = payload.get("dock", payload.get("goal"))
@@ -1839,12 +1871,10 @@ class NavBridge(Node):
                 self.get_logger().warning(
                     "preempting active navigation for kitchen return"
                 )
-                self.navigation_status_pub.publish(Int32(data=1))
                 return True
             self._direct_nav_request = target
             self._target_vx = 0.0
             self._target_wz = 0.0
-        self.navigation_status_pub.publish(Int32(data=1))
         self.get_logger().info(
             f"direct wheel navigation queued: target_id={target} (Nav2 bypassed)"
         )
@@ -1926,6 +1956,14 @@ class NavBridge(Node):
             if hasattr(self.articulation, "prim_path")
             else self.robot_root
         )
+        # Always exclude the whole robot USD root; articulation path alone can
+        # miss tray/sensor prims and false-classify them as a peer robot.
+        own_roots = [
+            p for p in (self.robot_root, robot_prefix) if p
+        ]
+
+        def _is_own_hit(body: str) -> bool:
+            return any(body.startswith(root) for root in own_roots)
 
         # The walking person uses a non-contact capsule.  Read its current
         # world position and intersect it analytically with each planar ray,
@@ -1949,6 +1987,8 @@ class NavBridge(Node):
         ranges = []
         obstacle_ranges = []
         person_hits = []
+        self._peer_hit_this_scan = False
+        self._peer_near_dist = float("inf")
         for index in range(LIDAR_SAMPLES):
             angle = angle_min + index * angle_increment
             world_angle = yaw + angle
@@ -1970,7 +2010,11 @@ class NavBridge(Node):
                 else ""
             )
 
-            if hit and hit.get("hit") and not rigid_body.startswith(robot_prefix):
+            own_hit = (
+                (bool(rigid_body) and _is_own_hit(rigid_body))
+                or (bool(collision_prim) and _is_own_hit(collision_prim))
+            )
+            if hit and hit.get("hit") and not own_hit:
                 distance = float(hit["distance"])
             else:
                 distance = math.inf
@@ -2006,16 +2050,30 @@ class NavBridge(Node):
 
             ranges.append(distance)
 
-            # Filter for dynamic person / obstacle detection: ignore static environment (tables, chairs, walls, kitchen)
+            # Filter for dynamic obstacles: people always stop us.
+            # Peer NavRobot*: only the later-order (lower priority) robot stops.
+            # The earlier-order robot ignores the peer so it can keep moving /
+            # use its lane while the later robot waits.
             hit_path = (rigid_body + " " + collision_prim).lower()
+            is_peer_robot = (
+                "navrobot" in hit_path
+                and not own_hit
+            )
+            # Do not match bare "hand" — robot arms / trays false-trigger stops.
             is_person = virtual_person_hit or (
                 "/World/CorridorObstacleTestPerson" in (rigid_body + collision_prim)
-                or "person" in hit_path
+                or "crossingpedestrian" in hit_path
+                or "/person" in hit_path
                 or "character" in hit_path
-                or "obstacle" in hit_path
                 or "human" in hit_path
-                or "hand" in hit_path
             )
+            stop_for_peer = False
+            if is_peer_robot and math.isfinite(distance):
+                # NEVER hard-stop for the peer robot. Mutual peer-stop at
+                # ~0.3m caused permanent face-to-face pending. Pass with
+                # opposite-lane swerve instead (person obstacles still stop).
+                self._peer_near_dist = min(self._peer_near_dist, distance)
+                self._peer_hit_this_scan = True
             if is_person and math.isfinite(distance):
                 obstacle_ranges.append(distance)
                 hit_x = origin[0] + direction[0] * distance
@@ -2099,9 +2157,63 @@ class NavBridge(Node):
             f"obstacle event published: {message.data}"
         )
 
+    def _fleet_aisle_x(self) -> float:
+        """Per-robot corridor lane so simultaneous trips do not share x=0.
+
+        When a peer is nearby, widen further so head-on pairs peel apart
+        instead of freezing face-to-face.
+        """
+        if (self.robot_name or "") == "robot1":
+            base = -FLEET_AISLE_OFFSET_M
+            sign = -1.0
+        elif (self.robot_name or "") == "robot2":
+            base = FLEET_AISLE_OFFSET_M
+            sign = 1.0
+        else:
+            return 0.0
+        peer_near = float(getattr(self, "_peer_near_dist", float("inf")))
+        if math.isfinite(peer_near) and peer_near < 2.0:
+            extra = FLEET_PASS_EXTRA_M * max(0.0, min(1.0, (2.0 - peer_near) / 1.4))
+            return base + sign * extra
+        return base
+
+    def _on_fleet_intent(self, robot_name: str, msg: String):
+        try:
+            payload = json.loads(msg.data)
+        except Exception:
+            return
+        active = bool(payload.get("active", False))
+        self._fleet_active[robot_name] = active
+        phase = str(payload.get("phase", "idle") or "idle").lower()
+        if active:
+            try:
+                self._fleet_priorities[robot_name] = float(payload.get("priority", 0.0))
+            except (TypeError, ValueError):
+                self._fleet_priorities[robot_name] = 0.0
+            self._fleet_phases[robot_name] = phase
+        else:
+            self._fleet_priorities.pop(robot_name, None)
+            self._fleet_phases.pop(robot_name, None)
+        if robot_name == (self.robot_name or ""):
+            self._my_fleet_priority = self._fleet_priorities.get(robot_name)
+        # Drop any legacy peer-stop so we never stay pending on an empty aisle.
+        peer = "robot2" if (self.robot_name or "") == "robot1" else "robot1"
+        if self._obstacle_stop and self._obstacle_stop_from_peer:
+            with self._lock:
+                if self._obstacle_stop and self._obstacle_stop_from_peer:
+                    self._finish_obstacle_stop(float("inf"))
+
+    def _peer_swerve_bias(self, peer_hit: bool, nearest: float) -> float:
+        """Legacy hook: constant-sign yaw bias is unsafe (wrong for northbound).
+
+        Lane separation is handled by heading-aware crosstrack in
+        `_update_direct_navigation` toward `_fleet_aisle_x()`.
+        """
+        return 0.0
     def _clear_obstacle_state(self):
         self._obstacle_stop = False
         self._obstacle_stop_started = None
+        self._obstacle_stop_from_peer = False
         self._clearance_start = None
         self._obstacle_scale = 1.0
 
@@ -2132,7 +2244,10 @@ class NavBridge(Node):
                     return
                 kind = stages[index].get("kind")
                 if kind not in ("axis_x", "axis_y"):
+                    # Pivot must stay pure yaw — drop sticky peer swerve from
+                    # the previous translate stage so it cannot cancel wz.
                     self._clear_obstacle_state()
+                    self._peer_swerve_wz = 0.0
                     return
 
             # Robot-local (not just forward-cone) safety check: classify each
@@ -2164,12 +2279,23 @@ class NavBridge(Node):
 
             nearest = min(slowdown_hits) if slowdown_hits else float("inf")
             close_points = stop_hits
+            peer_hit = bool(getattr(self, "_peer_hit_this_scan", False))
+            peer_near = float(getattr(self, "_peer_near_dist", float("inf")))
+            # Swerve for nearby peers; never leave a sticky peer hard-stop.
+            if self._obstacle_stop and self._obstacle_stop_from_peer:
+                self._finish_obstacle_stop(peer_near)
+            swerve_range = peer_near if peer_near <= 2.0 else float("inf")
+            self._peer_swerve_wz = self._peer_swerve_bias(
+                peer_hit or math.isfinite(swerve_range),
+                nearest if (peer_hit and math.isfinite(nearest)) else swerve_range,
+            )
 
             now = time.monotonic()
 
             if not self._obstacle_stop:
                 if len(close_points) >= 3:
-                    self._start_obstacle_stop(nearest)
+                    # Person (or non-peer) polygon stop only.
+                    self._start_obstacle_stop(nearest, from_peer=False)
                 elif slowdown_hits:
                     self._obstacle_scale = OBSTACLE_SLOWDOWN_RATIO
                 else:
@@ -2193,20 +2319,23 @@ class NavBridge(Node):
                 if now - getattr(self, "_last_obstacle_log", 0.0) >= 0.5:
                     self._last_obstacle_log = now
                     self.get_logger().info(
-                        f"obstacle distance={nearest:.2f}m scale={self._obstacle_scale:.2f} stop={self._obstacle_stop}"
+                        f"obstacle distance={nearest:.2f}m scale={self._obstacle_scale:.2f} "
+                        f"stop={self._obstacle_stop} peer={self._obstacle_stop_from_peer}"
                     )
 
-    def _start_obstacle_stop(self, distance: float):
+    def _start_obstacle_stop(self, distance: float, from_peer: bool = False):
         if self._obstacle_stop:
             return
         self._obstacle_stop = True
         self._obstacle_stop_started = time.monotonic()
+        self._obstacle_stop_from_peer = bool(from_peer)
         self._clearance_start = None
         self._obstacle_scale = 0.0
         self._target_vx = 0.0
         self._target_wz = 0.0
         self.get_logger().warning(
-            f"주변 장애물(사람) 정지영역 진입: distance={distance:.2f}m, 주행 정지"
+            f"주변 장애물 정지영역 진입: distance={distance:.2f}m, 주행 정지"
+            + (" (peer yield)" if from_peer else "")
         )
 
     def _finish_obstacle_stop(self, distance: float):
@@ -2215,12 +2344,15 @@ class NavBridge(Node):
         paused_for = time.monotonic() - (self._obstacle_stop_started or time.monotonic())
         if self._direct_nav is not None and "stage_start" in self._direct_nav:
             self._direct_nav["stage_start"] += paused_for
+        was_peer = self._obstacle_stop_from_peer
         self._obstacle_stop = False
         self._obstacle_stop_started = None
+        self._obstacle_stop_from_peer = False
         self._clearance_start = None
         self._obstacle_scale = 1.0
         self.get_logger().info(
-            f"전방 장애물(사람) 해제: distance={distance:.2f}m >= 1.2m, 0.5s 안전 지연 완료, 주행 재개"
+            f"전방 장애물 해제: distance={distance:.2f}m, 주행 재개"
+            + (" (peer clear)" if was_peer else "")
         )
 
     def _apply_pending_teleport(self):
@@ -2309,7 +2441,6 @@ class NavBridge(Node):
             self._cmd_vx = self._cmd_wz = 0.0
             self._target_vx = self._target_wz = 0.0
             self.navigation_location_pub.publish(Int32(data=4))
-            self.navigation_status_pub.publish(Int32(data=2))
             if self._active_two_wheel_mission_id:
                 mission_id = self._active_two_wheel_mission_id
                 self._publish_two_wheel_mission_status(
@@ -2327,15 +2458,23 @@ class NavBridge(Node):
                 "without moving"
             )
             return
+        aisle_x = self._fleet_aisle_x()
         stages = (
-            build_kitchen_route(x, y, kitchen_dock=kitchen_dock)
+            build_kitchen_route(
+                x, y, kitchen_dock=kitchen_dock, aisle_x=aisle_x
+            )
             if target == 4
             else build_table_route(
                 target,
                 x,
                 y,
                 table_dock=self._active_two_wheel_goal,
+                aisle_x=aisle_x,
             )
+        )
+        self.get_logger().info(
+            f"route aisle_x={aisle_x:.2f} robot={self.robot_name or 'default'} "
+            f"target={target}"
         )
 
         # Normalize only the first kitchen translation after park-out.
@@ -2385,6 +2524,7 @@ class NavBridge(Node):
         }
         self._obstacle_stop = False
         self._obstacle_stop_started = None
+        self._obstacle_stop_from_peer = False
         self._clearance_start = None
         self._cmd_vx = 0.0
         self._cmd_wz = 0.0
@@ -2403,25 +2543,28 @@ class NavBridge(Node):
         self._target_vx = self._target_wz = 0.0
         self._obstacle_stop = False
         self._obstacle_stop_started = None
+        self._obstacle_stop_from_peer = False
         self._clearance_start = None
 
         if mission_id:
             if success:
-                self._publish_two_wheel_mission_status(
-                    "completed",
-                    "park_out_aligned",
-                    mission_id=mission_id,
-                )
+                for _ in range(5):
+                    self._publish_two_wheel_mission_status(
+                        "completed",
+                        "park_out_aligned",
+                        mission_id=mission_id,
+                    )
                 self.get_logger().info(
                     f"[Mission TX] park-out completed id={mission_id}"
                 )
             else:
-                self._publish_two_wheel_mission_status(
-                    "failed",
-                    "execution_failed",
-                    reason=reason,
-                    mission_id=mission_id,
-                )
+                for _ in range(5):
+                    self._publish_two_wheel_mission_status(
+                        "failed",
+                        "execution_failed",
+                        reason=reason,
+                        mission_id=mission_id,
+                    )
                 self.get_logger().error(
                     f"[Mission TX] park-out failed id={mission_id}: {reason}"
                 )
@@ -2437,18 +2580,20 @@ class NavBridge(Node):
         self._direct_nav = None
         self._obstacle_stop = False
         self._obstacle_stop_started = None
+        self._obstacle_stop_from_peer = False
         self._clearance_start = None
         self._cmd_vx = self._cmd_wz = 0.0
         self._target_vx = self._target_wz = 0.0
         if success:
             self._navigation_location = target
             self.navigation_location_pub.publish(Int32(data=target))
-            self.navigation_status_pub.publish(Int32(data=2))
             if self._active_two_wheel_mission_id:
                 mission_id = self._active_two_wheel_mission_id
-                self._publish_two_wheel_mission_status(
-                    "completed", "completed", target=target
-                )
+                for _ in range(5):
+                    self._publish_two_wheel_mission_status(
+                        "completed", "completed", target=target,
+                        mission_id=mission_id,
+                    )
                 self.get_logger().info(
                     f"[Mission TX] completed id={mission_id} target={target}"
                 )
@@ -2456,15 +2601,18 @@ class NavBridge(Node):
                 self._active_two_wheel_target = None
             self.get_logger().info(f"direct navigation complete target={target}")
         else:
-            self.navigation_status_pub.publish(Int32(data=3))
+            # String mission_status only — ROS retries attempts. Never publish
+            # navigation/status Int32 from Isaac (manager sticky FAILED).
             if self._active_two_wheel_mission_id:
                 mission_id = self._active_two_wheel_mission_id
-                self._publish_two_wheel_mission_status(
-                    "failed",
-                    "execution_failed",
-                    reason=reason,
-                    target=target,
-                )
+                for _ in range(5):
+                    self._publish_two_wheel_mission_status(
+                        "failed",
+                        "execution_failed",
+                        reason=reason,
+                        target=target,
+                        mission_id=mission_id,
+                    )
                 self.get_logger().error(
                     f"[Mission TX] failed id={mission_id} target={target}: "
                     f"{reason}"
@@ -2481,7 +2629,57 @@ class NavBridge(Node):
         if mission is None:
             return None
         if self._navigation_paused or self._obstacle_stop:
-            return 0.0, 0.0
+            # Legacy peer-stop must never freeze motion — clear and continue.
+            if self._obstacle_stop and self._obstacle_stop_from_peer:
+                self._finish_obstacle_stop(float("inf"))
+            elif self._navigation_paused or self._obstacle_stop:
+                # Paused/blocked park-out used to wedge forever because the
+                # timeout check lived below this early return. Fail fast so the
+                # peer is not held by a sticky parking_out fleet intent.
+                if mission.get("mode") == "park_out":
+                    now = time.monotonic()
+                    wall = float(mission.get("wall_start", mission.get("stage_start", now)))
+                    if now - wall > 40.0:
+                        self._finish_park_out(
+                            False,
+                            "park_out blocked timeout "
+                            f"(paused={self._navigation_paused} "
+                            f"obstacle={self._obstacle_stop})",
+                        )
+                        return 0.0, 0.0
+                    if (
+                        mission.get("phase") == "align_opposite"
+                        and not self._obstacle_stop
+                    ):
+                        yaw_error = self._angle_error(mission["target_yaw"], yaw)
+                        if abs(yaw_error) < math.radians(2.5):
+                            self._finish_park_out(True)
+                            return 0.0, 0.0
+                        wz = float(np.clip(1.8 * yaw_error, -0.65, 0.65))
+                        if abs(wz) < 0.18:
+                            wz = math.copysign(0.18, yaw_error)
+                        return 0.0, wz
+                if (
+                    mission.get("mode") not in ("park_out", "legacy_table")
+                    and not self._obstacle_stop
+                ):
+                    stages = mission.get("stages") or []
+                    index = int(mission.get("index", 0))
+                    if index < len(stages) and stages[index].get("kind") == "pivot":
+                        error = self._angle_error(stages[index]["yaw"], yaw)
+                        if abs(error) < math.radians(8.0):
+                            mission["index"] = index + 1
+                            mission["stage_start"] = time.monotonic()
+                            if mission["index"] >= len(stages):
+                                self._finish_direct_navigation(True)
+                                return 0.0, 0.0
+                            return 0.0, 0.0
+                        wz = float(np.clip(1.8 * error, -0.65, 0.65))
+                        if abs(wz) < 0.22:
+                            wz = math.copysign(0.22, error)
+                        return 0.0, wz
+                if self._navigation_paused or self._obstacle_stop:
+                    return 0.0, 0.0
 
         if mission["mode"] == "park_out":
             now = time.monotonic()
@@ -2542,17 +2740,23 @@ class NavBridge(Node):
             else:
                 yaw_error = self._angle_error(mission["target_yaw"], yaw)
                 done = abs(yaw_error) < math.radians(2.5)
+                if (
+                    not done
+                    and now - mission["stage_start"] > 8.0
+                    and abs(yaw_error) < math.radians(10.0)
+                ):
+                    done = True
                 vx = 0.0
                 wz = 0.0
                 if not done:
-                    wz = float(np.clip(1.8 * yaw_error, -0.65, 0.65))
-                    if abs(wz) < 0.18:
-                        wz = math.copysign(0.18, yaw_error)
+                    wz = float(np.clip(2.2 * yaw_error, -0.80, 0.80))
+                    if abs(wz) < 0.22:
+                        wz = math.copysign(0.22, yaw_error)
                 detail = (
                     f"target_yaw={math.degrees(mission['target_yaw']):.1f}deg "
                     f"yaw_error={math.degrees(yaw_error):.1f}deg"
                 )
-                timeout = 25.0
+                timeout = 35.0
                 if done:
                     self._finish_park_out(True)
                     return 0.0, 0.0
@@ -2584,23 +2788,45 @@ class NavBridge(Node):
 
         if kind == "pivot":
             error = self._angle_error(stage["yaw"], yaw)
-            done = abs(error) < math.radians(2.5)
+            # Skip near-aligned pivots immediately — corridor starts often sit
+            # at ~10deg and used to wedge forever under peer lat bias.
+            done = abs(error) < math.radians(8.0)
             if not done:
-                wz = float(np.clip(1.8 * error, -0.65, 0.65))
-                if abs(wz) < 0.18:
-                    wz = math.copysign(0.18, error)
-            timeout = 25.0
+                if elapsed > 2.0 and abs(error) < math.radians(15.0):
+                    done = True
+                elif elapsed > 5.0 and abs(error) < math.radians(25.0):
+                    done = True
+            if not done:
+                wz = float(np.clip(2.6 * error, -0.95, 0.95))
+                if abs(wz) < 0.40:
+                    wz = math.copysign(0.40, error)
+            timeout = 18.0
             detail = f"yaw_error={math.degrees(error):.1f}deg"
         else:
             axis = x if kind == "axis_x" else y
+            # Live retarget corridor x to the peer-aware lane so a head-on
+            # pair peels apart even if the stage was planned on a narrow aisle.
+            if kind == "axis_x" and abs(float(stage.get("value", 0.0))) <= 0.85:
+                stage["value"] = self._fleet_aisle_x()
             error = stage["value"] - axis
             done = abs(error) <= 0.05
             desired_yaw = stage["yaw"]
             yaw_error = self._angle_error(desired_yaw, yaw)
             if not done:
-                requested = min(abs(stage["speed"]), max(0.045, abs(error) * 0.8))
-                vx = math.copysign(requested, stage["speed"])
-                wz = float(np.clip(1.6 * yaw_error, -0.28, 0.28))
+                # If heading is blown out, stop translating and re-align.
+                # Otherwise peer lane bias drives the nose into a table bay
+                # (kitchen return → east tables) while still rolling forward.
+                if abs(yaw_error) > math.radians(30.0):
+                    vx = 0.0
+                    wz = float(np.clip(2.2 * yaw_error, -0.80, 0.80))
+                    if abs(wz) < 0.30:
+                        wz = math.copysign(0.30, yaw_error)
+                else:
+                    requested = min(
+                        abs(stage["speed"]), max(0.045, abs(error) * 0.8)
+                    )
+                    vx = math.copysign(requested, stage["speed"])
+                    wz = float(np.clip(1.8 * yaw_error, -0.45, 0.45))
             timeout = 90.0
             detail = f"axis_error={error:.3f}m yaw_error={math.degrees(yaw_error):.1f}deg"
 
@@ -2644,6 +2870,28 @@ class NavBridge(Node):
             next_kind = mission["stages"][mission["index"]]["kind"]
             self.get_logger().info(f"direct stage complete; next={next_kind}")
             return (0.0, 0.0)
+        # Lane hold only while translating and roughly aligned. Constant-sign
+        # peer swerve + raw (aisle-x) on northbound axis_y turned robot1 CW
+        # into +X and parked it in the east table bay (table 4).
+        if kind == "axis_y" and abs(vx) > 1e-3:
+            desired_yaw = float(stage["yaw"])
+            yaw_error = self._angle_error(desired_yaw, yaw)
+            if abs(yaw_error) < math.radians(25.0):
+                aisle = self._fleet_aisle_x()
+                lat_err = aisle - x
+                # Heading-aware crosstrack: northbound (+Y) needs
+                # wz = -k*(aisle-x); southbound the opposite.
+                lane_wz = -1.15 * lat_err * math.sin(desired_yaw)
+                peer_near = float(
+                    getattr(self, "_peer_near_dist", float("inf"))
+                )
+                limit = 0.28
+                if math.isfinite(peer_near) and peer_near < 2.0:
+                    limit = 0.35
+                    slow = 0.50 if peer_near < 0.8 else 0.80
+                    vx = math.copysign(max(0.12, abs(vx) * slow), vx)
+                lane_wz = float(np.clip(lane_wz, -limit, limit))
+                wz = float(np.clip(wz + lane_wz, -0.55, 0.55))
         return (vx * self._obstacle_scale, wz)
 
     def _update_legacy_table_navigation(self, mission, x, y, yaw):
@@ -2871,15 +3119,9 @@ class NavBridge(Node):
         now_monotonic = time.monotonic()
         if now_monotonic - self._last_navigation_heartbeat >= 1.0:
             self._last_navigation_heartbeat = now_monotonic
-            navigation_active = (
-                self._direct_nav is not None
-                or self._direct_nav_request is not None
-            )
+            # Location only — never publish navigation/status from Isaac.
             self.navigation_location_pub.publish(
                 Int32(data=self._navigation_location)
-            )
-            self.navigation_status_pub.publish(
-                Int32(data=1 if navigation_active else 2)
             )
 
         position, orientation = self.articulation.get_world_pose()

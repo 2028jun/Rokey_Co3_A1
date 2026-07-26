@@ -14,18 +14,23 @@ def build_kitchen_route(
     x: float,
     y: float,
     kitchen_dock=KITCHEN_DOCK,
+    aisle_x: float = 0.0,
 ):
-    """Return stages that leave a table bay and finish at the kitchen dock."""
+    """Return stages that leave a table bay and finish at the kitchen dock.
+
+    aisle_x keeps this robot on its corridor lane while traveling the spine.
+    """
     dock_x, dock_y, dock_yaw = kitchen_dock
+    aisle = float(aisle_x)
     stages = []
-    if abs(x) > 0.10:
-        outward_yaw = 0.0 if x > 0.0 else math.pi
+    if abs(x - aisle) > 0.10:
+        outward_yaw = 0.0 if x > aisle else math.pi
         stages.extend(
             [
                 {"kind": "pivot", "yaw": outward_yaw},
                 {
                     "kind": "axis_x",
-                    "value": 0.0,
+                    "value": aisle,
                     "speed": -BACKOUT_SPEED,
                     "yaw": outward_yaw,
                 },
@@ -43,8 +48,8 @@ def build_kitchen_route(
                 },
             ]
         )
-    if abs(dock_x) > 0.03:
-        slot_yaw = 0.0 if dock_x > 0.0 else math.pi
+    if abs(dock_x - aisle) > 0.03 or abs(x - dock_x) > 0.03:
+        slot_yaw = 0.0 if dock_x > aisle else math.pi
         stages.extend(
             [
                 {"kind": "pivot", "yaw": slot_yaw},

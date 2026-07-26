@@ -57,7 +57,9 @@ class OrderManager:
         )
         self.orders[order_id] = order
         # Update active_order_id if empty or previous active order is finished
-        if not self.active_order_id or self.orders.get(self.active_order_id, Order("", 0, [])).status in [OrderStatus.COMPLETED, OrderStatus.CANCELLED]:
+        if not self.active_order_id or self.orders.get(
+            self.active_order_id, Order("", 0, [], 0)
+        ).status in [OrderStatus.COMPLETED, OrderStatus.CANCELLED]:
             self.active_order_id = order_id
         return order
 

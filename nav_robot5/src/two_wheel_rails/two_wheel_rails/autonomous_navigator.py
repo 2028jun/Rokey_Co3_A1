@@ -257,6 +257,34 @@ class SimplifiedPathNavigator:
             self._on_mission_status,
             stage_qos,
         )
+        self._pub_fleet_intent = nav.create_publisher(
+            StringMsg, "fleet/intent", stage_qos
+        )
+        occupancy_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._sub_table_occupancy = nav.create_subscription(
+            StringMsg,
+            "/fleet/table_occupancy",
+            self._on_table_occupancy,
+            occupancy_qos,
+        )
+        ns = (nav.get_namespace() or "").strip("/")
+        self._robot_id = ns or "robot"
+        self._intent_priority = 0.0
+        self._intent_mission_id = ""
+        self._intent_polyline: list[dict] = []
+        self._intent_phase = "idle"
+        self._intent_table_id: int | None = None
+        # robot_id -> {table_id, phase}
+        self._table_occupancy: dict[str, dict] = {}
+        # robot_id -> last fleet intent snapshot (for hold gating)
+        self._peer_intents: dict[str, dict] = {}
+        self._occupying_timer = None
+        self._hold_distance_m = 2.0
+        self._hold_wait_timeout_sec = 240.0
 
         self._last_status: dict | None = None
 
@@ -270,6 +298,21 @@ class SimplifiedPathNavigator:
         self._pub_l_cand_y = nav.create_publisher(NavPath, "orthogonal_path/l_candidate_y_first", path_qos)
         self._pub_selected = nav.create_publisher(NavPath, "orthogonal_path/selected", path_qos)
         self._pub_dock_approach = nav.create_publisher(NavPath, "orthogonal_path/dock_approach", path_qos)
+
+        intent_qos = QoSProfile(
+            depth=5,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        for peer in ("robot1", "robot2"):
+            if peer == self._robot_id:
+                continue
+            nav.create_subscription(
+                StringMsg,
+                f"/{peer}/fleet/intent",
+                lambda msg, name=peer: self._on_peer_intent(name, msg),
+                intent_qos,
+            )
 
         # Run from the node's existing executor. No extra spin thread is created.
         # Once all inputs are ready, the timer cancels itself.
@@ -329,6 +372,430 @@ class SimplifiedPathNavigator:
         msg.data = json.dumps(payload)
         self._pub_mission_cmd.publish(msg)
 
+    def _on_peer_intent(self, robot: str, msg: StringMsg) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except Exception:
+            return
+        raw_table = payload.get("table_id")
+        table_id = None
+        if raw_table is not None:
+            try:
+                table_id = int(raw_table)
+            except (TypeError, ValueError):
+                table_id = None
+        self._peer_intents[robot] = {
+            "active": bool(payload.get("active", False)),
+            "phase": str(payload.get("phase", "idle") or "idle").lower(),
+            "table_id": table_id,
+            "priority": float(payload.get("priority", 0.0) or 0.0),
+        }
+
+    def _on_table_occupancy(self, msg: StringMsg) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except Exception:
+            return
+        robot = str(payload.get("robot_id", "")).strip()
+        if not robot:
+            return
+        phase = str(payload.get("phase", "clear")).strip().lower()
+        raw_table = payload.get("table_id")
+        if phase in ("", "clear"):
+            self._table_occupancy.pop(robot, None)
+            return
+        if raw_table is None:
+            return
+        try:
+            table_id = int(raw_table)
+        except (TypeError, ValueError):
+            return
+        self._table_occupancy[robot] = {
+            "table_id": table_id,
+            "phase": phase,
+        }
+
+    def _table_owner(self, table_id: int | None) -> str | None:
+        """Peer that still claims this table until kitchen return."""
+        if table_id is None:
+            return None
+        # Keep later robots waiting through approach, serve, park-out, and
+        # the whole return trip. Only 'clear' releases the dock.
+        hard = (
+            "serving",
+            "parking_out",
+            "occupying",
+            "approaching",
+            "returning",
+        )
+        for robot, info in self._table_occupancy.items():
+            if robot == self._robot_id:
+                continue
+            if int(info.get("table_id", -1)) != int(table_id):
+                continue
+            if str(info.get("phase", "")).lower() in hard:
+                return robot
+        return None
+
+    def _peer_blocks_table(self, table_id: int | None) -> str | None:
+        """Occupancy claim or live fleet intent near the same table."""
+        owner = self._table_owner(table_id)
+        if owner:
+            return owner
+        if table_id is None:
+            return None
+        for robot, intent in self._peer_intents.items():
+            if robot == self._robot_id:
+                continue
+            if not intent.get("active"):
+                continue
+            if intent.get("table_id") is None:
+                continue
+            if int(intent["table_id"]) != int(table_id):
+                continue
+            phase = str(intent.get("phase", "")).lower()
+            if phase in (
+                "serving",
+                "parking_out",
+                "occupying",
+                "approaching",
+                "returning",
+            ):
+                return robot
+        return None
+
+    @staticmethod
+    def _table_id_from_label(label: str) -> int | None:
+        if not label.startswith("table_"):
+            return None
+        try:
+            return int(label.split("_", 1)[1])
+        except (IndexError, ValueError):
+            return None
+
+    def _lane_x(self) -> float | None:
+        if self._robot_id == "robot1":
+            return -0.55
+        if self._robot_id == "robot2":
+            return 0.55
+        return None
+
+    def _hold_point_for_dock(
+        self, gx: float, gy: float, goal_yaw: float
+    ) -> Point:
+        hold_dist = max(self._hold_distance_m, self._cfg.dock_approach_distance_m + 0.8)
+        hx = gx - hold_dist * math.cos(goal_yaw)
+        hy = gy - hold_dist * math.sin(goal_yaw)
+        lane_x = self._lane_x()
+        # Prefer aisle lane when the hold sits near the corridor spine.
+        if lane_x is not None and abs(hx) < 0.55:
+            hx = lane_x
+        return (hx, hy)
+
+    def _apply_fleet_lane(
+        self, points: list[dict] | list[Point]
+    ) -> list[dict]:
+        """Shift corridor (near x=0) segments onto a per-robot lane.
+
+        robot1 keeps left of center, robot2 keeps right so simultaneous
+        kitchen departures do not share the exact same spine.
+        """
+        lane_x = self._lane_x()
+
+        out: list[dict] = []
+        n = len(points)
+        for i, pt in enumerate(points):
+            if isinstance(pt, dict):
+                x, y = float(pt["x"]), float(pt["y"])
+            else:
+                x, y = float(pt[0]), float(pt[1])
+            if lane_x is not None and 0 < i < n - 1 and abs(x) < 0.55:
+                x = lane_x
+            out.append({"x": round(x, 4), "y": round(y, 4)})
+        # Drop near-duplicates after lane snap.
+        cleaned: list[dict] = []
+        for p in out:
+            if (
+                not cleaned
+                or math.hypot(p["x"] - cleaned[-1]["x"], p["y"] - cleaned[-1]["y"])
+                > 0.05
+            ):
+                cleaned.append(p)
+        return cleaned
+
+    def _publish_fleet_intent(
+        self,
+        *,
+        active: bool,
+        mission_id: str = "",
+        polyline: list[tuple[float, float]] | list[dict] | None = None,
+        priority: float | None = None,
+        phase: str | None = None,
+        table_id: int | None = None,
+    ) -> None:
+        pose = self._map_pose()
+        if polyline is not None:
+            points: list[dict] = []
+            for pt in polyline:
+                if isinstance(pt, dict):
+                    points.append({"x": float(pt["x"]), "y": float(pt["y"])})
+                else:
+                    points.append({"x": float(pt[0]), "y": float(pt[1])})
+            self._intent_polyline = points
+        if phase is not None:
+            self._intent_phase = str(phase)
+        if table_id is not None:
+            self._intent_table_id = int(table_id)
+        points = list(self._intent_polyline)
+        # Stationary dock claim: publish pose only. Keeping the old approach
+        # polyline makes path_yield think we will redrive the aisle and
+        # permanently pauses peers on other tables.
+        if active and self._intent_phase in (
+            "occupying",
+            "parking_out",
+            "serving",
+        ):
+            if pose is not None:
+                points = [{"x": float(pose[0]), "y": float(pose[1])}]
+                self._intent_polyline = list(points)
+            else:
+                points = []
+                self._intent_polyline = []
+        elif active and self._intent_phase == "returning" and pose is not None:
+            # Refresh path head with live pose; drop stale duplicates only.
+            pass
+        payload = {
+            "robot_id": self._robot_id,
+            "mission_id": mission_id or self._intent_mission_id,
+            "priority": float(
+                self._intent_priority if priority is None else priority
+            ),
+            "pose_xy": (
+                {"x": float(pose[0]), "y": float(pose[1])}
+                if pose is not None
+                else None
+            ),
+            "remaining_polyline": points,
+            "active": bool(active),
+            "phase": self._intent_phase if active else "idle",
+            "table_id": self._intent_table_id,
+        }
+        msg = StringMsg()
+        msg.data = json.dumps(payload)
+        self._pub_fleet_intent.publish(msg)
+        if not active:
+            self._intent_mission_id = ""
+            self._intent_polyline = []
+            self._intent_phase = "idle"
+            self._intent_table_id = None
+
+    def _stop_occupying_heartbeat(self) -> None:
+        timer = self._occupying_timer
+        if timer is not None:
+            timer.cancel()
+            self._occupying_timer = None
+
+    def _enter_occupying(self, table_id: int, mission_id: str = "") -> None:
+        """Keep fleet intent alive through PnP so peers treat the dock as busy."""
+        self._stop_occupying_heartbeat()
+        self._intent_table_id = int(table_id)
+        self._intent_phase = "occupying"
+        if mission_id:
+            self._intent_mission_id = mission_id
+        elif not self._intent_mission_id:
+            self._intent_mission_id = f"occupy_{table_id}_{time.monotonic_ns()}"
+        pose = self._map_pose()
+        pose_poly = (
+            [{"x": float(pose[0]), "y": float(pose[1])}]
+            if pose is not None
+            else []
+        )
+        self._publish_fleet_intent(
+            active=True,
+            mission_id=self._intent_mission_id,
+            polyline=pose_poly,
+            phase="occupying",
+            table_id=table_id,
+        )
+
+        def _tick() -> None:
+            if self._intent_phase != "occupying":
+                self._stop_occupying_heartbeat()
+                return
+            live = self._map_pose()
+            poly = (
+                [{"x": float(live[0]), "y": float(live[1])}]
+                if live is not None
+                else []
+            )
+            self._publish_fleet_intent(
+                active=True,
+                mission_id=self._intent_mission_id,
+                polyline=poly,
+                phase="occupying",
+                table_id=self._intent_table_id,
+            )
+
+        self._occupying_timer = self._nav.create_timer(0.4, _tick)
+
+    def _clear_occupying(self) -> None:
+        self._stop_occupying_heartbeat()
+        if self._intent_phase in (
+            "occupying",
+            "parking_out",
+            "holding",
+            "approaching",
+            "returning",
+            "serving",
+        ):
+            self._publish_fleet_intent(active=False)
+
+    def _wait_for_table_free(
+        self, table_id: int, timeout_sec: float
+    ) -> bool:
+        """Block final dock until peer has fully released the table.
+
+        Release means manager occupancy clear (kitchen arrival), not merely
+        park-out. Also honor live peer fleet intents for the same table.
+        """
+        started = time.monotonic()
+        last_log = started
+        while time.monotonic() - started < timeout_sec:
+            rclpy.spin_once(self._nav, timeout_sec=0.05)
+            blocker = self._peer_blocks_table(table_id)
+            if blocker is None:
+                return True
+            now = time.monotonic()
+            if now - last_log >= 2.0:
+                print(
+                    f"[hold] waiting for table_{table_id} free "
+                    f"(blocker={blocker}) elapsed={now - started:.1f}s",
+                    flush=True,
+                )
+                last_log = now
+                pose = self._map_pose()
+                poly = (
+                    [{"x": float(pose[0]), "y": float(pose[1])}]
+                    if pose is not None
+                    else []
+                )
+                self._publish_fleet_intent(
+                    active=True,
+                    mission_id=self._intent_mission_id or f"hold_{table_id}",
+                    polyline=poly,
+                    phase="holding",
+                    table_id=table_id,
+                )
+        print(
+            f"[hold] timeout waiting for table_{table_id} after {timeout_sec:.0f}s",
+            flush=True,
+        )
+        return False
+
+    def _run_route_mission(
+        self,
+        *,
+        label: str,
+        points: list[Point],
+        dock: tuple[float, float, float] | None,
+        finish_after_route: bool,
+        final_yaw: float,
+        phase: str,
+        table_id: int | None,
+        timeout_sec: float = 180.0,
+    ) -> bool:
+        for attempt in range(self._cfg.replan_attempts + 1):
+            mission_id = f"{label}_{time.monotonic_ns()}_attempt_{attempt}"
+            self._last_status = None
+            self._spin_sleep(0.1)
+            map_p = self._map_pose()
+            raw_p = self._motion_pose()
+            if map_p is None or raw_p is None:
+                print(
+                    f"[{label}] planning failed: cannot resolve map/motion pose",
+                    flush=True,
+                )
+                return False
+
+            if attempt > 0:
+                start_pt = (map_p[0], map_p[1])
+                goal_pt = points[-1] if points else start_pt
+                try:
+                    points = self._plan_orthogonal_path(start_pt, goal_pt)
+                except RuntimeError as exc:
+                    print(
+                        f"[{label}] replan failed (attempt {attempt}): {exc}",
+                        flush=True,
+                    )
+                    if attempt < self._cfg.replan_attempts:
+                        self._spin_sleep(0.5)
+                        continue
+                    return False
+
+            ctrl_points = [
+                {"x": round(p[0], 4), "y": round(p[1], 4)} for p in points
+            ]
+            lane_points = self._apply_fleet_lane(ctrl_points)
+            self._publish_rviz_path(
+                self._pub_selected,
+                [(p["x"], p["y"]) for p in lane_points],
+            )
+            if dock is None:
+                dock_x, dock_y, dock_yaw = (
+                    lane_points[-1]["x"],
+                    lane_points[-1]["y"],
+                    final_yaw,
+                )
+            else:
+                dock_x, dock_y, dock_yaw = dock
+
+            mission_payload = {
+                "mission_id": mission_id,
+                "kind": "execute_route",
+                "points": lane_points,
+                "dock": {
+                    "x": round(dock_x, 4),
+                    "y": round(dock_y, 4),
+                    "yaw": round(dock_yaw, 4),
+                },
+                "finish_after_route": bool(finish_after_route),
+                "final_yaw": round(final_yaw, 4),
+            }
+            print(
+                f"[mission] sent mission={mission_id} points={len(lane_points)} "
+                f"dock=({dock_x:.3f},{dock_y:.3f}) phase={phase} "
+                f"lane={self._robot_id}",
+                flush=True,
+            )
+            self._intent_mission_id = mission_id
+            if self._intent_priority == 0.0 or phase in ("approaching", "holding"):
+                # Preserve earlier-order priority across hold -> final approach.
+                if self._intent_priority == 0.0:
+                    self._intent_priority = -float(time.monotonic())
+            self._publish_fleet_intent(
+                active=True,
+                mission_id=mission_id,
+                polyline=lane_points,
+                priority=self._intent_priority,
+                phase=phase,
+                table_id=table_id,
+            )
+            self._send_mission_command(mission_payload)
+            ok, reason = self._wait_for_mission_completion(
+                mission_id, timeout_sec, label
+            )
+            if ok:
+                return True
+            print(
+                f"[{label}] mission failed or timed out ({reason}); "
+                f"attempt={attempt}",
+                flush=True,
+            )
+            if attempt < self._cfg.replan_attempts:
+                self._spin_sleep(1.0)
+                continue
+        return False
+
     def _wait_for_mission_completion(
         self,
         mission_id: str,
@@ -337,15 +804,31 @@ class SimplifiedPathNavigator:
     ) -> tuple[bool, str]:
         started = time.monotonic()
         last_log = started
+        last_intent = started
 
         while time.monotonic() - started < timeout_sec:
             rclpy.spin_once(self._nav, timeout_sec=0.03)
 
+            # Keep fleet intent fresh so the yield coordinator can use live pose.
+            now = time.monotonic()
+            if self._intent_mission_id == mission_id and now - last_intent >= 0.4:
+                self._publish_fleet_intent(
+                    active=True,
+                    mission_id=mission_id,
+                    priority=self._intent_priority,
+                    phase=self._intent_phase,
+                    table_id=self._intent_table_id,
+                )
+                last_intent = now
+
             status = self._last_status
             if status and status.get("mission_id") == mission_id:
                 state = status.get("state")
-                phase = status.get("phase", "unknown")
-                if state == "completed":
+                phase = str(status.get("phase", "unknown"))
+                if state == "completed" or phase in (
+                    "park_out_aligned",
+                    "completed",
+                ):
                     print(
                         f"[mission] completed: mission={mission_id} label={label}",
                         flush=True,
@@ -387,8 +870,18 @@ class SimplifiedPathNavigator:
         *,
         label: str = "drive_distance",
     ) -> bool:
+        self._stop_occupying_heartbeat()
         mission_id = f"{label}_{time.monotonic_ns()}"
         self._last_status = None
+        self._intent_mission_id = mission_id
+        phase = "parking_out" if label == "park_out" else "drive"
+        saved_table = self._intent_table_id
+        self._publish_fleet_intent(
+            active=True,
+            mission_id=mission_id,
+            phase=phase,
+            table_id=saved_table,
+        )
         self._spin_sleep(0.25)
         self._send_mission_command(
             {
@@ -407,8 +900,170 @@ class SimplifiedPathNavigator:
         ok, _reason = self._wait_for_mission_completion(
             mission_id, timeout, label
         )
+        if label == "park_out":
+            if ok:
+                # Keep the table claim through the kitchen return so same-table
+                # peers stay on hold until we arrive at the kitchen.
+                self._intent_table_id = saved_table
+                self._intent_phase = "parking_out"
+                pose = self._map_pose()
+                poly = (
+                    [{"x": float(pose[0]), "y": float(pose[1])}]
+                    if pose is not None
+                    else []
+                )
+                self._publish_fleet_intent(
+                    active=True,
+                    mission_id=mission_id,
+                    polyline=poly,
+                    phase="parking_out",
+                    table_id=saved_table,
+                )
+            else:
+                # Failed park-out must not leave a sticky active claim that
+                # permanently pauses the other robot on a different route.
+                self._clear_occupying()
+        elif not ok:
+            self._publish_fleet_intent(active=False, mission_id=mission_id)
         return ok
 
+    def navigate_to(
+        self,
+        goal: PoseStamped,
+        *,
+        label: str = "goal",
+        position_then_align: bool = False,
+    ) -> bool:
+        if not self._wait_for_navigation_inputs(timeout_sec=8.0):
+            print(f"[{label}] navigation aborted: required inputs are unavailable", flush=True)
+            return False
+
+        gx = goal.pose.position.x
+        gy = goal.pose.position.y
+        q = goal.pose.orientation
+        goal_yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+        )
+        table_id = self._table_id_from_label(label)
+        returning_table = self._intent_table_id if label == "kitchen" else None
+
+        if label == "kitchen":
+            # Keep priority + table claim visible while returning so the later
+            # robot stays on hold until manager clears occupancy at kitchen.
+            self._stop_occupying_heartbeat()
+            if returning_table is not None:
+                self._intent_table_id = returning_table
+                self._intent_phase = "returning"
+        elif position_then_align and table_id is None:
+            self._clear_occupying()
+            self._intent_priority = 0.0
+
+        app_dist = self._cfg.dock_approach_distance_m
+        approach_pt = (
+            (gx, gy)
+            if position_then_align
+            else (
+                gx - app_dist * math.cos(goal_yaw),
+                gy - app_dist * math.sin(goal_yaw),
+            )
+        )
+        self._publish_rviz_path(self._pub_dock_approach, [approach_pt, (gx, gy)])
+
+        # Same-table serialization: stay in the kitchen seat until the peer
+        # has fully returned home. Driving to an aisle hold while the peer is
+        # still returning caused head-on pending deadlocks.
+        if table_id is not None and not position_then_align:
+            for _ in range(10):
+                rclpy.spin_once(self._nav, timeout_sec=0.02)
+            blocker = self._peer_blocks_table(table_id)
+            if not blocker:
+                deadline = time.monotonic() + 0.8
+                while time.monotonic() < deadline and not blocker:
+                    rclpy.spin_once(self._nav, timeout_sec=0.05)
+                    blocker = self._peer_blocks_table(table_id)
+            if blocker:
+                if self._intent_priority == 0.0:
+                    self._intent_priority = -float(time.monotonic())
+                print(
+                    f"[hold] table_{table_id} blocked by {blocker}; "
+                    "waiting at kitchen until peer returns home",
+                    flush=True,
+                )
+                pose = self._map_pose()
+                poly = (
+                    [{"x": float(pose[0]), "y": float(pose[1])}]
+                    if pose is not None
+                    else []
+                )
+                self._publish_fleet_intent(
+                    active=True,
+                    mission_id=f"hold_kitchen_{table_id}_{time.monotonic_ns()}",
+                    polyline=poly,
+                    priority=self._intent_priority,
+                    phase="holding",
+                    table_id=table_id,
+                )
+                if not self._wait_for_table_free(
+                    table_id, self._hold_wait_timeout_sec
+                ):
+                    self._publish_fleet_intent(active=False)
+                    return False
+                print(
+                    f"[hold] table_{table_id} clear (peer home); "
+                    "starting table approach",
+                    flush=True,
+                )
+
+        map_p = self._map_pose()
+        if map_p is None:
+            print(f"[{label}] planning failed: cannot resolve map pose", flush=True)
+            return False
+        start_pt = (map_p[0], map_p[1])
+        try:
+            points = self._plan_orthogonal_path(start_pt, approach_pt)
+        except RuntimeError as exc:
+            print(f"[{label}] orthogonal planning failed: {exc}", flush=True)
+            return False
+
+        if self._intent_priority == 0.0:
+            self._intent_priority = -float(time.monotonic())
+
+        if label == "kitchen":
+            phase = "returning"
+            mission_table = returning_table
+        elif table_id is not None:
+            phase = "approaching"
+            mission_table = table_id
+        else:
+            phase = "navigating"
+            mission_table = None
+
+        ok = self._run_route_mission(
+            label=label,
+            points=points,
+            dock=(gx, gy, normalize_angle(goal_yaw)),
+            finish_after_route=position_then_align,
+            final_yaw=normalize_angle(goal_yaw),
+            phase=phase,
+            table_id=mission_table,
+        )
+        if ok and table_id is not None and not position_then_align:
+            print(
+                f"[{label}] docked; keeping occupying intent through serving",
+                flush=True,
+            )
+            self._enter_occupying(table_id, mission_id=self._intent_mission_id)
+            return True
+
+        if ok:
+            self._publish_fleet_intent(active=False)
+            self._intent_priority = 0.0
+            print(f"[{label}] entire autonomous mission completed successfully!", flush=True)
+            return True
+
+        self._publish_fleet_intent(active=False)
+        return False
     def _wait_for_navigation_inputs(self, timeout_sec: float = 8.0) -> bool:
         # Fast path for normal operation: startup readiness was already cached
         # by _warm_navigation_inputs before the order arrived.
@@ -681,101 +1336,3 @@ class SimplifiedPathNavigator:
             print(f"[auto] Corner at ({invalid_corner[0]:.2f}, {invalid_corner[1]:.2f}) uncleared; expanding forbidden radius and replanning...", flush=True)
 
         raise RuntimeError("Orthogonal path planning failed all corner clearance checks")
-
-    def navigate_to(
-        self,
-        goal: PoseStamped,
-        *,
-        label: str = "goal",
-        position_then_align: bool = False,
-    ) -> bool:
-        if not self._wait_for_navigation_inputs(timeout_sec=8.0):
-            print(f"[{label}] navigation aborted: required inputs are unavailable", flush=True)
-            return False
-
-        gx = goal.pose.position.x
-        gy = goal.pose.position.y
-        q = goal.pose.orientation
-        goal_yaw = math.atan2(
-            2.0 * (q.w * q.z + q.x * q.y),
-            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
-        )
-
-        app_dist = self._cfg.dock_approach_distance_m
-        approach_pt = (
-            (gx, gy)
-            if position_then_align
-            else (
-                gx - app_dist * math.cos(goal_yaw),
-                gy - app_dist * math.sin(goal_yaw),
-            )
-        )
-        self._publish_rviz_path(self._pub_dock_approach, [approach_pt, (gx, gy)])
-
-        for attempt in range(self._cfg.replan_attempts + 1):
-            mission_id = (
-                f"{label}_{time.monotonic_ns()}_attempt_{attempt}"
-            )
-            self._last_status = None
-            self._spin_sleep(0.1)
-            map_p = self._map_pose()
-            raw_p = self._motion_pose()
-            if map_p is None or raw_p is None:
-                print(f"[{label}] planning failed: cannot resolve map/motion pose", flush=True)
-                return False
-
-            start_pt = (map_p[0], map_p[1])
-            try:
-                points = self._plan_orthogonal_path(start_pt, approach_pt)
-            except RuntimeError as exc:
-                print(f"[{label}] orthogonal planning failed (attempt {attempt}): {exc}", flush=True)
-                if attempt < self._cfg.replan_attempts:
-                    self._spin_sleep(0.5)
-                    continue
-                return False
-
-            # Isaac world, map, and route coordinates are deliberately the
-            # same in this simulation.  Applying the instantaneous AMCL/raw
-            # offset here duplicated localization error and shifted the whole
-            # executed route away from the path displayed in RViz.
-            ctrl_points = [
-                {"x": round(p[0], 4), "y": round(p[1], 4)}
-                for p in points
-            ]
-            ctrl_dock_x = gx
-            ctrl_dock_y = gy
-            ctrl_dock_yaw = normalize_angle(goal_yaw)
-
-            mission_payload = {
-                "mission_id": mission_id,
-                "kind": "execute_route",
-                "points": ctrl_points,
-                "dock": {
-                    "x": round(ctrl_dock_x, 4),
-                    "y": round(ctrl_dock_y, 4),
-                    "yaw": round(ctrl_dock_yaw, 4),
-                },
-                "finish_after_route": position_then_align,
-                "final_yaw": round(ctrl_dock_yaw, 4),
-            }
-
-            print(
-                f"[mission] sent mission={mission_id} points={len(ctrl_points)} "
-                f"dock=({ctrl_dock_x:.3f},{ctrl_dock_y:.3f}) "
-                f"map_raw_delta=({raw_p[0] - map_p[0]:.3f},"
-                f"{raw_p[1] - map_p[1]:.3f})",
-                flush=True,
-            )
-            self._send_mission_command(mission_payload)
-
-            ok, reason = self._wait_for_mission_completion(mission_id, 180.0, label)
-            if ok:
-                print(f"[{label}] entire autonomous mission completed successfully!", flush=True)
-                return True
-
-            print(f"[{label}] mission failed or timed out ({reason}); attempt={attempt}", flush=True)
-            if attempt < self._cfg.replan_attempts:
-                self._spin_sleep(1.0)
-                continue
-
-        return False

@@ -6,8 +6,13 @@ let mapRenderer = null;
 
 let selectedMenu = { id: 'm1', name: '페퍼로니', price: 18000 };
 let selectedTable = 1;
+let selectedRobot = 'auto';
 let isEmergencyStop = false;
 let currentDriveMode = 'MOCK';
+let fleetRobots = {
+    robot1: { state: 'UNKNOWN', available: false },
+    robot2: { state: 'UNKNOWN', available: false },
+};
 
 function toggleDriveMode() {
     currentDriveMode = (currentDriveMode === 'MOCK') ? 'LIVE' : 'MOCK';
@@ -99,6 +104,10 @@ function updateSystemTelemetry(data) {
     } else {
         robotDot.className = "status-dot offline";
         robotStateText.innerText = "OFFLINE";
+    }
+
+    if (data.robots) {
+        updateRobotAvailability(data.robots);
     }
 
     const domainTag = document.getElementById('domain-id-tag');
@@ -285,12 +294,60 @@ function renderCartSummary() {
 
 function selectTable(tableNum) {
     selectedTable = tableNum;
-    document.querySelectorAll('.table-btn').forEach(btn => btn.classList.remove('selected'));
-    event.currentTarget.classList.add('selected');
+    document.querySelectorAll('.table-grid .table-btn:not(.robot-btn)').forEach(btn => btn.classList.remove('selected'));
+    if (typeof event !== 'undefined' && event && event.currentTarget) {
+        event.currentTarget.classList.add('selected');
+    }
     
     document.getElementById('summary-table-num').innerText = `Table ${tableNum}`;
     if (mapRenderer) {
         mapRenderer.setActiveTargetTable(tableNum);
+    }
+}
+
+function selectRobot(robotId, btnEl) {
+    selectedRobot = robotId || 'auto';
+    document.querySelectorAll('.robot-btn').forEach(btn => btn.classList.remove('selected'));
+    if (btnEl) {
+        btnEl.classList.add('selected');
+    }
+    const labels = { auto: 'Auto', robot1: 'Robot 1', robot2: 'Robot 2' };
+    const summary = document.getElementById('summary-robot');
+    if (summary) {
+        summary.innerText = labels[selectedRobot] || selectedRobot;
+    }
+}
+
+function updateRobotAvailability(robots) {
+    fleetRobots = robots || fleetRobots;
+    ['robot1', 'robot2'].forEach((name) => {
+        const info = fleetRobots[name] || {};
+        const avail = !!info.available;
+        const state = info.state || 'UNKNOWN';
+        const el = document.getElementById(`${name}-avail`);
+        if (el) {
+            el.textContent = `${name === 'robot1' ? 'Robot1' : 'Robot2'}: ${avail ? '대기가능' : '사용중'} (${state})`;
+            el.className = avail ? 'robot-avail-ok' : 'robot-avail-busy';
+        }
+        const btn = document.querySelector(`.robot-btn[data-robot="${name}"]`);
+        if (btn) {
+            btn.disabled = !avail && currentDriveMode === 'LIVE';
+            btn.title = avail ? '대기가능' : `사용중: ${state}`;
+        }
+    });
+    const autoBtn = document.querySelector('.robot-btn[data-robot="auto"]');
+    if (autoBtn) {
+        const anyAvail = !!(fleetRobots.robot1?.available || fleetRobots.robot2?.available);
+        autoBtn.disabled = currentDriveMode === 'LIVE' && !anyAvail;
+    }
+    if (
+        currentDriveMode === 'LIVE'
+        && selectedRobot !== 'auto'
+        && fleetRobots[selectedRobot]
+        && !fleetRobots[selectedRobot].available
+    ) {
+        const auto = document.querySelector('.robot-btn[data-robot="auto"]');
+        selectRobot('auto', auto);
     }
 }
 
@@ -306,9 +363,20 @@ function submitOrder() {
         return;
     }
 
+    if (
+        currentDriveMode === 'LIVE'
+        && selectedRobot !== 'auto'
+        && fleetRobots[selectedRobot]
+        && !fleetRobots[selectedRobot].available
+    ) {
+        alert(`${selectedRobot}은(는) 현재 사용 중이어서 주문을 보낼 수 없습니다.`);
+        return;
+    }
+
     const payload = {
         type: "CREATE_ORDER",
         table_number: selectedTable,
+        preferred_robot: selectedRobot,
         items: orderItems.map(item => ({
             menu_id: item.id,
             name: item.name,
@@ -319,7 +387,8 @@ function submitOrder() {
 
     socket.send(JSON.stringify(payload));
     const summaryText = orderItems.map(i => `${i.name}(${i.quantity}개)`).join(', ');
-    alert(`Table ${selectedTable}번으로 [${summaryText}] 다중 로봇 서빙 주문이 전송되었습니다!`);
+    const robotLabel = selectedRobot === 'auto' ? 'Auto' : selectedRobot;
+    alert(`Table ${selectedTable}번 / ${robotLabel} 으로 [${summaryText}] 주문이 전송되었습니다!`);
 
     // Reset cart after submission
     for (const key in cart) {

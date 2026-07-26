@@ -276,6 +276,10 @@ class ManagerNode(Node):
         self._table_arrived_pub = self.create_publisher(
             Bool, 'serving_robot/table_arrived', status_qos)
         self._order_cancelled_pub = self.create_publisher(Int32, 'manager/order_cancelled', 10)
+        # Absolute fleet topic so every robot + coordinator see the same map.
+        self._table_occupancy_pub = self.create_publisher(
+            String, '/fleet/table_occupancy', status_qos)
+        self._occupancy_phase = 'clear'
         self.create_service(Trigger, 'manager/reset_fault', self._on_reset_fault)
 
         self.create_timer(1.0, self._check_timeouts)
@@ -301,6 +305,9 @@ class ManagerNode(Node):
             '✅ 주문 서비스 준비 완료: Navigation 초기 위치가 주방으로 확인됐습니다.')
 
     def _on_order_request(self, request, response):
+        ns = self.get_namespace().strip('/') or ''
+        if hasattr(response, 'assigned_robot'):
+            response.assigned_robot = ns
         self.get_logger().info(
             f'📥 [수신/RECV Service] /manager/order -> Table={request.table_id}, '
             f'Pizza1={request.pizza1_count}, Pizza2={request.pizza2_count}, '
@@ -467,8 +474,14 @@ class ManagerNode(Node):
                 and self._nav_status == NAV_STATUS_ARRIVED):
             self.get_logger().info(
                 '🏠 현재 위치가 주방으로 확인되어 중복 주방 복귀를 생략합니다.')
+            self._publish_table_occupancy('clear')
             self._start_next_trip()
             return
+        # Leaving the dock: keep table claimed until park-out finishes and
+        # we are no longer at the table location.
+        if self._table_id is not None and self._state in (
+                _State.ARM_SERVING, _State.ARM_PAUSED, _State.MOVING_TO_TABLE):
+            self._publish_table_occupancy('parking_out')
         self._state = _State.RETURNING_TO_KITCHEN
         self._set_state_deadline()
         self._publish_system_status()
@@ -491,6 +504,7 @@ class ManagerNode(Node):
             self._state = _State.MOVING_TO_TABLE
             self._set_state_deadline()
             self._publish_system_status()
+            self._publish_table_occupancy('approaching')
             self._call_nav_command(self._table_id)
             return
         self._state = _State.SPAWNING
@@ -703,7 +717,17 @@ class ManagerNode(Node):
             return
         if self._nav_status == NAV_STATUS_FAILED:
             if self._state in (_State.RETURNING_TO_KITCHEN, _State.MOVING_TO_TABLE):
-                self._fail()
+                # Only navigation_subsystem terminal FAILED (detail.state) may
+                # lock the robot. Isaac used to publish Int32=3 mid-attempt
+                # and cancel every following HMI order until reset_fault.
+                if self._nav_detail_state == 'FAILED':
+                    self._fail()
+                else:
+                    self.get_logger().warn(
+                        'Navigation Int32 FAILED ignored '
+                        f'(detail.state={self._nav_detail_state!r}; '
+                        'waiting for subsystem terminal failure)'
+                    )
             else:
                 self.get_logger().warn(
                     f'⚠️ {self._state.name} 상태에서 Navigation FAILED 상태를 수신했습니다 (무시).')
@@ -718,6 +742,8 @@ class ManagerNode(Node):
         if prev_location != msg.data:
             loc_name = "주방" if msg.data == 4 else f"테이블 {msg.data}"
             self.get_logger().info(f'📥 [수신/RECV Topic] /navigation/current_location = {msg.data} ({loc_name})')
+            # Do NOT clear table occupancy here. Peers must wait until this
+            # robot has fully returned to the kitchen (see kitchen arrival).
         self._check_table_arrival()
         self._check_kitchen_arrival()
         self._maybe_enable_order_service()
@@ -733,8 +759,15 @@ class ManagerNode(Node):
                 and self._nav_detail_phase == 'initialized'):
             self._navigation_initialized = True
             self._maybe_enable_order_service()
+        # Subsystem terminal failure (detail arrives with or after Int32=3).
+        if (self._nav_detail_state == 'FAILED'
+                and self._state in (
+                    _State.RETURNING_TO_KITCHEN, _State.MOVING_TO_TABLE)):
+            self._fail()
+            return
         self._check_table_arrival()
         self._check_kitchen_arrival()
+        self._maybe_enable_order_service()
 
     def _check_table_arrival(self):
         if (self._state == _State.MOVING_TO_TABLE
@@ -776,6 +809,7 @@ class ManagerNode(Node):
                 and self._nav_detail_state == 'SUCCEEDED'
                 and self._nav_detail_phase == 'completed'):
             self.get_logger().info('🏠 [ARRIVED] 주방 대기 위치 도착 확인 완료')
+            self._publish_table_occupancy('clear')
             self._start_next_trip()
 
     # ------------------------------------------------------------------
@@ -809,6 +843,7 @@ class ManagerNode(Node):
             self._state = _State.MOVING_TO_TABLE
             self._set_state_deadline()
             self._publish_system_status()
+            self._publish_table_occupancy('approaching')
             self._call_nav_command(self._table_id)
 
     # ------------------------------------------------------------------
@@ -824,6 +859,7 @@ class ManagerNode(Node):
             self._state = _State.ARM_PAUSED
             self._state_deadline = None
             self._publish_system_status()
+            self._publish_table_occupancy('serving')
             return
         if self._hand_intrusion:
             self.get_logger().warn('✋ [HAND INTRUSION] ROI 손 침입 감지 상태 -> 서빙 동작 일시 대기')
@@ -832,11 +868,13 @@ class ManagerNode(Node):
             self._state = _State.ARM_PAUSED
             self._state_deadline = None
             self._publish_system_status()
+            self._publish_table_occupancy('serving')
             return
         self._waiting_to_start_trip = False
         self._state = _State.ARM_SERVING
         self._set_state_deadline()
         self._publish_system_status()
+        self._publish_table_occupancy('serving')
         self._call_arm_command(self._current_trip.arm_command())
 
     def _on_arm_status(self, msg):
@@ -952,6 +990,8 @@ class ManagerNode(Node):
         self._arm_command_epoch += 1
         self._spawn_command_epoch += 1
         self._safety_command_epoch += 1
+        if self._table_id is not None or self._occupancy_phase != 'clear':
+            self._publish_table_occupancy('clear')
         self._table_id = None
         self._serve_queue = []
         self._current_trip = None
@@ -1054,6 +1094,37 @@ class ManagerNode(Node):
             self._hand_intrusion = False
         self._table_arrived = arrived
         self._table_arrived_pub.publish(Bool(data=arrived))
+
+    def _robot_id(self) -> str:
+        return self.get_namespace().strip('/') or 'robot'
+
+    def _publish_table_occupancy(self, phase: str) -> None:
+        """Publish shared dock claim for multi-robot table serialization."""
+        if not hasattr(self, '_table_occupancy_pub'):
+            return
+        phase = str(phase or 'clear')
+        table_id = self._table_id
+        if phase == 'clear':
+            payload = {
+                'table_id': table_id,
+                'robot_id': self._robot_id(),
+                'phase': 'clear',
+            }
+            self._occupancy_phase = 'clear'
+        else:
+            if table_id is None:
+                return
+            payload = {
+                'table_id': int(table_id),
+                'robot_id': self._robot_id(),
+                'phase': phase,
+            }
+            self._occupancy_phase = phase
+        msg = String()
+        msg.data = json.dumps(payload, ensure_ascii=False)
+        self._table_occupancy_pub.publish(msg)
+        self.get_logger().info(
+            f'📤 [송신/SEND Topic] /fleet/table_occupancy = {msg.data}')
 
 
 def _split_future_result(future):
