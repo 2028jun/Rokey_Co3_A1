@@ -1,5 +1,106 @@
 # Rokey_Co3_A1 서빙 로봇 및 손 안전 작업공간
 
+## 빠른 실행: 멀티로봇 + 원격 YOLO + HMI
+
+아래 순서대로 터미널을 각각 따로 열어 실행합니다. 현재 내부망은 메인
+Isaac/Manager 컴퓨터 `10.10.0.1`, 원격 YOLO 컴퓨터 `10.10.0.2`이며, 모든
+ROS 터미널은 `ROS_DOMAIN_ID=101`, `ROS_LOCALHOST_ONLY=0`을 사용합니다.
+Isaac 터미널에는 `/opt/ros/humble/setup.bash`를 source하지 마십시오.
+
+### 터미널 1 — 메인 컴퓨터: Isaac Sim
+
+```bash
+cd /home/rokey/cobot3_ws
+export ROS_DOMAIN_ID=101
+export ROS_LOCALHOST_ONLY=0
+./tools/run_multi_integrated_isaac.sh
+```
+
+### 터미널 2 — 메인 컴퓨터: Nav2 + Manager
+
+```bash
+cd /home/rokey/cobot3_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=101
+export ROS_LOCALHOST_ONLY=0
+./tools/t2_ros.sh
+```
+
+`robot1`, `robot2` 모두 `Navigation is fully initialized and ready!`를 출력할
+때까지 주문을 넣지 않습니다. 기본값은 전체 서빙 활성화 및 로컬 YOLO
+비활성화입니다.
+
+### 터미널 3 — 원격 컴퓨터 `10.10.0.2`: YOLO 두 대
+
+```bash
+cd /home/rokey/cobot3_ws
+export ROS_DOMAIN_ID=101
+export ROS_LOCALHOST_ONLY=0
+./tools/run_remote_yolo.sh
+```
+
+### 터미널 4 — 메인 컴퓨터: HMI
+
+```bash
+cd /home/rokey/cobot3_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=101
+export ROS_LOCALHOST_ONLY=0
+./tools/t3_hmi.sh
+```
+
+브라우저에서 주문 화면 `http://localhost:8000`, 관리자·테스트 화면
+`http://localhost:8000/admin`을 엽니다.
+
+### 터미널 5 — 메인 컴퓨터: 연결 확인
+
+```bash
+cd /home/rokey/cobot3_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=101
+export ROS_LOCALHOST_ONLY=0
+
+ping -c 3 10.10.0.2
+ros2 node list | grep hand_detector
+ros2 topic info /robot1/hand_safety/intrusion -v
+ros2 topic info /robot2/hand_safety/intrusion -v
+```
+
+정상이면 `/robot1/hand_detector`, `/robot2/hand_detector`가 보이고 두 안전
+토픽의 `Publisher count`가 각각 `1`입니다. 실제 heartbeat는 아래 명령을
+하나씩 실행해 주기가 출력되는지 확인하고 `Ctrl+C`로 종료합니다.
+
+```bash
+ros2 topic hz /robot1/hand_safety/intrusion
+ros2 topic hz /robot2/hand_safety/intrusion
+```
+
+`Publisher count: 0`이면 원격 YOLO가 붙지 않은 상태입니다. 이때 원격
+컴퓨터의 domain ID, `ROS_LOCALHOST_ONLY`, YOLO 실행 로그를 먼저 확인합니다.
+
+### HMI 실기 테스트
+
+1. 주문 화면에서 메뉴를 담고 Table 1로 첫 주문을 보냅니다.
+2. 첫 주문이 `robot1`에 배정되고 실제로 출발하는지 확인합니다.
+3. `robot1`이 복귀하기 전에 Table 2로 두 번째 주문을 보냅니다.
+4. 두 번째 주문이 `robot2`에 배정되고 두 로봇이 각각 서빙하는지 확인합니다.
+5. 관리자 화면에서 카메라·지도·로봇 상태가 갱신되는지 확인합니다.
+6. 관리자 화면의 사람 스폰/제거 버튼으로 보행자 감속·정지를 확인하고,
+   타이핑 시작 버튼으로 원격 YOLO 손 침입 감지를 확인합니다.
+
+진행 상태는 진단 터미널에서 확인할 수 있습니다.
+
+```bash
+ros2 topic echo /robot1/system/status
+ros2 topic echo /robot2/system/status
+```
+
+정상 전체 서빙 상태 순서는 `2 -> 3 -> 4 -> 1 -> 6`이며 `7`은 실패입니다.
+비상정지는 실제 주문을 중단시키므로 마지막에 별도 주문으로 시험합니다.
+
 ## 회사 장비 최종 검증
 
 WSL Ubuntu 22.04에서 ROS 2 Humble 빌드와 단위 테스트 17개는 통과했습니다.

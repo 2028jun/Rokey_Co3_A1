@@ -4345,9 +4345,6 @@ def main():
     for index, config in enumerate(robot_configs):
         set_robot_context(config["root"], config["spawn"])
         stage = open_restaurant_and_robot(open_stage=index == 0)
-        if index == 0:
-            add_three_by_three_restaurant_tiles(stage)
-            add_outer_wall_finish(stage)
         configure_wheel_contact_material(stage)
         configure_gripper_contact_material(stage)
         articulation_path = find_articulation_path(stage)
