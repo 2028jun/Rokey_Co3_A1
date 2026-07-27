@@ -2,333 +2,194 @@
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pizza Robot HMI - Order & System Monitoring</title>
-    <!-- Google Fonts & FontAwesome -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>PIZZA BOT - 주문하기</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <link rel="stylesheet" href="/css/styles.css?v=3">
+    <link rel="stylesheet" href="/css/kiosk.css?v=1">
 </head>
-<body>
-    <div class="app-container">
-        <!-- Top Navbar -->
-        <header class="navbar">
-            <div class="brand">
-                <div class="logo-icon"><i class="fa-solid fa-robot"></i></div>
-                <div class="brand-text">
-                    <h1>PIZZA BOT <span>HMI</span></h1>
-                    <p class="subtitle">Mobile Manipulator Serving System</p>
-                </div>
+<body class="kiosk-body">
+    <div class="kiosk-app">
+        <!-- Top Brand Bar -->
+        <header class="kiosk-topbar">
+            <div class="kiosk-brand">
+                <span class="kiosk-brand-emoji">🍕</span>
+                <span class="kiosk-brand-name">PIZZA BOT</span>
             </div>
-
-            <!-- Monitoring LEDs & Mode Toggle -->
-            <div class="system-status-bar">
-                <button class="mode-toggle-btn mock" id="mode-toggle-btn" onclick="toggleDriveMode()">
-                    <i class="fa-solid fa-gamepad"></i> <span class="label">구동 모드:</span>
-                    <strong id="mode-text">가상 모의 주행 (Mock)</strong>
-                </button>
-
-                <div class="status-badge" id="isaac-status-badge">
-                    <span class="status-dot offline" id="isaac-dot"></span>
-                    <span class="label">Isaac Sim:</span>
-                    <strong id="isaac-state-text">OFFLINE</strong>
-                    <span class="hz-tag" id="isaac-hz">0.0 Hz</span>
-                </div>
-
-                <div class="status-badge" id="robot-status-badge">
-                    <span class="status-dot offline" id="robot-dot"></span>
-                    <span class="label">Robot (M0609):</span>
-                    <strong id="robot-state-text">OFFLINE</strong>
-                    <span class="domain-tag" id="domain-id-tag">Domain -</span>
-                </div>
-
-                <div class="status-badge">
-                    <i class="fa-solid fa-parking-brake text-warning" id="brake-icon"></i>
-                    <span class="label">Brake:</span>
-                    <strong id="brake-state-text">LOCKED</strong>
-                </div>
-
-                <button class="estop-btn" id="estop-btn" onclick="toggleEmergencyStop()">
-                    <i class="fa-solid fa-triangle-exclamation"></i> EMERGENCY STOP
-                </button>
-                <button class="mode-toggle-btn" id="reset-fault-btn" onclick="resetManagerFault()">
-                    <i class="fa-solid fa-rotate-right"></i> RESET FAULT
-                </button>
-            </div>
+            <div class="kiosk-topbar-hint">화면을 터치해서 주문해 주세요</div>
         </header>
 
-        <!-- Main Workspace -->
-        <main class="workspace-grid">
-            <!-- Left Panel: Order Creation -->
-            <section class="panel glass-panel order-panel">
-                <div class="panel-header">
-                    <h2><i class="fa-solid fa-utensils"></i> 주문 생성 (Order Creation)</h2>
-                </div>
+        <div class="kiosk-body-grid">
+            <!-- Main: Category Tabs + Item Grid -->
+            <div class="kiosk-main">
+                <nav class="kiosk-cat-tabs">
+                    <button class="cat-tab active" id="cat-tab-pizza" onclick="switchCategory('pizza')">
+                        <i class="fa-solid fa-pizza-slice"></i> 메뉴
+                    </button>
+                    <button class="cat-tab" id="cat-tab-extra" onclick="switchCategory('extra')">
+                        <i class="fa-solid fa-utensils"></i> 추가 주문
+                    </button>
+                    <button class="cat-tab" id="cat-tab-table" onclick="switchCategory('table')">
+                        <i class="fa-solid fa-chair"></i> 테이블 선택
+                    </button>
+                </nav>
 
-                <!-- Step 1: Select Menu -->
-                <div class="form-section">
-                    <label class="section-label">1. 메뉴 선택</label>
-                    <div class="menu-grid">
-                        <div class="menu-card" id="menu-card-m1">
-                            <div class="menu-emoji">🍕</div>
-                            <div class="menu-info">
-                                <span class="menu-name">페퍼로니</span>
-                                <span class="menu-price">18,000원</span>
+                <!-- Pizza / Drink Menu -->
+                <section class="cat-panel active" id="cat-panel-pizza">
+                    <div class="kiosk-item-grid">
+                        <div class="item-card" id="menu-card-m1" role="button" tabindex="0" onclick="quickAdd('m1', '페퍼로니', 18000)">
+                            <div class="item-badge">🍕</div>
+                            <div class="item-info">
+                                <span class="item-name">페퍼로니</span>
+                                <span class="item-price">18,000원</span>
                             </div>
-                            <div class="qty-controls">
-                                <button class="qty-btn" onclick="updateCart('m1', '페퍼로니', 18000, -1)">-</button>
+                            <div class="item-qty-controls" onclick="event.stopPropagation()">
+                                <button class="qty-btn" onclick="updateCart('m1', '페퍼로니', 18000, -1)">−</button>
                                 <span class="qty-count" id="qty-m1">0</span>
                                 <button class="qty-btn" onclick="updateCart('m1', '페퍼로니', 18000, 1)">+</button>
                             </div>
                         </div>
 
-                        <div class="menu-card" id="menu-card-m2">
-                            <div class="menu-emoji">🧀</div>
-                            <div class="menu-info">
-                                <span class="menu-name">마르게리따</span>
-                                <span class="menu-price">17,000원</span>
+                        <div class="item-card" id="menu-card-m2" role="button" tabindex="0" onclick="quickAdd('m2', '마르게리따', 17000)">
+                            <div class="item-badge">🧀</div>
+                            <div class="item-info">
+                                <span class="item-name">마르게리따</span>
+                                <span class="item-price">17,000원</span>
                             </div>
-                            <div class="qty-controls">
-                                <button class="qty-btn" onclick="updateCart('m2', '마르게리따', 17000, -1)">-</button>
+                            <div class="item-qty-controls" onclick="event.stopPropagation()">
+                                <button class="qty-btn" onclick="updateCart('m2', '마르게리따', 17000, -1)">−</button>
                                 <span class="qty-count" id="qty-m2">0</span>
                                 <button class="qty-btn" onclick="updateCart('m2', '마르게리따', 17000, 1)">+</button>
                             </div>
                         </div>
 
-                        <div class="menu-card" id="menu-card-m3">
-                            <div class="menu-emoji">🍕</div>
-                            <div class="menu-info">
-                                <span class="menu-name">콤비네이션</span>
-                                <span class="menu-price">20,000원</span>
+                        <div class="item-card" id="menu-card-m3" role="button" tabindex="0" onclick="quickAdd('m3', '콤비네이션', 20000)">
+                            <div class="item-badge">🍕</div>
+                            <div class="item-info">
+                                <span class="item-name">콤비네이션</span>
+                                <span class="item-price">20,000원</span>
                             </div>
-                            <div class="qty-controls">
-                                <button class="qty-btn" onclick="updateCart('m3', '콤비네이션', 20000, -1)">-</button>
+                            <div class="item-qty-controls" onclick="event.stopPropagation()">
+                                <button class="qty-btn" onclick="updateCart('m3', '콤비네이션', 20000, -1)">−</button>
                                 <span class="qty-count" id="qty-m3">0</span>
                                 <button class="qty-btn" onclick="updateCart('m3', '콤비네이션', 20000, 1)">+</button>
                             </div>
                         </div>
 
-                        <div class="menu-card" id="menu-card-m4">
-                            <div class="menu-emoji">🥤</div>
-                            <div class="menu-info">
-                                <span class="menu-name">콜라 / 음료</span>
-                                <span class="menu-price">3,000원</span>
+                        <div class="item-card" id="menu-card-m4" role="button" tabindex="0" onclick="quickAdd('m4', '콜라 / 음료', 3000)">
+                            <div class="item-badge">🥤</div>
+                            <div class="item-info">
+                                <span class="item-name">콜라 / 음료</span>
+                                <span class="item-price">3,000원</span>
                             </div>
-                            <div class="qty-controls">
-                                <button class="qty-btn" onclick="updateCart('m4', '콜라 / 음료', 3000, -1)">-</button>
+                            <div class="item-qty-controls" onclick="event.stopPropagation()">
+                                <button class="qty-btn" onclick="updateCart('m4', '콜라 / 음료', 3000, -1)">−</button>
                                 <span class="qty-count" id="qty-m4">0</span>
                                 <button class="qty-btn" onclick="updateCart('m4', '콜라 / 음료', 3000, 1)">+</button>
                             </div>
                         </div>
                     </div>
-                </div>
+                </section>
 
-                <!-- Step 2: Additional Options -->
-                <div class="form-section">
-                    <label class="section-label">2. 추가 주문</label>
-                    <div class="menu-grid">
-                        <div class="menu-card" id="menu-card-m5">
-                            <div class="menu-emoji">🍴</div>
-                            <div class="menu-info">
-                                <span class="menu-name">식기도구 (수저통)</span>
-                                <span class="menu-price">0원 (무료)</span>
+                <!-- Extra / Cutlery -->
+                <section class="cat-panel" id="cat-panel-extra">
+                    <div class="kiosk-item-grid">
+                        <div class="item-card" id="menu-card-m5" role="button" tabindex="0" onclick="quickAdd('m5', '식기도구 (수저통)', 0)">
+                            <div class="item-badge">🍴</div>
+                            <div class="item-info">
+                                <span class="item-name">식기도구 (수저통)</span>
+                                <span class="item-price">무료</span>
                             </div>
-                            <div class="qty-controls">
-                                <button class="qty-btn" onclick="updateCart('m5', '식기도구 (수저통)', 0, -1)">-</button>
+                            <div class="item-qty-controls" onclick="event.stopPropagation()">
+                                <button class="qty-btn" onclick="updateCart('m5', '식기도구 (수저통)', 0, -1)">−</button>
                                 <span class="qty-count" id="qty-m5">0</span>
                                 <button class="qty-btn" onclick="updateCart('m5', '식기도구 (수저통)', 0, 1)">+</button>
                             </div>
                         </div>
-                        <div class="menu-card" id="menu-card-m6">
-                            <div class="menu-emoji">🍽️</div>
-                            <div class="menu-info">
-                                <span class="menu-name">접시</span>
-                                <span class="menu-price">0원 (무료)</span>
+                        <div class="item-card" id="menu-card-m6" role="button" tabindex="0" onclick="quickAdd('m6', '접시', 0)">
+                            <div class="item-badge">🍽️</div>
+                            <div class="item-info">
+                                <span class="item-name">접시</span>
+                                <span class="item-price">무료</span>
                             </div>
-                            <div class="qty-controls">
-                                <button class="qty-btn" onclick="updateCart('m6', '접시', 0, -1)">-</button>
+                            <div class="item-qty-controls" onclick="event.stopPropagation()">
+                                <button class="qty-btn" onclick="updateCart('m6', '접시', 0, -1)">−</button>
                                 <span class="qty-count" id="qty-m6">0</span>
                                 <button class="qty-btn" onclick="updateCart('m6', '접시', 0, 1)">+</button>
                             </div>
                         </div>
                     </div>
+                </section>
+
+                <!-- Table Selection -->
+                <section class="cat-panel" id="cat-panel-table">
+                    <p class="kiosk-table-hint">지금 앉아 계신 테이블 번호를 선택해 주세요</p>
+                    <div class="kiosk-table-grid">
+                        <button class="table-card selected" id="table-card-1" onclick="selectTable(1)">
+                            <i class="fa-solid fa-chair"></i>
+                            <span>Table 1</span>
+                        </button>
+                        <button class="table-card" id="table-card-2" onclick="selectTable(2)">
+                            <i class="fa-solid fa-chair"></i>
+                            <span>Table 2</span>
+                        </button>
+                        <button class="table-card" id="table-card-3" onclick="selectTable(3)">
+                            <i class="fa-solid fa-chair"></i>
+                            <span>Table 3</span>
+                        </button>
+                        <button class="table-card" id="table-card-4" onclick="selectTable(4)">
+                            <i class="fa-solid fa-chair"></i>
+                            <span>Table 4</span>
+                        </button>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Persistent Cart Sidebar -->
+            <aside class="kiosk-cart">
+                <div class="kiosk-cart-header">
+                    <i class="fa-solid fa-cart-shopping"></i> 주문 내역
+                    <span class="kiosk-cart-table-chip">Table <strong id="summary-table-num">1</strong></span>
                 </div>
 
-                <!-- Step 3: Select Table -->
-                <div class="form-section">
-                    <label class="section-label">3. 서빙 테이블 선택</label>
-                    <div class="table-grid">
-                        <button class="table-btn selected" onclick="selectTable(1)">Table 1</button>
-                        <button class="table-btn" onclick="selectTable(2)">Table 2</button>
-                        <button class="table-btn" onclick="selectTable(3)">Table 3</button>
-                        <button class="table-btn" onclick="selectTable(4)">Table 4</button>
+                <div class="kiosk-cart-items" id="cart-items-list">
+                    <div class="cart-empty-state">
+                        <i class="fa-solid fa-pizza-slice"></i>
+                        <p>메뉴를 선택해 주세요</p>
                     </div>
                 </div>
 
-                <!-- Selected Summary & Submit -->
-                <div class="order-summary-box">
-                    <div class="summary-row">
-                        <span>선택 품목:</span>
-                        <strong id="summary-menu-name">메뉴를 선택해 주세요</strong>
+                <div class="kiosk-cart-footer">
+                    <div class="kiosk-cart-total-row">
+                        <span>총 결제 금액</span>
+                        <strong id="summary-total-price">0원</strong>
                     </div>
-                    <div class="summary-row">
-                        <span>총 결제 금액:</span>
-                        <strong id="summary-total-price" class="highlight-text">0원</strong>
-                    </div>
-                    <div class="summary-row">
-                        <span>목적지 테이블:</span>
-                        <strong id="summary-table-num" class="highlight-text">Table 1</strong>
-                    </div>
-                    <button class="submit-order-btn" onclick="submitOrder()">
-                        <i class="fa-solid fa-paper-plane"></i> 로봇 서빙 주문 전송
+                    <button class="kiosk-submit-btn" id="submit-order-btn" onclick="submitOrder()" disabled>
+                        <i class="fa-solid fa-robot"></i> 로봇 서빙 주문하기
                     </button>
                 </div>
-            </section>
+            </aside>
+        </div>
 
-            <!-- Center Panel: Map & Active Mission Tracker -->
-            <section class="panel glass-panel map-panel">
-                <div class="panel-header">
-                    <h2><i class="fa-solid fa-map-location-dot"></i> 실시간 2D 식당 맵 & 로봇 트래킹</h2>
-                    <span class="badge-live"><i class="fa-solid fa-circle"></i> LIVE</span>
-                </div>
-
-                <div class="canvas-wrapper">
-                    <canvas id="restaurant-map-canvas" width="600" height="340"></canvas>
-                </div>
-
-                <!-- Live Camera Viewport -->
-                <div class="camera-viewport-box">
-                    <div class="camera-header">
-                        <span><i class="fa-solid fa-video text-danger"></i> 테이블 고정 카메라 (Table Camera Feed)</span>
-                        <span class="camera-status" id="camera-status-text">Live ROS 2 Topic</span>
-                    </div>
-                    <div class="camera-frame-container">
-                        <img id="camera-stream-img" src="" alt="Camera Feed Waiting..." onerror="this.style.display='none'; document.getElementById('camera-placeholder').style.display='flex';">
-                        <div class="camera-placeholder" id="camera-placeholder">
-                            <i class="fa-solid fa-camera-retro"></i>
-                            <p>/camera/color/image_raw 대기 중</p>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Mission Lifecycle Progress Bar -->
-                <div class="mission-tracker-box">
-                    <h3>현재 미션 상태: <span id="active-order-id-display">없음 (대기 중)</span></h3>
-                    <div class="stepper-wrapper">
-                        <div class="step-item active" id="step-1">
-                            <div class="step-counter"><i class="fa-solid fa-clipboard-check"></i></div>
-                            <div class="step-name">주문 접수</div>
-                        </div>
-                        <div class="step-item" id="step-2">
-                            <div class="step-counter"><i class="fa-solid fa-kitchen-set"></i></div>
-                            <div class="step-name">주방 수거</div>
-                        </div>
-                        <div class="step-item" id="step-3">
-                            <div class="step-counter"><i class="fa-solid fa-route"></i></div>
-                            <div class="step-name">테이블 이동</div>
-                        </div>
-                        <div class="step-item" id="step-4">
-                            <div class="step-counter"><i class="fa-solid fa-hand-holding-hand"></i></div>
-                            <div class="step-name">손회피 세팅</div>
-                        </div>
-                        <div class="step-item" id="step-5">
-                            <div class="step-counter"><i class="fa-solid fa-house"></i></div>
-                            <div class="step-name">복귀 완료</div>
-                        </div>
-                    </div>
-                </div>
-            </section>
-
-            <!-- Right Panel: System Metrics & Order History -->
-            <section class="panel glass-panel telemetry-panel">
-                <div class="panel-header">
-                    <h2><i class="fa-solid fa-gauge-high"></i> 로봇 텔레메트리 & 주문 목록</h2>
-                </div>
-
-                <!-- Telemetry Metrics -->
-                <div class="metrics-grid">
-                    <div class="metric-card">
-                        <div class="metric-icon"><i class="fa-solid fa-location-crosshairs"></i></div>
-                        <div class="metric-body">
-                            <span class="metric-title">로봇 위치 (Pose)</span>
-                            <span class="metric-value" id="val-pose">(-1.82, -2.20) m</span>
-                        </div>
-                    </div>
-
-                    <div class="metric-card">
-                        <div class="metric-icon"><i class="fa-solid fa-battery-three-quarters"></i></div>
-                        <div class="metric-body">
-                            <span class="metric-title">배터리 잔량</span>
-                            <span class="metric-value" id="val-battery">98.0 %</span>
-                        </div>
-                    </div>
-
-                    <div class="metric-card">
-                        <div class="metric-icon"><i class="fa-solid fa-bolt"></i></div>
-                        <div class="metric-body">
-                            <span class="metric-title">Sim Hz</span>
-                            <span class="metric-value" id="val-sim-hz">0.0 Hz</span>
-                        </div>
-                    </div>
-
-                    <div class="metric-card">
-                        <div class="metric-icon"><i class="fa-solid fa-gears"></i></div>
-                        <div class="metric-body">
-                            <span class="metric-title">로봇 암 모드</span>
-                            <span class="metric-value" id="val-arm-mode">READY</span>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Order List Table -->
-                <div class="orders-list-wrapper">
-                    <h3>최근 주문 내역</h3>
-                    <div class="table-responsive">
-                        <table class="order-table">
-                            <thead>
-                                <tr>
-                                    <th>ID</th>
-                                    <th>테이블</th>
-                                    <th>메뉴</th>
-                                    <th>상태</th>
-                                    <th>관리</th>
-                                </tr>
-                            </thead>
-                            <tbody id="order-table-body">
-                                <tr>
-                                    <td colspan="5" class="empty-msg">주문 내역이 없습니다.</td>
-                                </tr>
-                            </tbody>
-                        </table>
-                    </div>
-                <!-- Test Controls Section (테스트 제어) -->
-                <div class="test-controls-wrapper">
-                    <h3><i class="fa-solid fa-vial-virus" style="color: var(--accent-neon);"></i> 시뮬레이션 테스트 제어</h3>
-                    <div class="test-btn-group">
-                        <button class="test-btn spawn" onclick="triggerTypingAnimation()">
-                            <i class="fa-solid fa-keyboard"></i> 타이핑 시작
-                        </button>
-                    </div>
-                    <div class="test-btn-group" style="margin-top: 6px;">
-                        <button class="test-btn spawn" onclick="setObstacleTestVisible(true)">
-                            <i class="fa-solid fa-user"></i> 사람 스폰 (Spawn)
-                        </button>
-                        <button class="test-btn remove" onclick="setObstacleTestVisible(false)">
-                            <i class="fa-solid fa-user-slash"></i> 사람 제거 (Remove)
-                        </button>
-                    </div>
-                    <div class="test-status-info">
-                        <span>테스트 서비스 상태: <strong id="test-service-status">대기 중</strong></span>
-                    </div>
-                </div>
-            </section>
-        </main>
+        <a class="kiosk-admin-link" href="/admin" target="_blank" rel="noopener">
+            <i class="fa-solid fa-gauge-high"></i>
+        </a>
     </div>
 
-    <!-- Scripts -->
-    <script src="/js/robot_map.js"></script>
-    <script src="/js/app.js?v=4"></script>
+    <!-- Order Confirmation Overlay -->
+    <div class="kiosk-overlay" id="kiosk-confirm-overlay">
+        <div class="kiosk-confirm-card">
+            <div class="kiosk-confirm-icon"><i class="fa-solid fa-circle-check"></i></div>
+            <h2>주문이 접수되었어요!</h2>
+            <p id="kiosk-confirm-detail">Table 1으로 로봇이 곧 서빙을 시작합니다.</p>
+        </div>
+    </div>
+
+    <!-- Toast Notifications (replaces alert()) -->
+    <div class="kiosk-toast" id="kiosk-toast"></div>
+
+    <script src="/js/kiosk.js?v=1"></script>
 </body>
 </html>

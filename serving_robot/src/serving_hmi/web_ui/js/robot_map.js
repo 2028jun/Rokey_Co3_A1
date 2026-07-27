@@ -1,15 +1,26 @@
 /**
  * Restaurant Map Canvas Renderer for HMI
  * Accurately synced with lightweight_pizza_restaurant.usda stage
+ * Tracks two independent serving robots.
  */
+const ROBOT_MAP_COLORS = {
+    robot1: { body: "#6366f1", accent: "#a855f7", label: "#818cf8" },
+    robot2: { body: "#0ea5e9", accent: "#38bdf8", label: "#38bdf8" },
+};
+
 class RestaurantMap {
     constructor(canvasId) {
         this.canvas = document.getElementById(canvasId);
         this.ctx = this.canvas.getContext('2d');
-        
-        // World scale: 1 meter = 32 pixels
+
+        // World scale (pixels per meter) -- recomputed in resize() to fit
+        // whatever canvas size the layout gives us, so a bigger panel
+        // actually draws a bigger map instead of leaving empty margins.
         this.scale = 32;
-        
+        // Restaurant floor plan bounds drawn in render(): X=[-6,6], Y=[-5,5]
+        this.worldWidth = 12.0;
+        this.worldHeight = 10.0;
+
         // Actual USD Stage TableSet Positions (X, Y in meters)
         this.tables = {
             1: { x: -3.2, y: -2.2, label: "Table 1" },
@@ -17,11 +28,15 @@ class RestaurantMap {
             3: { x: -3.2, y: 0.7,  label: "Table 3" },
             4: { x: 3.2,  y: 0.7,  label: "Table 4" }
         };
-        
+
         // Kitchen Entry at rear wall gap (y=4.5)
         this.kitchenZone = { x: 0.0, y: 4.5, label: "Lightwheel Kitchen" };
-        this.robotPose = { x: -1.82, y: -2.20, yaw: 0.0 };
-        this.activeTargetTable = 1;
+
+        this.robotPoses = {
+            robot1: { x: -1.82, y: -2.20, yaw: 0.0 },
+            robot2: { x: 1.82, y: -2.20, yaw: 0.0 },
+        };
+        this.activeTargetTables = { robot1: null, robot2: null };
 
         // Robot-local (forward=+x) safety zones.  Kept in sync with the
         // collision_monitor polygons in nav2_params.yaml and the
@@ -29,7 +44,7 @@ class RestaurantMap {
         // nav_restaurant_demo.py -- update all three together.
         this.stopZone = { front: 0.75, back: -0.55, halfWidth: 0.60 };
         this.slowdownZone = { front: 1.35, back: -0.75, halfWidth: 0.85 };
-        
+
         this.init();
     }
 
@@ -43,6 +58,14 @@ class RestaurantMap {
         if (!this.canvas.parentElement) return;
         this.canvas.width = this.canvas.parentElement.clientWidth;
         this.canvas.height = this.canvas.parentElement.clientHeight || 380;
+
+        // Fit the fixed-size restaurant floor plan to whatever canvas size
+        // we actually got, with a small margin so walls don't touch the edge.
+        const padding = 48;
+        const scaleX = (this.canvas.width - padding * 2) / this.worldWidth;
+        const scaleY = (this.canvas.height - padding * 2) / this.worldHeight;
+        this.scale = Math.max(10, Math.min(scaleX, scaleY));
+
         this.originX = this.canvas.width / 2;
         this.originY = this.canvas.height / 2 + 20; // slight offset for kitchen top
         this.render();
@@ -55,15 +78,17 @@ class RestaurantMap {
         return { x: px, y: py };
     }
 
-    updateRobotPose(x, y, yaw) {
-        this.robotPose.x = x;
-        this.robotPose.y = y;
-        this.robotPose.yaw = yaw || 0.0;
+    updateRobotPose(robotName, x, y, yaw) {
+        if (!this.robotPoses[robotName]) return;
+        this.robotPoses[robotName].x = x;
+        this.robotPoses[robotName].y = y;
+        this.robotPoses[robotName].yaw = yaw || 0.0;
         this.render();
     }
 
-    setActiveTargetTable(tableNum) {
-        this.activeTargetTable = tableNum;
+    setActiveTargetTable(robotName, tableNum) {
+        if (!(robotName in this.activeTargetTables)) return;
+        this.activeTargetTables[robotName] = tableNum || null;
         this.render();
     }
 
@@ -127,9 +152,10 @@ class RestaurantMap {
         ctx.stroke();
 
         // 5. Draw 4 Tables (TableSet_00 ~ 03)
+        const targetedTables = new Set(Object.values(this.activeTargetTables).filter(Boolean).map(Number));
         for (const [tNum, tbl] of Object.entries(this.tables)) {
             const pos = this.worldToCanvas(tbl.x, tbl.y);
-            const isTarget = parseInt(tNum) === this.activeTargetTable;
+            const isTarget = targetedTables.has(parseInt(tNum));
 
             // Table Box (1.80m x 0.94m in world scale)
             const tw = 1.80 * this.scale;
@@ -151,12 +177,14 @@ class RestaurantMap {
             ctx.fillText(tbl.label, pos.x, pos.y + 4);
         }
 
-        // 6. Draw Path line from Robot to Target Table
-        if (this.activeTargetTable && this.tables[this.activeTargetTable]) {
-            const targetPos = this.worldToCanvas(this.tables[this.activeTargetTable].x, this.tables[this.activeTargetTable].y);
-            const rPos = this.worldToCanvas(this.robotPose.x, this.robotPose.y);
+        // 6. Draw Path line from each Robot to its own Target Table
+        for (const [robotName, targetTable] of Object.entries(this.activeTargetTables)) {
+            if (!targetTable || !this.tables[targetTable]) continue;
+            const colors = ROBOT_MAP_COLORS[robotName];
+            const targetPos = this.worldToCanvas(this.tables[targetTable].x, this.tables[targetTable].y);
+            const rPos = this.worldToCanvas(this.robotPoses[robotName].x, this.robotPoses[robotName].y);
 
-            ctx.strokeStyle = "#a855f7";
+            ctx.strokeStyle = colors.accent;
             ctx.lineWidth = 2.5;
             ctx.setLineDash([6, 6]);
             ctx.beginPath();
@@ -166,60 +194,63 @@ class RestaurantMap {
             ctx.setLineDash([]);
         }
 
-        // 7. Draw Robot (Ridgeback + M0609 Arm)
-        const rPos = this.worldToCanvas(this.robotPose.x, this.robotPose.y);
-        ctx.save();
-        ctx.translate(rPos.x, rPos.y);
-        ctx.rotate(-this.robotPose.yaw);
+        // 7. Draw both robots (Ridgeback + M0609 Arm)
+        for (const [robotName, pose] of Object.entries(this.robotPoses)) {
+            const colors = ROBOT_MAP_COLORS[robotName];
+            const rPos = this.worldToCanvas(pose.x, pose.y);
+            ctx.save();
+            ctx.translate(rPos.x, rPos.y);
+            ctx.rotate(-pose.yaw);
 
-        // Safety zones (drawn under the robot body, local +x = forward,
-        // matching the heading dot below).
-        const drawZone = (zone, fillStyle, strokeStyle, dash) => {
-            const zx = zone.back * this.scale;
-            const zy = -zone.halfWidth * this.scale;
-            const zw = (zone.front - zone.back) * this.scale;
-            const zh = 2 * zone.halfWidth * this.scale;
-            ctx.fillStyle = fillStyle;
-            ctx.strokeStyle = strokeStyle;
-            ctx.lineWidth = 1.5;
-            ctx.setLineDash(dash || []);
+            // Safety zones (drawn under the robot body, local +x = forward,
+            // matching the heading dot below).
+            const drawZone = (zone, fillStyle, strokeStyle, dash) => {
+                const zx = zone.back * this.scale;
+                const zy = -zone.halfWidth * this.scale;
+                const zw = (zone.front - zone.back) * this.scale;
+                const zh = 2 * zone.halfWidth * this.scale;
+                ctx.fillStyle = fillStyle;
+                ctx.strokeStyle = strokeStyle;
+                ctx.lineWidth = 1.5;
+                ctx.setLineDash(dash || []);
+                ctx.beginPath();
+                ctx.roundRect(zx, zy, zw, zh, 6);
+                ctx.fill();
+                ctx.stroke();
+                ctx.setLineDash([]);
+            };
+            drawZone(this.slowdownZone, "rgba(245, 158, 11, 0.12)", "rgba(245, 158, 11, 0.65)", [5, 4]);
+            drawZone(this.stopZone, "rgba(239, 68, 68, 0.18)", "rgba(239, 68, 68, 0.75)");
+
+            // Ridgeback base body
+            ctx.fillStyle = colors.body;
+            ctx.strokeStyle = colors.accent;
+            ctx.lineWidth = 2;
             ctx.beginPath();
-            ctx.roundRect(zx, zy, zw, zh, 6);
+            ctx.roundRect(-16, -14, 32, 28, 5);
             ctx.fill();
             ctx.stroke();
-            ctx.setLineDash([]);
-        };
-        drawZone(this.slowdownZone, "rgba(245, 158, 11, 0.12)", "rgba(245, 158, 11, 0.65)", [5, 4]);
-        drawZone(this.stopZone, "rgba(239, 68, 68, 0.18)", "rgba(239, 68, 68, 0.75)");
 
-        // Ridgeback base body
-        ctx.fillStyle = "#6366f1";
-        ctx.strokeStyle = "#a855f7";
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.roundRect(-16, -14, 32, 28, 5);
-        ctx.fill();
-        ctx.stroke();
+            // Robot Heading Indicator
+            ctx.fillStyle = "#ffffff";
+            ctx.beginPath();
+            ctx.arc(10, 0, 3.5, 0, Math.PI * 2);
+            ctx.fill();
 
-        // Robot Heading Indicator
-        ctx.fillStyle = "#ffffff";
-        ctx.beginPath();
-        ctx.arc(10, 0, 3.5, 0, Math.PI * 2);
-        ctx.fill();
+            // M0609 Arm Base
+            ctx.fillStyle = "#38bdf8";
+            ctx.beginPath();
+            ctx.arc(-5, 0, 5, 0, Math.PI * 2);
+            ctx.fill();
 
-        // M0609 Arm Base
-        ctx.fillStyle = "#38bdf8";
-        ctx.beginPath();
-        ctx.arc(-5, 0, 5, 0, Math.PI * 2);
-        ctx.fill();
+            ctx.restore();
 
-        ctx.restore();
-
-        // Robot Label
-        ctx.fillStyle = "#818cf8";
-        ctx.font = "bold 11px Outfit";
-        ctx.textAlign = "center";
-        ctx.fillText("PIZZA BOT", rPos.x, rPos.y - 18);
+            // Robot Label
+            ctx.fillStyle = colors.label;
+            ctx.font = "bold 11px Outfit";
+            ctx.textAlign = "center";
+            ctx.fillText(robotName === "robot1" ? "ROBOT 1" : "ROBOT 2", rPos.x, rPos.y - 18);
+        }
 
         // 8. Draw Obstacle Person on Map if Active
         if (this.obstaclePerson && this.obstaclePerson.active) {
@@ -247,22 +278,28 @@ class RestaurantMap {
             ctx.fillText("⚠️ PERSON (STOPPED)", oPos.x, oPos.y - 22);
         }
 
-        // 9. Safety zone legend (fixed, unrotated corner overlay)
+        // 9. Legend (fixed, unrotated corner overlay)
         const legendX = 10;
-        let legendY = this.canvas.height - 34;
+        let legendY = this.canvas.height - 52;
         ctx.font = "10px Outfit";
         ctx.textAlign = "left";
 
+        ctx.fillStyle = ROBOT_MAP_COLORS.robot1.body;
+        ctx.fillRect(legendX, legendY - 8, 12, 12);
+        ctx.fillStyle = "#f1f5f9";
+        ctx.fillText("Robot 1", legendX + 18, legendY + 1);
+
+        legendY += 18;
+        ctx.fillStyle = ROBOT_MAP_COLORS.robot2.body;
+        ctx.fillRect(legendX, legendY - 8, 12, 12);
+        ctx.fillStyle = "#f1f5f9";
+        ctx.fillText("Robot 2", legendX + 18, legendY + 1);
+
+        legendY += 18;
         ctx.fillStyle = "rgba(239, 68, 68, 0.75)";
         ctx.fillRect(legendX, legendY - 8, 12, 12);
         ctx.fillStyle = "#f1f5f9";
         ctx.fillText("Stop zone", legendX + 18, legendY + 1);
-
-        legendY += 18;
-        ctx.fillStyle = "rgba(245, 158, 11, 0.65)";
-        ctx.fillRect(legendX, legendY - 8, 12, 12);
-        ctx.fillStyle = "#f1f5f9";
-        ctx.fillText("Slowdown zone", legendX + 18, legendY + 1);
     }
 
     setObstaclePerson(active, x = 0.0, y = 2.8) {

@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import math
 import time
 import asyncio
 import threading
@@ -44,29 +45,49 @@ connected_clients: Set[WebSocket] = set()
 # Global state manager
 order_manager = OrderManager()
 
+# Per-robot topic namespace. robot1 keeps the original, unnamespaced topics
+# so the existing single-robot Isaac Sim / manager integration is unaffected;
+# robot2 is new and namespaced under /robot2/.
+ROBOT_TOPIC_PREFIX = {"robot1": "", "robot2": "/robot2"}
+ROBOT_SPAWN_POSE = {
+    "robot1": {"x": -1.82, "y": -2.20, "yaw": 0.0},
+    "robot2": {"x": 1.82, "y": -2.20, "yaw": 0.0},
+}
+
 class HMIBridgeNode(Node):
     def __init__(self):
         super().__init__('serving_hmi_bridge_node')
-        
+
         # System status state
         self.last_clock_time = 0.0
         self.last_clock_recv_wall_time = 0.0
         self.clock_hz = 0.0
         self.isaac_sim_connected = False
-        
-        self.last_robot_status_recv_time = 0.0
-        self.robot_connected = False
-        
+
         # Drive mode: 'MOCK' (standalone virtual simulator) vs 'LIVE' (Isaac Sim / Real Robot ROS 2)
         self.drive_mode = "MOCK"
-        
-        self.robot_pose = {"x": -1.82, "y": -2.20, "yaw": 0.0}
-        self.robot_state = "IDLE"  # IDLE, NAVIGATING, SERVING, ERROR
-        self.parking_brake = True
-        self.battery_level = 98.0
-        self.arm_state = "HOME"
+
         self.obstacle_info = {"active": False, "x": 0.0, "y": 2.8, "stop": False}
-        
+
+        # Per-robot state -- each robot tracks its own pose/status/camera and
+        # can be mid-mission independently of the other.
+        self.robots = {
+            name: {
+                "pose": dict(ROBOT_SPAWN_POSE[name]),
+                "state": "IDLE",
+                "parking_brake": True,
+                "battery": 98.0,
+                "connected": False,
+                "last_status_recv_time": 0.0,
+                "camera_base64": "",
+                "camera_recv_time": 0.0,
+                "camera_error_time": 0.0,
+                "_waiting_pickup": False,
+                "_waiting_serve": False,
+            }
+            for name in ROBOT_TOPIC_PREFIX
+        }
+
         # Publishers
         self.order_pub = self.create_publisher(String, '/serving_robot/order', 10)
         self.estop_pub = self.create_publisher(Bool, '/serving_robot/emergency_stop', 10)
@@ -76,7 +97,7 @@ class HMIBridgeNode(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
-        
+
         # ROS 2 Subscribers
         self.clock_sub = self.create_subscription(
             Clock,
@@ -84,30 +105,9 @@ class HMIBridgeNode(Node):
             self.clock_callback,
             qos_profile_sensor_data
         )
-        
-        # ROS 2 Status Subscribers (Dual QoS for maximum compatibility with Isaac Sim & ROS nodes)
-        self.robot_status_sub = self.create_subscription(
-            String,
-            '/serving_robot/status',
-            self.robot_status_callback,
-            10
-        )
-        self.robot_status_sensor_sub = self.create_subscription(
-            String,
-            '/serving_robot/status',
-            self.robot_status_callback,
-            qos_profile_sensor_data
-        )
 
-        # Direct Event Topic Subscriber (/serving_robot/event)
-        self.event_sub = self.create_subscription(
-            String,
-            '/serving_robot/event',
-            self.robot_status_callback,
-            10
-        )
-
-        # Obstacle Event Subscriber (/serving_robot/obstacle_event)
+        # Obstacle Event Subscriber (/serving_robot/obstacle_event) --
+        # shared corridor test actor, not per-robot.
         self.obstacle_event_sub = self.create_subscription(
             String,
             '/serving_robot/obstacle_event',
@@ -115,31 +115,50 @@ class HMIBridgeNode(Node):
             10
         )
 
-        # Table Camera Subscription
         from sensor_msgs.msg import Image
-        self.last_camera_base64 = ""
-        self.last_camera_recv_time = 0.0
-        self.last_camera_error_time = 0.0
-        self.camera_sub = self.create_subscription(
-            Image,
-            '/camera/color/image_raw',
-            self.table_camera_callback,
-            qos_profile_sensor_data
-        )
-        self.odom_sub = self.create_subscription(
-            Odometry,
-            '/nav_robot/odom',
-            self.odom_callback,
-            qos_profile_sensor_data,
-        )
 
-        # Serving Robot Manager Integration Clients & Subscribers
-        self.system_status_sub = self.create_subscription(
-            Int32,
-            '/system/status',
-            self.system_status_callback,
-            status_qos
-        )
+        self._robot_subs = []
+        for robot_name, prefix in ROBOT_TOPIC_PREFIX.items():
+            self._robot_subs.append(self.create_subscription(
+                Image,
+                f'{prefix}/camera/color/image_raw',
+                self._make_camera_callback(robot_name),
+                qos_profile_sensor_data
+            ))
+            self._robot_subs.append(self.create_subscription(
+                Odometry,
+                f'{prefix}/nav_robot/odom',
+                self._make_odom_callback(robot_name),
+                qos_profile_sensor_data,
+            ))
+            # Dual QoS for maximum compatibility with Isaac Sim & ROS nodes
+            self._robot_subs.append(self.create_subscription(
+                String,
+                f'{prefix}/serving_robot/status',
+                self._make_robot_status_callback(robot_name),
+                10
+            ))
+            self._robot_subs.append(self.create_subscription(
+                String,
+                f'{prefix}/serving_robot/status',
+                self._make_robot_status_callback(robot_name),
+                qos_profile_sensor_data
+            ))
+            self._robot_subs.append(self.create_subscription(
+                String,
+                f'{prefix}/serving_robot/event',
+                self._make_robot_status_callback(robot_name),
+                10
+            ))
+            self._robot_subs.append(self.create_subscription(
+                Int32,
+                f'{prefix}/system/status',
+                self._make_system_status_callback(robot_name),
+                status_qos
+            ))
+
+        # Serving Robot Manager Integration Clients & Subscribers (shared,
+        # single manager -- not yet namespaced per robot in this branch)
         self.order_cancelled_sub = self.create_subscription(
             Int32,
             '/manager/order_cancelled',
@@ -191,79 +210,88 @@ class HMIBridgeNode(Node):
         self.typing_trigger_pub.publish(Empty())
         return True, "typing animation trigger published"
 
-    def table_camera_callback(self, msg):
-        try:
-            import cv2
-            import numpy as np
-            import base64
+    @staticmethod
+    def _encode_image_to_data_uri(msg) -> str:
+        import cv2
+        import numpy as np
+        import base64
 
-            height = msg.height
-            width = msg.width
-            encoding = msg.encoding.lower()
-            channels = {
-                'mono8': 1,
-                'rgb8': 3,
-                'bgr8': 3,
-                'rgba8': 4,
-                'bgra8': 4,
-            }.get(encoding)
-            if channels is None:
-                raise ValueError(f"unsupported image encoding: {msg.encoding}")
+        height = msg.height
+        width = msg.width
+        encoding = msg.encoding.lower()
+        channels = {
+            'mono8': 1,
+            'rgb8': 3,
+            'bgr8': 3,
+            'rgba8': 4,
+            'bgra8': 4,
+        }.get(encoding)
+        if channels is None:
+            raise ValueError(f"unsupported image encoding: {msg.encoding}")
 
-            row_bytes = int(msg.step) if msg.step else width * channels
-            rows = np.frombuffer(msg.data, dtype=np.uint8).reshape(height, row_bytes)
-            pixels = rows[:, :width * channels]
-            if channels == 1:
-                img = pixels.reshape(height, width)
-            else:
-                img = pixels.reshape(height, width, channels)
-            if encoding == 'rgb8':
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            elif encoding == 'rgba8':
-                img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-            elif encoding == 'bgra8':
-                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        row_bytes = int(msg.step) if msg.step else width * channels
+        rows = np.frombuffer(msg.data, dtype=np.uint8).reshape(height, row_bytes)
+        pixels = rows[:, :width * channels]
+        if channels == 1:
+            img = pixels.reshape(height, width)
+        else:
+            img = pixels.reshape(height, width, channels)
+        if encoding == 'rgb8':
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        elif encoding == 'rgba8':
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        elif encoding == 'bgra8':
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
-            ok, buffer = cv2.imencode(
-                '.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 60])
-            if not ok:
-                raise RuntimeError("JPEG encoding failed")
-            b64_str = base64.b64encode(buffer).decode('utf-8')
-            self.last_camera_base64 = f"data:image/jpeg;base64,{b64_str}"
-            self.last_camera_recv_time = time.time()
-        except Exception as e:
-            now = time.time()
-            if now - self.last_camera_error_time >= 5.0:
-                self.last_camera_error_time = now
-                self.get_logger().warning(f"Camera frame conversion failed: {e}")
+        ok, buffer = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        if not ok:
+            raise RuntimeError("JPEG encoding failed")
+        b64_str = base64.b64encode(buffer).decode('utf-8')
+        return f"data:image/jpeg;base64,{b64_str}"
+
+    def _make_camera_callback(self, robot_name):
+        def callback(msg):
+            r = self.robots[robot_name]
+            try:
+                r["camera_base64"] = self._encode_image_to_data_uri(msg)
+                r["camera_recv_time"] = time.time()
+            except Exception as e:
+                now = time.time()
+                if now - r["camera_error_time"] >= 5.0:
+                    r["camera_error_time"] = now
+                    self.get_logger().warning(f"[{robot_name}] Camera frame conversion failed: {e}")
+        return callback
 
     def clock_callback(self, msg: Clock):
         now_wall = time.time()
         sim_sec = msg.clock.sec + msg.clock.nanosec * 1e-9
-        
+
         if self.last_clock_recv_wall_time > 0:
             dt_wall = now_wall - self.last_clock_recv_wall_time
             if dt_wall > 0:
                 self.clock_hz = round(1.0 / dt_wall, 1)
-        
+
         self.last_clock_time = sim_sec
         self.last_clock_recv_wall_time = now_wall
         self.isaac_sim_connected = True
 
-    def odom_callback(self, msg: Odometry):
-        orientation = msg.pose.pose.orientation
-        siny_cosp = 2.0 * (
-            orientation.w * orientation.z + orientation.x * orientation.y)
-        cosy_cosp = 1.0 - 2.0 * (
-            orientation.y * orientation.y + orientation.z * orientation.z)
-        import math
-        self.robot_pose = {
-            "x": float(msg.pose.pose.position.x),
-            "y": float(msg.pose.pose.position.y),
-            "yaw": math.atan2(siny_cosp, cosy_cosp),
-        }
-        self.last_robot_status_recv_time = time.time()
-        self.robot_connected = True
+    def _make_odom_callback(self, robot_name):
+        def callback(msg: Odometry):
+            orientation = msg.pose.pose.orientation
+            siny_cosp = 2.0 * (
+                orientation.w * orientation.z + orientation.x * orientation.y)
+            cosy_cosp = 1.0 - 2.0 * (
+                orientation.y * orientation.y + orientation.z * orientation.z)
+            r = self.robots[robot_name]
+            r["pose"] = {
+                "x": float(msg.pose.pose.position.x),
+                "y": float(msg.pose.pose.position.y),
+                "yaw": math.atan2(siny_cosp, cosy_cosp),
+            }
+            r["last_status_recv_time"] = time.time()
+            r["connected"] = True
+        return callback
+
     def obstacle_event_callback(self, msg: String):
         try:
             data = json.loads(msg.data)
@@ -276,67 +304,67 @@ class HMIBridgeNode(Node):
                 "y": float(y_val) if (y_val is not None and active) else 2.8,
                 "stop": active,
             }
-            if active:
-                self.robot_state = "🛑 OBSTACLE DETECTED (STOPPED)"
         except Exception:
             pass
 
-    def robot_status_callback(self, msg: String):
-        self.last_robot_status_recv_time = time.time()
-        self.robot_connected = True
-        try:
-            raw_text = msg.data.strip()
-            print(f"\n📥 [HMI RECEIVED ROS 2 EVENT] -> {raw_text}", flush=True)
+    def _make_robot_status_callback(self, robot_name):
+        def callback(msg: String):
+            r = self.robots[robot_name]
+            r["last_status_recv_time"] = time.time()
+            r["connected"] = True
+            try:
+                raw_text = msg.data.strip()
+                print(f"\n📥 [HMI RECEIVED ROS 2 EVENT:{robot_name}] -> {raw_text}", flush=True)
 
-            # Support plain text events as well as JSON
-            event_signal = None
-            data = {}
-            if raw_text.startswith('{'):
-                data = json.loads(raw_text)
-                event_signal = data.get("event") or data.get("action_completed")
-            else:
-                event_signal = raw_text
+                # Support plain text events as well as JSON
+                event_signal = None
+                data = {}
+                if raw_text.startswith('{'):
+                    data = json.loads(raw_text)
+                    event_signal = data.get("event") or data.get("action_completed")
+                else:
+                    event_signal = raw_text
 
-            # Automatically update robot_pose and force LIVE mode when real/Isaac Sim pose is received
-            if "pose" in data:
-                self.robot_pose = data["pose"]
-                if self.drive_mode != "LIVE":
-                    self.drive_mode = "LIVE"
-                    print("📡 [HMI Backend] Isaac Sim Robot Pose Received -> DRIVE MODE AUTO SWITCHED TO LIVE!", flush=True)
+                # Automatically update pose and force LIVE mode when real/Isaac Sim pose is received
+                if "pose" in data:
+                    r["pose"] = data["pose"]
+                    if self.drive_mode != "LIVE":
+                        self.drive_mode = "LIVE"
+                        print("📡 [HMI Backend] Isaac Sim Robot Pose Received -> DRIVE MODE AUTO SWITCHED TO LIVE!", flush=True)
 
-            if "state" in data:
-                self.robot_state = data["state"]
-            if "parking_brake" in data:
-                self.parking_brake = data["parking_brake"]
-            if "battery" in data:
-                self.battery_level = data["battery"]
+                if "state" in data:
+                    r["state"] = data["state"]
+                if "parking_brake" in data:
+                    r["parking_brake"] = data["parking_brake"]
+                if "battery" in data:
+                    r["battery"] = data["battery"]
 
-            active_id = order_manager.active_order_id
-            if event_signal and active_id:
-                active_order = order_manager.orders.get(active_id)
-                if active_order:
-                    if event_signal in ["ORDER_ACCEPTED", "START_KITCHEN_PICKUP"]:
-                        print(f"🚀 [EVENT 1 ACCEPTED] Driving to Kitchen for Order {active_id}...", flush=True)
-                        order_manager.update_status(active_id, OrderStatus.PICKING_UP)
-                        self.robot_state = "NAVIGATING TO KITCHEN"
-                        self.parking_brake = False
+                active_id = order_manager.active_order_ids.get(robot_name)
+                if event_signal and active_id:
+                    active_order = order_manager.orders.get(active_id)
+                    if active_order:
+                        if event_signal in ["ORDER_ACCEPTED", "START_KITCHEN_PICKUP"]:
+                            print(f"🚀 [EVENT 1 ACCEPTED:{robot_name}] Driving to Kitchen for Order {active_id}...", flush=True)
+                            order_manager.update_status(active_id, OrderStatus.PICKING_UP)
+                            r["state"] = "NAVIGATING TO KITCHEN"
+                            r["parking_brake"] = False
 
-                    elif event_signal in ["PICKUP_COMPLETED", "START_TABLE_NAV"]:
-                        print(f"🍕 [EVENT 2 PICKUP COMPLETED] Driving to Table {active_order.table_number}...", flush=True)
-                        order_manager.update_status(active_id, OrderStatus.NAVIGATING)
-                        self.robot_state = f"NAVIGATING TO T{active_order.table_number}"
-                        self.parking_brake = False
+                        elif event_signal in ["PICKUP_COMPLETED", "START_TABLE_NAV"]:
+                            print(f"🍕 [EVENT 2 PICKUP COMPLETED:{robot_name}] Driving to Table {active_order.table_number}...", flush=True)
+                            order_manager.update_status(active_id, OrderStatus.NAVIGATING)
+                            r["state"] = f"NAVIGATING TO T{active_order.table_number}"
+                            r["parking_brake"] = False
 
-                    elif event_signal in ["SERVING_COMPLETED", "COMPLETED"]:
-                        print(f"🎉 [EVENT 3 SERVING COMPLETED] Mission Done.", flush=True)
-                        order_manager.update_status(active_id, OrderStatus.COMPLETED)
-                        self.robot_state = "IDLE (MISSION COMPLETED)"
-                        self.parking_brake = True
-        except Exception as e:
-            self.get_logger().warn(f"Failed to parse robot status msg: {e}")
+                        elif event_signal in ["SERVING_COMPLETED", "COMPLETED"]:
+                            print(f"🎉 [EVENT 3 SERVING COMPLETED:{robot_name}] Mission Done.", flush=True)
+                            order_manager.update_status(active_id, OrderStatus.COMPLETED)
+                            r["state"] = "IDLE (MISSION COMPLETED)"
+                            r["parking_brake"] = True
+            except Exception as e:
+                self.get_logger().warn(f"[{robot_name}] Failed to parse robot status msg: {e}")
+        return callback
 
-    def system_status_callback(self, msg: Int32):
-        status_code = msg.data
+    def _make_system_status_callback(self, robot_name):
         status_map = {
             0: "IDLE",
             1: "RETURNING TO KITCHEN",
@@ -347,31 +375,36 @@ class HMIBridgeNode(Node):
             6: "COMPLETED",
             7: "SYSTEM FAILED (RESET REQUIRED)"
         }
-        self.robot_state = status_map.get(status_code, f"STATE_{status_code}")
-        self.robot_connected = True
-        self.last_robot_status_recv_time = time.time()
 
-        if self.drive_mode != "LIVE":
-            self.drive_mode = "LIVE"
-            print(f"📡 [HMI Backend] Manager Status Received ({self.robot_state}) -> DRIVE MODE AUTO SWITCHED TO LIVE!", flush=True)
+        def callback(msg: Int32):
+            status_code = msg.data
+            r = self.robots[robot_name]
+            r["state"] = status_map.get(status_code, f"STATE_{status_code}")
+            r["connected"] = True
+            r["last_status_recv_time"] = time.time()
 
-        active_id = order_manager.active_order_id
-        if active_id:
-            if status_code in (1, 2):
-                order_manager.update_status(active_id, OrderStatus.PICKING_UP)
-                self.parking_brake = False
-            elif status_code == 3:
-                order_manager.update_status(active_id, OrderStatus.NAVIGATING)
-                self.parking_brake = False
-            elif status_code in (4, 5):
-                order_manager.update_status(active_id, OrderStatus.SERVING)
-                self.parking_brake = True
-            elif status_code == 6:
-                order_manager.update_status(active_id, OrderStatus.COMPLETED)
-                self.parking_brake = True
-            elif status_code == 7:
-                order_manager.update_status(active_id, OrderStatus.CANCELLED)
-                self.parking_brake = True
+            if self.drive_mode != "LIVE":
+                self.drive_mode = "LIVE"
+                print(f"📡 [HMI Backend] Manager Status Received ({r['state']}) -> DRIVE MODE AUTO SWITCHED TO LIVE!", flush=True)
+
+            active_id = order_manager.active_order_ids.get(robot_name)
+            if active_id:
+                if status_code in (1, 2):
+                    order_manager.update_status(active_id, OrderStatus.PICKING_UP)
+                    r["parking_brake"] = False
+                elif status_code == 3:
+                    order_manager.update_status(active_id, OrderStatus.NAVIGATING)
+                    r["parking_brake"] = False
+                elif status_code in (4, 5):
+                    order_manager.update_status(active_id, OrderStatus.SERVING)
+                    r["parking_brake"] = True
+                elif status_code == 6:
+                    order_manager.update_status(active_id, OrderStatus.COMPLETED)
+                    r["parking_brake"] = True
+                elif status_code == 7:
+                    order_manager.update_status(active_id, OrderStatus.CANCELLED)
+                    r["parking_brake"] = True
+        return callback
 
     def order_cancelled_callback(self, msg: Int32):
         hmi_table_number = int(msg.data) + 1
@@ -469,20 +502,22 @@ class HMIBridgeNode(Node):
         if now - self.last_clock_recv_wall_time > 2.0:
             self.isaac_sim_connected = False
             self.clock_hz = 0.0
-            
-        # Robot status liveness check
-        if now - self.last_robot_status_recv_time > 3.0:
-            self.robot_connected = False
-            
-        # Run Mock Navigation Engine unconditionally when drive_mode == 'MOCK'
-        if self.drive_mode == "MOCK" and order_manager.active_order_id:
-            self.update_mock_navigation()
 
-    def update_mock_navigation(self):
-        active_id = order_manager.active_order_id
+        for robot_name, r in self.robots.items():
+            # Robot status liveness check
+            if now - r["last_status_recv_time"] > 3.0:
+                r["connected"] = False
+
+            # Run Mock Navigation Engine unconditionally when drive_mode == 'MOCK'
+            if self.drive_mode == "MOCK" and order_manager.active_order_ids.get(robot_name):
+                self.update_mock_navigation(robot_name)
+
+    def update_mock_navigation(self, robot_name: str):
+        r = self.robots[robot_name]
+        active_id = order_manager.active_order_ids.get(robot_name)
         if not active_id:
             return
-            
+
         active_order = order_manager.orders.get(active_id)
         if not active_order or active_order.status in [OrderStatus.COMPLETED, OrderStatus.CANCELLED]:
             return
@@ -499,77 +534,72 @@ class HMIBridgeNode(Node):
 
         # Helper to step robot pose towards target coordinate (20Hz)
         def step_towards(tx, ty, speed=0.12):
-            cx, cy = self.robot_pose["x"], self.robot_pose["y"]
+            cx, cy = r["pose"]["x"], r["pose"]["y"]
             dx, dy = tx - cx, ty - cy
             dist = (dx**2 + dy**2)**0.5
             if dist < 0.25:
                 return True
-            import math
             yaw = math.atan2(dy, dx)
-            self.robot_pose["x"] += (dx / dist) * speed
-            self.robot_pose["y"] += (dy / dist) * speed
-            self.robot_pose["yaw"] = yaw
+            r["pose"]["x"] += (dx / dist) * speed
+            r["pose"]["y"] += (dy / dist) * speed
+            r["pose"]["yaw"] = yaw
             return False
 
         # Phase 0: PENDING -> Instantly start drive to Kitchen
         if active_order.status == OrderStatus.PENDING:
-            self._waiting_pickup = False
-            self._waiting_serve = False
+            r["_waiting_pickup"] = False
+            r["_waiting_serve"] = False
             order_manager.update_status(active_id, OrderStatus.PICKING_UP)
-            self.robot_state = "NAVIGATING TO KITCHEN"
-            self.parking_brake = False
-            print(f"🤖 [Auto Mock Nav] Order {active_id} received! Driving to Kitchen...", flush=True)
+            r["state"] = "NAVIGATING TO KITCHEN"
+            r["parking_brake"] = False
+            print(f"🤖 [Auto Mock Nav:{robot_name}] Order {active_id} received! Driving to Kitchen...", flush=True)
 
         # Phase 1: PICKING_UP -> Drive to Kitchen then auto-wait 2s & switch to NAVIGATING
         elif active_order.status == OrderStatus.PICKING_UP:
             arrived = step_towards(kitchen_xy[0], kitchen_xy[1])
             if arrived:
-                self.robot_state = "AT KITCHEN (PICKING UP FOOD)"
-                self.parking_brake = True
-                if not getattr(self, "_waiting_pickup", False):
-                    self._waiting_pickup = True
-                    print(f"🤖 [Auto Mock Nav] Arrived at Kitchen. Loading food (2s)...", flush=True)
-                    threading.Thread(target=self._finish_pickup_and_navigate, args=(active_id,), daemon=True).start()
+                r["state"] = "AT KITCHEN (PICKING UP FOOD)"
+                r["parking_brake"] = True
+                if not r["_waiting_pickup"]:
+                    r["_waiting_pickup"] = True
+                    print(f"🤖 [Auto Mock Nav:{robot_name}] Arrived at Kitchen. Loading food (2s)...", flush=True)
+                    threading.Thread(target=self._finish_pickup_and_navigate, args=(robot_name, active_id), daemon=True).start()
             else:
-                self.robot_state = "NAVIGATING TO KITCHEN"
-                self.parking_brake = False
+                r["state"] = "NAVIGATING TO KITCHEN"
+                r["parking_brake"] = False
 
         # Phase 2: NAVIGATING -> Drive to Target Table then auto-wait 3s & COMPLETED
         elif active_order.status == OrderStatus.NAVIGATING:
             arrived = step_towards(target_table_xy[0], target_table_xy[1])
             if arrived:
-                self.robot_state = f"AT TABLE {active_order.table_number} (SERVING FOOD)"
-                self.parking_brake = True
+                r["state"] = f"AT TABLE {active_order.table_number} (SERVING FOOD)"
+                r["parking_brake"] = True
                 order_manager.update_status(active_id, OrderStatus.SERVING)
-                if not getattr(self, "_waiting_serve", False):
-                    self._waiting_serve = True
-                    print(f"🤖 [Auto Mock Nav] Arrived at Table {active_order.table_number}. Serving (3s)...", flush=True)
-                    threading.Thread(target=self._auto_complete_order, args=(active_id,), daemon=True).start()
+                if not r["_waiting_serve"]:
+                    r["_waiting_serve"] = True
+                    print(f"🤖 [Auto Mock Nav:{robot_name}] Arrived at Table {active_order.table_number}. Serving (3s)...", flush=True)
+                    threading.Thread(target=self._auto_complete_order, args=(robot_name, active_id), daemon=True).start()
             else:
-                self.robot_state = f"NAVIGATING TO T{active_order.table_number}"
-                self.parking_brake = False
+                r["state"] = f"NAVIGATING TO T{active_order.table_number}"
+                r["parking_brake"] = False
 
-    def _finish_pickup_and_navigate(self, order_id):
+    def _finish_pickup_and_navigate(self, robot_name, order_id):
         time.sleep(2.0)
         order = order_manager.orders.get(order_id)
         if order and order.status == OrderStatus.PICKING_UP:
             order_manager.update_status(order_id, OrderStatus.NAVIGATING)
-            self.parking_brake = False
-            print(f"🤖 [Auto Mock Nav] Pickup Done! Driving to Table...", flush=True)
+            self.robots[robot_name]["parking_brake"] = False
+            print(f"🤖 [Auto Mock Nav:{robot_name}] Pickup Done! Driving to Table...", flush=True)
 
-    def _auto_complete_order(self, order_id):
+    def _auto_complete_order(self, robot_name, order_id):
         time.sleep(3.0)
+        r = self.robots[robot_name]
         order = order_manager.orders.get(order_id)
         if order and order.status in [OrderStatus.NAVIGATING, OrderStatus.SERVING]:
             order_manager.update_status(order_id, OrderStatus.COMPLETED)
-            self.robot_state = "IDLE (MISSION COMPLETED)"
-            self.parking_brake = True
-            print(f"🎉 [Auto Mock Nav] Mission {order_id} Completed!", flush=True)
-        if order and order.status == OrderStatus.SERVING:
-            order_manager.update_status(order_id, OrderStatus.COMPLETED)
-            self.robot_state = "IDLE (SERVING DONE)"
-            self.parking_brake = True
-            self.get_logger().info(f"[Mock Nav] Order {order_id} completed!")
+            r["state"] = "IDLE (MISSION COMPLETED)"
+            r["parking_brake"] = True
+            print(f"🎉 [Auto Mock Nav:{robot_name}] Mission {order_id} Completed!", flush=True)
 
     def publish_order(self, order_dict: dict):
         msg = String()
@@ -585,36 +615,41 @@ class HMIBridgeNode(Node):
 
 ros_node: HMIBridgeNode = None
 
-def get_system_status_payload():
+def _robot_status_payload(robot_name: str) -> dict:
     is_mock = (ros_node.drive_mode == "MOCK") if ros_node else True
+    r = ros_node.robots.get(robot_name) if ros_node else None
     camera_connected = bool(
-        ros_node
-        and ros_node.last_camera_recv_time > 0.0
-        and time.time() - ros_node.last_camera_recv_time <= 2.0
+        r and r["camera_recv_time"] > 0.0
+        and time.time() - r["camera_recv_time"] <= 2.0
     )
+    return {
+        "connected": True if is_mock else bool(r and r["connected"]),
+        "state": r["state"] if r else "OFFLINE",
+        "pose": r["pose"] if r else dict(ROBOT_SPAWN_POSE[robot_name]),
+        "parking_brake": r["parking_brake"] if r else True,
+        "battery": r["battery"] if r else 100.0,
+        "camera_connected": camera_connected,
+        "camera_image": r["camera_base64"] if (r and camera_connected) else "",
+    }
+
+def get_system_status_payload():
     return {
         "type": "SYSTEM_STATUS",
         "timestamp": time.time(),
         "drive_mode": ros_node.drive_mode if ros_node else "MOCK",
+        "domain_id": os.environ.get("ROS_DOMAIN_ID", "0"),
         "isaac_sim": {
             "connected": ros_node.isaac_sim_connected if ros_node else False,
             "hz": ros_node.clock_hz if ros_node else 0.0,
             "clock": ros_node.last_clock_time if ros_node else 0.0
         },
-        "robot": {
-            "connected": True if is_mock else (ros_node.robot_connected if ros_node else False),
-            "state": ros_node.robot_state if ros_node else "OFFLINE",
-            "pose": ros_node.robot_pose if ros_node else {"x": -1.82, "y": -2.20, "yaw": 0.0},
-            "parking_brake": ros_node.parking_brake if ros_node else True,
-            "battery": ros_node.battery_level if ros_node else 100.0,
-            "domain_id": os.environ.get("ROS_DOMAIN_ID", "0")
+        "robots": {
+            "robot1": _robot_status_payload("robot1"),
+            "robot2": _robot_status_payload("robot2"),
         },
-        "camera_connected": camera_connected,
         "obstacle": (ros_node.obstacle_info if ros_node else {"active": False, "x": 0.0, "y": 2.8, "stop": False}),
-        "camera_image": (
-            ros_node.last_camera_base64 if camera_connected else ""),
         "orders": order_manager.get_all_orders_dict(),
-        "active_order_id": order_manager.active_order_id
+        "active_order_ids": dict(order_manager.active_order_ids),
     }
 
 @app.on_event("startup")
@@ -629,20 +664,21 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         # Send initial full state immediately
         await websocket.send_json(get_system_status_payload())
-        
+
         while True:
             data_text = await websocket.receive_text()
             try:
                 data = json.loads(data_text)
                 msg_type = data.get("type")
-                
+
                 if msg_type == "SET_DRIVE_MODE":
                     mode = data.get("mode", "MOCK")
                     if ros_node:
                         ros_node.drive_mode = mode
                         print(f"[HMI Backend] DRIVE MODE SWITCHED TO: {mode}", flush=True)
                         if mode == "MOCK":
-                            ros_node.update_mock_navigation()
+                            for robot_name in ros_node.robots:
+                                ros_node.update_mock_navigation(robot_name)
                     payload = get_system_status_payload()
                     for client in list(connected_clients):
                         try:
@@ -654,13 +690,14 @@ async def websocket_endpoint(websocket: WebSocket):
                     table_num = int(data.get("table_number", 1))
                     items = data.get("items", [])
                     new_order = order_manager.create_order(table_num, items)
-                    print(f"[HMI Backend] NEW ORDER CREATED: {new_order.order_id} for Table {table_num}. Total items: {len(items)}")
-                    
+                    print(f"[HMI Backend] NEW ORDER CREATED: {new_order.order_id} for Table {table_num} -> {new_order.assigned_robot}. Total items: {len(items)}")
+
                     # Publish order to ROS 2 topic with quantities and total price
                     order_payload = {
                         "action": "NEW_ORDER",
                         "order_id": new_order.order_id,
                         "table_number": new_order.table_number,
+                        "assigned_robot": new_order.assigned_robot,
                         "items": [f"{item.name} x{item.quantity}" for item in new_order.items],
                         "total_price": new_order.total_price,
                         "status": new_order.status
@@ -676,7 +713,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                     f"HMI order {new_order.order_id} cancelled: {msg}")
                         else:
                             ros_node.publish_order(order_payload)
-                            ros_node.update_mock_navigation()
+                            ros_node.update_mock_navigation(new_order.assigned_robot)
 
                     # Immediate broadcast to all clients
                     payload = get_system_status_payload()
@@ -685,7 +722,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             await client.send_json(payload)
                         except Exception:
                             pass
-                        
+
                 elif msg_type == "UPDATE_ORDER_STATUS":
                     order_id = data.get("order_id")
                     status = data.get("status")
@@ -703,7 +740,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 await client.send_json(payload)
                             except Exception:
                                 pass
-                            
+
                 elif msg_type == "EMERGENCY_STOP":
                     stop_flag = bool(data.get("stop", True))
                     if ros_node:
@@ -735,10 +772,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif msg_type == "RESET_FAULT":
                     if ros_node:
                         ros_node.reset_manager_fault()
-                        
+
             except Exception as ex:
                 print(f"Error handling WS message: {ex}")
-                
+
     except WebSocketDisconnect:
         connected_clients.remove(websocket)
     except Exception as e:
@@ -789,6 +826,17 @@ async def get_index():
             )
     return {"error": "HMI Frontend index.html not found", "searched_paths": candidate_paths}
 
+@app.get("/admin")
+async def get_admin():
+    if web_ui_dir:
+        admin_file = os.path.join(web_ui_dir, "admin.html")
+        if os.path.exists(admin_file):
+            return FileResponse(
+                admin_file,
+                headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+            )
+    return {"error": "HMI Admin admin.html not found", "searched_paths": candidate_paths}
+
 @app.get("/css/{file_name}")
 async def get_css(file_name: str):
     if web_ui_dir:
@@ -812,11 +860,11 @@ def main():
     global ros_node
     rclpy.init()
     ros_node = HMIBridgeNode()
-    
+
     # Run ROS spin in background thread
     spin_thread = threading.Thread(target=ros_spin_thread, daemon=True)
     spin_thread.start()
-    
+
     port = int(os.environ.get("HMI_PORT", 8000))
     print(f"Starting Serving HMI Web Dashboard on http://0.0.0.0:{port} (ROS_DOMAIN_ID={os.environ.get('ROS_DOMAIN_ID', '0')})")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
