@@ -249,6 +249,11 @@ class SimplifiedPathNavigator:
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
         )
+        occupancy_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
 
         self._pub_mission_cmd = nav.create_publisher(StringMsg, "two_wheel/mission_command", stage_qos)
         self._sub_mission_status = nav.create_subscription(
@@ -258,12 +263,7 @@ class SimplifiedPathNavigator:
             stage_qos,
         )
         self._pub_fleet_intent = nav.create_publisher(
-            StringMsg, "fleet/intent", stage_qos
-        )
-        occupancy_qos = QoSProfile(
-            depth=10,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            StringMsg, "fleet/intent", occupancy_qos
         )
         self._sub_table_occupancy = nav.create_subscription(
             StringMsg,
@@ -285,6 +285,10 @@ class SimplifiedPathNavigator:
         self._occupying_timer = None
         self._hold_distance_m = 2.0
         self._hold_wait_timeout_sec = 240.0
+        # Opposite-side aisle serialization: wait until earlier peer docks.
+        self._corridor_hold_timeout_sec = 120.0
+        # Wait this long for a simultaneous peer claim to show up.
+        self._corridor_claim_grace_sec = 2.5
 
         self._last_status: dict | None = None
 
@@ -299,11 +303,7 @@ class SimplifiedPathNavigator:
         self._pub_selected = nav.create_publisher(NavPath, "orthogonal_path/selected", path_qos)
         self._pub_dock_approach = nav.create_publisher(NavPath, "orthogonal_path/dock_approach", path_qos)
 
-        intent_qos = QoSProfile(
-            depth=5,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.VOLATILE,
-        )
+        # TRANSIENT_LOCAL: simultaneous kitchen claims must not be missed.
         for peer in ("robot1", "robot2"):
             if peer == self._robot_id:
                 continue
@@ -311,7 +311,7 @@ class SimplifiedPathNavigator:
                 StringMsg,
                 f"/{peer}/fleet/intent",
                 lambda msg, name=peer: self._on_peer_intent(name, msg),
-                intent_qos,
+                occupancy_qos,
             )
 
         # Run from the node's existing executor. No extra spin thread is created.
@@ -389,7 +389,17 @@ class SimplifiedPathNavigator:
             "phase": str(payload.get("phase", "idle") or "idle").lower(),
             "table_id": table_id,
             "priority": float(payload.get("priority", 0.0) or 0.0),
+            "pose_xy": None,
         }
+        pose_xy = payload.get("pose_xy")
+        if isinstance(pose_xy, dict):
+            try:
+                self._peer_intents[robot]["pose_xy"] = (
+                    float(pose_xy["x"]),
+                    float(pose_xy["y"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                pass
 
     def _on_table_occupancy(self, msg: StringMsg) -> None:
         try:
@@ -488,11 +498,215 @@ class SimplifiedPathNavigator:
         except (IndexError, ValueError):
             return None
 
+    @staticmethod
+    def _table_side(table_id: int | None) -> str | None:
+        """West docks (0,2) vs east docks (1,3)."""
+        if table_id is None:
+            return None
+        tid = int(table_id)
+        if tid in (0, 2):
+            return "west"
+        if tid in (1, 3):
+            return "east"
+        return None
+
+    def _priority_should_yield(self, peer_priority: float) -> bool:
+        """True when this robot is the later order.
+
+        Priority is ``-monotonic`` at accept time: earlier orders are more
+        negative (smaller). Later orders have larger algebraically values and
+        must yield / kitchen-hold.
+        """
+        my_p = float(self._intent_priority or 0.0)
+        peer_p = float(peer_priority or 0.0)
+        if abs(my_p) < 1e-12 and abs(peer_p) < 1e-12:
+            return self._robot_id == "robot2"
+        if abs(my_p) < 1e-12:
+            return True
+        if abs(peer_p) < 1e-12:
+            return False
+        if abs(my_p - peer_p) < 1e-9:
+            return self._robot_id == "robot2"
+        # Later = larger (less negative) priority.
+        return my_p > peer_p
+
+    def _peer_cleared_corridor(self, intent: dict) -> bool:
+        """Peer no longer blocks an opposite-side kitchen departure.
+
+        Only soft kitchen home (idle/returning) or a docked bay / occupy
+        phase clears the slot. Holding/approaching always blocks.
+        """
+        if not intent.get("active"):
+            return True
+        phase = str(intent.get("phase", "idle") or "idle").lower()
+        if phase in ("idle",):
+            return True
+        # Occupying/serving means peer finished the aisle trip.
+        if phase in ("occupying", "serving"):
+            return True
+        # parking_out / returning: peer is coming back — still blocks outbound
+        # opposite departures only if mid-spine (handled below).
+        pose = intent.get("pose_xy")
+        if pose is not None:
+            x, y = float(pose[0]), float(pose[1])
+            if abs(x) >= 1.20 and phase in (
+                "occupying",
+                "serving",
+                "parking_out",
+                "approaching",
+            ):
+                # Deep in a table bay (or final dock approach).
+                if phase in ("occupying", "serving"):
+                    return True
+                if abs(x) >= 1.60:
+                    return True
+            if y >= 4.50:
+                return phase in ("idle", "returning")
+            if 0.30 <= y < 4.70 and abs(x) < 1.20:
+                return False
+            return phase in ("idle", "returning")
+        if phase in ("approaching", "navigating", "holding"):
+            return False
+        if phase in ("parking_out", "returning"):
+            return False
+        return True
+
+    def _opposite_outbound_blocker(self, my_table: int | None) -> str | None:
+        """Earlier peer still owning the aisle on an opposite-side trip."""
+        my_side = self._table_side(my_table)
+        if my_side is None:
+            return None
+        peer = "robot2" if self._robot_id == "robot1" else "robot1"
+        intent = self._peer_intents.get(peer) or {}
+        if not intent.get("active"):
+            return None
+        peer_side = self._table_side(intent.get("table_id"))
+        if not peer_side or peer_side == my_side:
+            return None
+        phase = str(intent.get("phase", "idle") or "idle").lower()
+        if phase not in (
+            "approaching",
+            "holding",
+            "navigating",
+            "returning",
+            "parking_out",
+        ):
+            return None
+        if self._peer_cleared_corridor(intent):
+            return None
+        if not self._priority_should_yield(
+            float(intent.get("priority", 0.0) or 0.0)
+        ):
+            return None
+        return peer
+
+    def _owns_opposite_corridor(self, my_table: int | None) -> bool:
+        """True when this robot may leave the kitchen on an opposite-side trip."""
+        return self._opposite_outbound_blocker(my_table) is None
+
+    def _wait_for_corridor_clear(
+        self, my_table: int | None, timeout_sec: float
+    ) -> bool:
+        """Block kitchen departure until the earlier peer frees the aisle."""
+        started = time.monotonic()
+        last_log = started
+        last_claim = started
+        while time.monotonic() - started < timeout_sec:
+            rclpy.spin_once(self._nav, timeout_sec=0.05)
+            now = time.monotonic()
+            # Refresh our claim so TRANSIENT_LOCAL peers keep seeing us.
+            if now - last_claim >= 1.0:
+                pose = self._map_pose()
+                poly = (
+                    [{"x": float(pose[0]), "y": float(pose[1])}]
+                    if pose is not None
+                    else []
+                )
+                self._publish_fleet_intent(
+                    active=True,
+                    mission_id=self._intent_mission_id
+                    or f"hold_corridor_{my_table}",
+                    polyline=poly,
+                    phase="holding",
+                    table_id=my_table,
+                )
+                last_claim = now
+            blocker = self._opposite_outbound_blocker(my_table)
+            if blocker is None:
+                return True
+            if now - last_log >= 2.0:
+                intent = self._peer_intents.get(blocker) or {}
+                print(
+                    f"[hold] corridor conflict with {blocker} "
+                    f"(peer_table={intent.get('table_id')} "
+                    f"phase={intent.get('phase')} "
+                    f"pose={intent.get('pose_xy')} "
+                    f"my_table={my_table} my_p={self._intent_priority:.3f} "
+                    f"peer_p={float(intent.get('priority', 0.0) or 0.0):.3f}); "
+                    f"waiting at kitchen elapsed={now - started:.1f}s",
+                    flush=True,
+                )
+                last_log = now
+        print(
+            f"[hold] corridor wait timeout after {timeout_sec:.0f}s; departing anyway",
+            flush=True,
+        )
+        return False
+
+    def _wait_opposite_corridor_turn(self, my_table: int | None) -> None:
+        """Serialize opposite-side (west↔east) kitchen departures.
+
+        1) Publish TRANSIENT_LOCAL claim.
+        2) Grace-wait so a simultaneous peer claim can arrive.
+        3) If we are later, stay until peer docks / clears the spine.
+        """
+        my_side = self._table_side(my_table)
+        if my_side is None:
+            return
+        if self._intent_priority == 0.0:
+            self._intent_priority = -float(time.monotonic())
+        pose = self._map_pose()
+        poly = (
+            [{"x": float(pose[0]), "y": float(pose[1])}]
+            if pose is not None
+            else []
+        )
+        self._publish_fleet_intent(
+            active=True,
+            mission_id=f"claim_corridor_{my_table}_{time.monotonic_ns()}",
+            polyline=poly,
+            priority=self._intent_priority,
+            phase="holding",
+            table_id=my_table,
+        )
+        grace_end = time.monotonic() + self._corridor_claim_grace_sec
+        while time.monotonic() < grace_end:
+            rclpy.spin_once(self._nav, timeout_sec=0.05)
+            if self._opposite_outbound_blocker(my_table) is not None:
+                break
+        if self._owns_opposite_corridor(my_table):
+            print(
+                f"[hold] opposite corridor clear for table_{my_table} "
+                f"(side={my_side}); departing",
+                flush=True,
+            )
+            return
+        print(
+            f"[hold] opposite corridor busy for table_{my_table} "
+            f"(side={my_side}); waiting for earlier peer",
+            flush=True,
+        )
+        self._wait_for_corridor_clear(my_table, self._corridor_hold_timeout_sec)
+        print(
+            f"[hold] opposite corridor released; starting table_{my_table}",
+            flush=True,
+        )
+
     def _lane_x(self) -> float | None:
         if self._robot_id == "robot1":
-            return -0.55
+            return -0.70
         if self._robot_id == "robot2":
-            return 0.55
+            return 0.70
         return None
 
     def _hold_point_for_dock(
@@ -1064,6 +1278,9 @@ class SimplifiedPathNavigator:
                     "starting table approach",
                     flush=True,
                 )
+
+            # Opposite-side (e.g. T3 west ↔ T4 east): always claim + serialize.
+            self._wait_opposite_corridor_turn(table_id)
 
         map_p = self._map_pose()
         if map_p is None:

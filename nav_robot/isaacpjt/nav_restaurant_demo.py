@@ -284,18 +284,25 @@ FRONT_LIDAR_TOPIC = "/scan"
 
 LIDAR_MIN_RANGE = 0.20
 PEER_HARD_STOP_M = 1.10
-# Yield only for a real head-on close pass; resume as soon as gap opens.
-PEER_YIELD_RANGE_M = 0.85
-PEER_YIELD_CLEAR_M = 1.05
-PEER_YIELD_HARD_M = 0.65
-PEER_YIELD_MAX_SEC = 1.2
-PEER_YIELD_AHEAD_DEG = 40.0
-# Peer must be moving in the aisle — ignore table serve / park-out ghosts.
+# Shared-pose + lidar right-of-way for corridor head-ons.
+PEER_ENGAGE_M = 2.50
+PEER_STOP_M = 1.00
+PEER_CLEAR_M = 1.35
+PEER_CONTACT_M = 0.40
+PEER_YIELD_AHEAD_DEG = 55.0
+# Lane offset is ~0.55; allow pass once lateral gap exceeds lane separation.
+PEER_SAFE_LATERAL_M = 0.85
+# Opposite head-on: hold longer before any creep (prevents T3/T4 collide).
+PEER_YIELD_MAX_HOLD_SEC = 12.0
+PEER_YIELD_MAX_HOLD_OPPOSITE_SEC = 45.0
+# West docks (0,2) vs east docks (1,3) — opposite-side trips conflict in spine.
+FLEET_WEST_TABLES = frozenset({0, 2})
+FLEET_EAST_TABLES = frozenset({1, 3})
 PEER_YIELD_PEER_PHASES = frozenset(
-    {"approaching", "returning", "holding"}
+    {"approaching", "returning", "holding", "navigating"}
 )
 # Corridor half-separation so simultaneous trips do not share the spine.
-FLEET_AISLE_OFFSET_M = 0.55
+FLEET_AISLE_OFFSET_M = 0.70
 FLEET_PASS_EXTRA_M = 0.30
 LIDAR_MAX_RANGE = 12.0
 LIDAR_SAMPLES = 180
@@ -378,6 +385,10 @@ def attach_m0609_visuals(stage):
             continue
         visual_path = matches[0].GetPath().AppendChild("visuals")
         visual_prim = stage.OverridePrim(visual_path)
+        # Dual-robot: break shared instance prototypes before retargeting.
+        if visual_prim.IsInstanceable():
+            visual_prim.SetInstanceable(False)
+        visual_prim.GetReferences().ClearReferences()
         visual_prim.GetReferences().SetReferences(
             [
                 Sdf.Reference(
@@ -491,10 +502,68 @@ def attach_fixed_table_depth_camera(stage):
 
             rsd_path = sensor_path.AppendChild("RSD455")
             rsd_prim = stage.OverridePrim(rsd_path)
+            if rsd_prim.IsInstanceable():
+                rsd_prim.SetInstanceable(False)
+            rsd_prim.GetReferences().ClearReferences()
             rsd_prim.GetReferences().SetReferences(
                 [Sdf.Reference(str(D455_ASSET_USD), Sdf.Path("/Root/RSD455"))]
             )
             print("[nav_robot] attached fixed table depth camera mast & D455 sensor", flush=True)
+
+
+def sanitize_embedded_rsd455(stage, robot_root: str) -> None:
+    """Keep D455 welded to the mast: strip nested rigid-body physics.
+
+    The Isaac ``rsd455.usd`` authors ``PhysicsRigidBodyAPI`` / PhysX rigid-body
+    schemas on ``/Root/RSD455``.  Nested under the mobile-base articulation that
+    becomes a detachable dynamic body.  With two robots the PhysX pose of that
+    body can desync from the USD xform stack and render as a RealSense Case at
+    the dining-hall origin while Prim paths still look correct under each mast.
+
+    ``UsdPhysics.RigidBodyAPI`` alone is not enough to check — the composed prim
+    often keeps ``PhysxRigidBodyAPI`` + ``physics:rigidBodyEnabled=true``.
+    """
+    rsd_path = (
+        f"{robot_root}/Robot/ridgeback_base_link/ridgeback_base_link/"
+        "fixed_table_depth_camera/realsense_d455/RSD455"
+    )
+    rsd_prim = stage.GetPrimAtPath(rsd_path)
+    if not rsd_prim.IsValid():
+        if os.environ.get("NAV_ROBOT_PRIM_DEBUG", "0") == "1":
+            print(
+                f"[nav_robot] sanitize_embedded_rsd455: missing prim {rsd_path}",
+                flush=True,
+            )
+        return
+    stripped = 0
+    touched = []
+    for prim in Usd.PrimRange(rsd_prim):
+        changed = False
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            prim.RemoveAPI(UsdPhysics.RigidBodyAPI)
+            changed = True
+        if prim.HasAPI(PhysxSchema.PhysxRigidBodyAPI):
+            prim.RemoveAPI(PhysxSchema.PhysxRigidBodyAPI)
+            changed = True
+        if prim.HasAPI(UsdPhysics.MassAPI):
+            prim.RemoveAPI(UsdPhysics.MassAPI)
+            changed = True
+        if prim.HasAPI(UsdPhysics.CollisionAPI):
+            prim.RemoveAPI(UsdPhysics.CollisionAPI)
+            changed = True
+        enabled = prim.GetAttribute("physics:rigidBodyEnabled")
+        if enabled and enabled.IsValid():
+            enabled.Set(False)
+            changed = True
+        if changed:
+            stripped += 1
+            touched.append(str(prim.GetPath()))
+    if stripped:
+        print(
+            f"[nav_robot] stripped rigid-body/collision under {rsd_path} "
+            f"n={stripped} roots_touched={touched[:8]}",
+            flush=True,
+        )
 
 
 def attach_front_rplidar_ros2(stage):
@@ -560,7 +629,10 @@ def open_restaurant_and_robot(open_stage: bool = True):
     spawn.AddTranslateOp().Set(SPAWN_POSITION)
     spawn.AddOrientOp().Set(yaw_to_quat(SPAWN_YAW))
     robot = UsdGeom.Xform.Define(stage, f"{ROBOT_ROOT}/Robot")
-    robot.GetPrim().GetReferences().AddReference(
+    robot_prim = robot.GetPrim()
+    # Dual references of the same ROBOT_USD must not share instance prototypes.
+    robot_prim.SetInstanceable(False)
+    robot_prim.GetReferences().AddReference(
         str(ROBOT_USD), Sdf.Path(ROBOT_ASSET_ROOT)
     )
     for _ in range(5):
@@ -587,6 +659,8 @@ def open_restaurant_and_robot(open_stage: bool = True):
     # asset.  Without this composition fix link_2's visual pieces can resolve
     # at the layer origin even though the physical link/joint poses are valid.
     attach_m0609_visuals(stage)
+    # Strip nested RSD455 rigid-body so dual-robot PhysX cannot detach the Case.
+    sanitize_embedded_rsd455(stage, robot_root=ROBOT_ROOT)
     print("[nav_robot] using embedded D455 and RPLIDAR sensor layer", flush=True)
     return stage
 
@@ -1373,24 +1447,31 @@ class NavBridge(Node):
             self._on_two_wheel_mission_command,
             mission_qos,
         )
-        # Fleet right-of-way: later order yields when lidar sees the peer robot.
+        # Fleet right-of-way: shared pose_xy + lidar; later order yields.
         self._fleet_priorities = {}
         self._fleet_active = {}
         self._fleet_phases = {}
+        self._fleet_poses = {}
+        self._fleet_table_ids = {}
         self._my_fleet_priority = None
+        self._live_pose = None
         self._peer_swerve_wz = 0.0
         self._peer_yielding = False
         self._peer_yield_last_log = 0.0
         self._peer_yield_started = None
-        self._peer_yield_gave_up = False
         self._peer_near_angle = 0.0
         self._peer_near_prev = float("inf")
+        fleet_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
         for peer in ("robot1", "robot2"):
             self.create_subscription(
                 String,
                 f"/{peer}/fleet/intent",
                 lambda msg, name=peer: self._on_fleet_intent(name, msg),
-                mission_qos,
+                fleet_qos,
             )
 
         self._obstacle_test_controller = None
@@ -2185,11 +2266,7 @@ class NavBridge(Node):
         )
 
     def _fleet_aisle_x(self) -> float:
-        """Per-robot corridor lane so simultaneous trips do not share x=0.
-
-        When a peer is nearby, widen further so head-on pairs peel apart
-        instead of freezing face-to-face.
-        """
+        """Per-robot corridor lane so simultaneous trips do not share x=0."""
         if (self.robot_name or "") == "robot1":
             base = -FLEET_AISLE_OFFSET_M
             sign = -1.0
@@ -2198,14 +2275,16 @@ class NavBridge(Node):
             sign = 1.0
         else:
             return 0.0
-        peer_near = float(getattr(self, "_peer_near_dist", float("inf")))
         peer = self._peer_name()
+        peer_dist, _, _ = self._peer_fused_distance()
         if (
             self._peer_in_aisle(peer)
-            and math.isfinite(peer_near)
-            and peer_near < 2.0
+            and math.isfinite(peer_dist)
+            and peer_dist < PEER_ENGAGE_M
         ):
-            extra = FLEET_PASS_EXTRA_M * max(0.0, min(1.0, (2.0 - peer_near) / 1.4))
+            extra = FLEET_PASS_EXTRA_M * max(
+                0.0, min(1.0, (PEER_ENGAGE_M - peer_dist) / PEER_ENGAGE_M)
+            )
             return base + sign * extra
         return base
 
@@ -2217,82 +2296,170 @@ class NavBridge(Node):
         active = bool(payload.get("active", False))
         self._fleet_active[robot_name] = active
         phase = str(payload.get("phase", "idle") or "idle").lower()
+        now = time.monotonic()
         if active:
             try:
                 self._fleet_priorities[robot_name] = float(payload.get("priority", 0.0))
             except (TypeError, ValueError):
                 self._fleet_priorities[robot_name] = 0.0
             self._fleet_phases[robot_name] = phase
+            raw_table = payload.get("table_id")
+            if raw_table is None:
+                self._fleet_table_ids.pop(robot_name, None)
+            else:
+                try:
+                    self._fleet_table_ids[robot_name] = int(raw_table)
+                except (TypeError, ValueError):
+                    self._fleet_table_ids.pop(robot_name, None)
+            pose_xy = payload.get("pose_xy")
+            if isinstance(pose_xy, dict):
+                try:
+                    self._fleet_poses[robot_name] = (
+                        float(pose_xy["x"]),
+                        float(pose_xy["y"]),
+                        now,
+                    )
+                except (KeyError, TypeError, ValueError):
+                    pass
         else:
             self._fleet_priorities.pop(robot_name, None)
             self._fleet_phases.pop(robot_name, None)
+            self._fleet_poses.pop(robot_name, None)
+            self._fleet_table_ids.pop(robot_name, None)
         if robot_name == (self.robot_name or ""):
             self._my_fleet_priority = self._fleet_priorities.get(robot_name)
-        # Drop any legacy peer-stop so we never stay pending on an empty aisle.
-        peer = "robot2" if (self.robot_name or "") == "robot1" else "robot1"
         if self._obstacle_stop and self._obstacle_stop_from_peer:
             with self._lock:
                 if self._obstacle_stop and self._obstacle_stop_from_peer:
                     self._finish_obstacle_stop(float("inf"))
 
     def _peer_swerve_bias(self, peer_hit: bool, nearest: float) -> float:
-        """Legacy hook: constant-sign yaw bias is unsafe (wrong for northbound).
-
-        Lane separation is handled by heading-aware crosstrack in
-        `_update_direct_navigation` toward `_fleet_aisle_x()`.
-        """
+        """Legacy hook: constant-sign yaw bias is unsafe (wrong for northbound)."""
         return 0.0
 
     def _peer_name(self) -> str:
         return "robot2" if (self.robot_name or "") == "robot1" else "robot1"
 
+    @staticmethod
+    def _table_side(table_id) -> str | None:
+        if table_id is None:
+            return None
+        tid = int(table_id)
+        if tid in FLEET_WEST_TABLES:
+            return "west"
+        if tid in FLEET_EAST_TABLES:
+            return "east"
+        return None
+
+    def _peer_map_distance(self) -> tuple[float, float | None]:
+        peer = self._peer_name()
+        pose = self._fleet_poses.get(peer)
+        live = self._live_pose
+        if pose is None or live is None:
+            return float("inf"), None
+        px, py, _stamp = pose
+        x, y, yaw = live
+        dx = float(px) - float(x)
+        dy = float(py) - float(y)
+        dist = math.hypot(dx, dy)
+        bearing = self._angle_error(math.atan2(dy, dx), yaw)
+        return dist, bearing
+
+    def _peer_fused_distance(self) -> tuple[float, float, float | None]:
+        map_dist, map_bearing = self._peer_map_distance()
+        lidar_dist = float(getattr(self, "_peer_near_dist", float("inf")))
+        lidar_angle = float(getattr(self, "_peer_near_angle", 0.0))
+        candidates = []
+        if math.isfinite(map_dist):
+            candidates.append((map_dist, map_bearing))
+        if math.isfinite(lidar_dist):
+            candidates.append((lidar_dist, lidar_angle))
+        if not candidates:
+            return float("inf"), map_dist, None
+        peer_dist, bearing = min(candidates, key=lambda item: item[0])
+        return peer_dist, map_dist, bearing
+
     def _peer_in_aisle(self, peer: str) -> bool:
-        """True only when the peer is also travelling the shared corridor."""
         if not self._fleet_active.get(peer, False):
             return False
         phase = str(self._fleet_phases.get(peer, "idle") or "idle").lower()
         return phase in PEER_YIELD_PEER_PHASES
 
-    def _should_yield_to_peer(self) -> bool:
-        """Earlier fleet priority keeps going; later order waits.
+    def _peer_out_of_conflict_zone(self) -> bool:
+        """Peer finished aisle / docked bay — free to move."""
+        peer = self._peer_name()
+        if not self._fleet_active.get(peer, False):
+            return True
+        phase = str(self._fleet_phases.get(peer, "idle") or "idle").lower()
+        if phase in ("idle", "occupying", "serving"):
+            return True
+        pose = self._fleet_poses.get(peer)
+        if pose is not None:
+            x, y, _stamp = pose
+            if abs(float(x)) >= 1.60 and phase in (
+                "occupying",
+                "serving",
+                "approaching",
+            ):
+                return True
+            if float(y) >= 4.50:
+                return phase in ("idle", "returning")
+            if 0.30 <= float(y) < 4.70 and abs(float(x)) < 1.20:
+                return False
+            return phase in ("idle", "returning")
+        return phase in ("idle", "returning")
 
-        Priority is -monotonic_time at order start, so earlier => larger value.
-        On a tie (or missing priorities), robot2 yields so both never stop.
-        """
+    def _opposite_side_conflict(self) -> bool:
+        """True when peer and I target opposite sides and peer still owns aisle."""
         peer = self._peer_name()
         if not self._peer_in_aisle(peer):
+            return False
+        if self._peer_out_of_conflict_zone():
+            return False
+        my_side = self._table_side(self._fleet_table_ids.get(self.robot_name or ""))
+        peer_side = self._table_side(self._fleet_table_ids.get(peer))
+        return bool(my_side and peer_side and my_side != peer_side)
+
+    def _should_yield_to_peer(self) -> bool:
+        peer = self._peer_name()
+        if not self._fleet_active.get(peer, False):
+            return False
+        if self._peer_out_of_conflict_zone():
             return False
         my_p = self._my_fleet_priority
         peer_p = self._fleet_priorities.get(peer)
         if my_p is None and peer_p is None:
             return (self.robot_name or "") == "robot2"
         if my_p is None:
-            return True
+            return False
         if peer_p is None:
             return False
         if abs(float(my_p) - float(peer_p)) < 1e-9:
             return (self.robot_name or "") == "robot2"
-        return float(my_p) < float(peer_p)
+        # priority = -monotonic → later has larger value and must yield.
+        return float(my_p) > float(peer_p)
+
+    def _peer_lateral_gap(self) -> float:
+        live = self._live_pose
+        pose = self._fleet_poses.get(self._peer_name())
+        if live is None or pose is None:
+            return 0.0
+        return abs(float(pose[0]) - float(live[0]))
 
     def _apply_peer_right_of_way(self, vx: float, wz: float, *, context: str = ""):
-        """Brief head-on yield only. Never freeze pivots or empty-corridor ghosts."""
-        peer_near = float(getattr(self, "_peer_near_dist", float("inf")))
-        peer_angle = float(getattr(self, "_peer_near_angle", 0.0))
+        """Later order yields for head-on / opposite-side peers."""
+        peer = self._peer_name()
+        peer_dist, map_dist, bearing = self._peer_fused_distance()
+        lidar_dist = float(getattr(self, "_peer_near_dist", float("inf")))
         now = time.monotonic()
-        prev = float(getattr(self, "_peer_near_prev", float("inf")))
-        # Closing = gap shrinking; opening/stable means no need to wait.
-        closing = math.isfinite(peer_near) and (
-            (not math.isfinite(prev)) or peer_near < prev - 0.025
-        )
-        self._peer_near_prev = peer_near
-
-        def _creep():
-            nonlocal vx
-            if abs(vx) < 1e-3:
-                vx = 0.14
-            else:
-                vx = math.copysign(max(0.12, abs(vx) * 0.55), vx)
-            return vx, wz
+        self._peer_near_prev = peer_dist
+        opposite = self._opposite_side_conflict()
+        lat = self._peer_lateral_gap()
+        ahead = False
+        behind = False
+        if bearing is not None:
+            ahead = abs(bearing) < math.radians(PEER_YIELD_AHEAD_DEG)
+            behind = abs(bearing) > math.radians(110.0)
 
         def _resume(reason: str):
             if self._peer_yielding:
@@ -2301,90 +2468,105 @@ class NavBridge(Node):
                 self._peer_yield_started = None
                 self.get_logger().info(
                     f"peer yield end ({reason}) held={held:.1f}s "
-                    f"dist={peer_near if math.isfinite(peer_near) else float('inf'):.2f}m "
+                    f"dist={peer_dist if math.isfinite(peer_dist) else float('inf'):.2f}m "
+                    f"map={map_dist if math.isfinite(map_dist) else float('inf'):.2f}m "
+                    f"lidar={lidar_dist if math.isfinite(lidar_dist) else float('inf'):.2f}m "
                     f"context={context}"
                 )
-            if reason in (
-                "clear",
-                "beside",
-                "priority",
-                "pivot",
-                "not-aisle",
-                "opening",
-                "not-ahead",
-            ):
-                self._peer_yield_gave_up = False
             return vx, wz
 
-        # Pivots / dock turns must never hard-stop — U-turn looked like a wait
-        # with an empty aisle when lidar briefly swept the peer.
         ctx = (context or "").lower()
         if ctx in ("pivot",) or ctx.startswith("legacy:rotate") or "align" in ctx:
             return _resume("pivot")
 
-        if (not math.isfinite(peer_near)) or peer_near > PEER_YIELD_CLEAR_M:
+        if self._peer_out_of_conflict_zone():
+            return _resume("peer-clear-zone")
+
+        engage = PEER_ENGAGE_M if opposite else PEER_CLEAR_M
+        if (not math.isfinite(peer_dist)) or peer_dist > engage:
             return _resume("clear")
 
-        peer = self._peer_name()
-        if not self._peer_in_aisle(peer):
-            # Peer serving / parking at a table is not an aisle blocker.
+        if not self._peer_in_aisle(peer) and not opposite:
             return _resume("not-aisle")
 
-        ahead = abs(peer_angle) < math.radians(PEER_YIELD_AHEAD_DEG)
-        if peer_near > PEER_YIELD_HARD_M and not ahead:
+        # Beside pass only when NOT opposite head-on (lanes already separate).
+        if (
+            (not opposite)
+            and lat >= PEER_SAFE_LATERAL_M
+            and peer_dist > PEER_CONTACT_M
+            and not ahead
+        ):
             return _resume("beside")
-
-        # Separating or parallel — keep rolling; only head-on closers wait.
-        if not closing and peer_near > PEER_YIELD_HARD_M:
-            return _resume("opening")
-
-        if peer_near > PEER_YIELD_RANGE_M and not self._peer_yielding:
-            return vx, wz
+        if behind and peer_dist > PEER_CONTACT_M and not opposite:
+            return _resume("behind")
 
         if not self._should_yield_to_peer():
-            if peer_near < PEER_YIELD_HARD_M and abs(vx) > 1e-3:
+            if peer_dist < PEER_STOP_M and abs(vx) > 1e-3:
                 vx = math.copysign(max(0.16, abs(vx) * 0.80), vx)
             return _resume("priority")
 
-        if self._peer_yield_gave_up:
-            return _creep()
-
-        # Medium range: slow, do not full-stop (avoids empty-looking stalls).
-        if peer_near > PEER_YIELD_HARD_M:
+        held = (
+            (now - self._peer_yield_started)
+            if self._peer_yielding and self._peer_yield_started
+            else 0.0
+        )
+        max_hold = (
+            PEER_YIELD_MAX_HOLD_OPPOSITE_SEC if opposite else PEER_YIELD_MAX_HOLD_SEC
+        )
+        # Creep only after long hold and never while truly head-on & close.
+        if (
+            held >= max_hold
+            and peer_dist > PEER_STOP_M
+            and not (opposite and ahead)
+        ):
             if abs(vx) > 1e-3:
-                vx = math.copysign(max(0.10, abs(vx) * 0.45), vx)
+                vx = math.copysign(max(0.08, abs(vx) * 0.40), vx)
+            return _resume("yield-timeout-creep")
+
+        if peer_dist > PEER_STOP_M and not (opposite and ahead):
+            if abs(vx) > 1e-3:
+                vx = math.copysign(max(0.08, abs(vx) * 0.50), vx)
             if self._peer_yielding:
-                return _resume("opening")
+                return _resume("peel")
             return vx, wz
+
+        if opposite and ahead and peer_dist > PEER_STOP_M:
+            if abs(vx) > 1e-3:
+                vx = math.copysign(max(0.06, abs(vx) * 0.25), vx)
 
         if not self._peer_yielding:
             self._peer_yielding = True
             self._peer_yield_started = now
             self._peer_yield_last_log = now
+            ang = math.degrees(bearing) if bearing is not None else float("nan")
             self.get_logger().warning(
-                f"yielding to {peer}: dist={peer_near:.2f}m "
-                f"angle={math.degrees(peer_angle):.0f}deg "
-                f"phase={self._fleet_phases.get(peer)} "
-                f"my_p={self._my_fleet_priority} "
-                f"peer_p={self._fleet_priorities.get(peer)} "
+                f"yielding to {peer}: dist={peer_dist:.2f}m "
+                f"map={map_dist if math.isfinite(map_dist) else float('inf'):.2f}m "
+                f"lidar={lidar_dist if math.isfinite(lidar_dist) else float('inf'):.2f}m "
+                f"angle={ang:.0f}deg lat={lat:.2f}m ahead={ahead} opposite={opposite} "
+                f"my_table={self._fleet_table_ids.get(self.robot_name or '')} "
+                f"peer_table={self._fleet_table_ids.get(peer)} "
+                f"my_p={self._my_fleet_priority} peer_p={self._fleet_priorities.get(peer)} "
                 f"context={context}"
             )
         elif now - self._peer_yield_last_log >= 1.0:
             self._peer_yield_last_log = now
             self.get_logger().warning(
-                f"still yielding to {peer}: dist={peer_near:.2f}m "
-                f"held={now - (self._peer_yield_started or now):.1f}s "
-                f"context={context}"
+                f"still yielding to {peer}: dist={peer_dist:.2f}m "
+                f"held={held:.1f}s lat={lat:.2f}m ahead={ahead} "
+                f"opposite={opposite} context={context}"
             )
 
-        held = now - (self._peer_yield_started or now)
-        if held >= PEER_YIELD_MAX_SEC:
-            self._peer_yield_gave_up = True
-            _resume("timeout-creep")
-            return _creep()
-
-        # Full stop only inside the hard bubble on a closing head-on.
-        return 0.0, 0.0
+        # Hard-stop for opposite ownership or true head-on proximity.
+        if peer_dist <= PEER_CONTACT_M:
+            return 0.0, 0.0
+        if ahead and peer_dist <= PEER_STOP_M:
+            return 0.0, 0.0
+        if opposite:
+            return 0.0, 0.0
+        if abs(vx) > 1e-3:
+            vx = math.copysign(max(0.06, abs(vx) * 0.30), vx)
+        return vx, wz
 
     def _clear_obstacle_state(self):
         self._obstacle_stop = False
@@ -2813,6 +2995,7 @@ class NavBridge(Node):
         self._active_two_wheel_goal = None
 
     def _update_direct_navigation(self, x, y, yaw):
+        self._live_pose = (float(x), float(y), float(yaw))
         mission = self._direct_nav
         if mission is None:
             return None
@@ -3103,6 +3286,7 @@ class NavBridge(Node):
 
     def _update_legacy_table_navigation(self, mission, x, y, yaw):
         """Original mobile_manipulator_demo TableNavigationServer controller."""
+        self._live_pose = (float(x), float(y), float(yaw))
         goal_x, goal_y, goal_yaw = mission["goal"]
         pre_x = goal_x - 0.65 * math.cos(goal_yaw)
         pre_y = goal_y - 0.65 * math.sin(goal_yaw)
@@ -3985,6 +4169,8 @@ def main():
             articulation_path,
             name=config["name"] or "nav_ridgeback",
         )
+        # Articulation init can rematerialize nested sensor physics schemas.
+        sanitize_embedded_rsd455(stage, robot_root=config["root"])
         # Preserve each complete robot's embedded D455.  Only the first graph
         # publishes the shared simulation clock.
         connect_embedded_sensor_ros(

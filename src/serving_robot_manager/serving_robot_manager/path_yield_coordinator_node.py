@@ -234,9 +234,9 @@ class PathYieldCoordinator(Node):
         if b_occ and not a_occ:
             return a
         if ia.priority > ib.priority:
-            return b
-        if ib.priority > ia.priority:
             return a
+        if ib.priority > ia.priority:
+            return b
         return a if a > b else b
 
     def _same_table_conflict(self, ia: RobotIntent, ib: RobotIntent) -> bool:

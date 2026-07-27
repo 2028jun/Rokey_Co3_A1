@@ -181,7 +181,18 @@ class FleetManager(Node):
                 )
                 response.success = False
                 return response
-            if preferred not in candidates:
+            if preferred in candidates:
+                candidates = [preferred]
+            elif candidates:
+                # Preferred not ready / busy: take any other idle worker so the
+                # HMI order is not cancelled while robot2 is still initializing.
+                self.get_logger().warning(
+                    f"preferred robot unavailable: {preferred} "
+                    f"states={self._states} "
+                    f"reserved={sorted(self._reserved)} "
+                    f"candidates={candidates}; falling back to {candidates[0]}"
+                )
+            else:
                 self.get_logger().warning(
                     f"preferred robot unavailable: {preferred} "
                     f"states={self._states} "
@@ -190,7 +201,6 @@ class FleetManager(Node):
                 )
                 response.success = False
                 return response
-            candidates = [preferred]
 
         if not candidates:
             self.get_logger().warning(

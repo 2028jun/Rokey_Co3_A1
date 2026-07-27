@@ -340,8 +340,8 @@ def test_fleet_respects_preferred_robot():
     fleet._order_clients['robot2'].call_async.assert_called_once()
 
 
-def test_fleet_rejects_busy_preferred_robot():
-    """지정 로봇이 busy면 주문을 거부한다."""
+def test_fleet_falls_back_when_preferred_busy():
+    """지정 로봇이 busy여도 다른 idle 로봇이 있으면 폴백한다."""
     fleet = FleetManager.__new__(FleetManager)
     fleet._robots = ['robot1', 'robot2']
     fleet._serialize_shared_payloads = False
@@ -349,17 +349,45 @@ def test_fleet_rejects_busy_preferred_robot():
     fleet._reserved = {}
     fleet._table_claims = {}
     fleet.get_logger = Mock(return_value=Mock())
+    accepted = type('Response', (), {'success': True})()
     fleet._order_clients = {
         'robot1': Mock(service_is_ready=Mock(return_value=True)),
         'robot2': Mock(service_is_ready=Mock(return_value=True)),
     }
+    for client in fleet._order_clients.values():
+        client.call_async.return_value = _FinishedFuture(accepted)
 
     response = type('Response', (), {'success': True, 'assigned_robot': 'x'})()
     fleet._on_order(_order_request(0, preferred_robot='robot1'), response)
 
-    assert response.success is False
-    assert response.assigned_robot == ''
+    assert response.success is True
+    assert response.assigned_robot == 'robot2'
     fleet._order_clients['robot1'].call_async.assert_not_called()
+    fleet._order_clients['robot2'].call_async.assert_called_once()
+
+
+def test_fleet_falls_back_when_preferred_order_not_ready():
+    """preferred의 /manager/order가 아직 없으면 다른 idle로 폴백한다."""
+    fleet = FleetManager.__new__(FleetManager)
+    fleet._robots = ['robot1', 'robot2']
+    fleet._serialize_shared_payloads = False
+    fleet._states = {'robot1': 0, 'robot2': 0}
+    fleet._reserved = {}
+    fleet._table_claims = {}
+    fleet.get_logger = Mock(return_value=Mock())
+    accepted = type('Response', (), {'success': True})()
+    fleet._order_clients = {
+        'robot1': Mock(service_is_ready=Mock(return_value=True)),
+        'robot2': Mock(service_is_ready=Mock(return_value=False)),
+    }
+    fleet._order_clients['robot1'].call_async.return_value = _FinishedFuture(accepted)
+
+    response = type('Response', (), {'success': False, 'assigned_robot': ''})()
+    fleet._on_order(_order_request(0, preferred_robot='robot2'), response)
+
+    assert response.success is True
+    assert response.assigned_robot == 'robot1'
+    fleet._order_clients['robot1'].call_async.assert_called_once()
     fleet._order_clients['robot2'].call_async.assert_not_called()
 
 
@@ -382,12 +410,12 @@ def test_path_clearance_detects_crossing_segments():
     assert abs(trimmed[-1][1] - 2.5) < 0.05
 
     coord = PathYieldCoordinator.__new__(PathYieldCoordinator)
-    # Earlier order has higher priority (more positive / less negative).
+    # priority = -monotonic: earlier is more negative; later (larger) yields.
     coord._intents = {
         "robot1": RobotIntent("robot1", priority=-100.0),
         "robot2": RobotIntent("robot2", priority=-101.0),
     }
-    assert coord._choose_yielder("robot1", "robot2") == "robot2"
+    assert coord._choose_yielder("robot1", "robot2") == "robot1"
 
 
 def test_far_shared_aisle_does_not_path_conflict():

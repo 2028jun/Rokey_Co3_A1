@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import math
 import threading
+import time
 from typing import Any
 
 import rclpy
@@ -67,6 +68,8 @@ class NavigationSubsystemNode(Node):
             self._routes["routes"].update(overrides.get("routes") or {})
         self._lock = threading.Lock()
         self._worker: threading.Thread | None = None
+        self._worker_started: float | None = None
+        self._worker_kind: str = ""
         self._worker_nav = None
         self._tf_buffer = None
         self._tracker = None
@@ -76,6 +79,12 @@ class NavigationSubsystemNode(Node):
         self._last_phase = "idle"
         self._last_mission_id = ""
         self._failure_reason = ""
+        self._nav2_wait_timeout_sec = float(
+            self.declare_parameter("nav2_wait_timeout_sec", 45.0).value
+        )
+        self._worker_stuck_sec = float(
+            self.declare_parameter("worker_stuck_sec", 60.0).value
+        )
 
         status_qos = QoSProfile(
             depth=1,
@@ -116,6 +125,36 @@ class NavigationSubsystemNode(Node):
             "navigation subsystem ready: commands 0..4, pause=99, resume=98"
         )
 
+    def _abandon_stuck_worker_locked(self, *, for_initialize: bool) -> bool:
+        """Drop a hung worker handle so initialize/order can recover.
+
+        ``waitUntilNav2Active`` can block forever when robot2's Nav2 lifecycle
+        lags; the daemon thread stays alive and every retry reports busy.
+        """
+        if self._worker is None or not self._worker.is_alive():
+            self._worker = None
+            self._worker_started = None
+            self._worker_kind = ""
+            return False
+        started = self._worker_started or time.monotonic()
+        age = time.monotonic() - started
+        if age < self._worker_stuck_sec:
+            return False
+        # Only abandon initialize / early ensure hangs — not active table drives
+        # unless they exceed a longer grace (handled by mission timeouts).
+        if not for_initialize and self._worker_kind not in ("initialize",):
+            return False
+        self.get_logger().warning(
+            f"abandoning stuck navigation worker kind={self._worker_kind} "
+            f"age={age:.1f}s"
+        )
+        self._worker = None
+        self._worker_started = None
+        self._worker_kind = ""
+        self._active_command = None
+        self._paused = False
+        return True
+
     def _on_command(self, request, response):
         command = int(request.command)
         if command == PAUSE_COMMAND:
@@ -130,6 +169,7 @@ class NavigationSubsystemNode(Node):
             return response
 
         with self._lock:
+            self._abandon_stuck_worker_locked(for_initialize=False)
             if self._worker is not None and self._worker.is_alive():
                 self.get_logger().warning(
                     f"navigation busy; rejected command={command}"
@@ -139,6 +179,8 @@ class NavigationSubsystemNode(Node):
             self._active_command = command
             self._paused = False
             self._failure_reason = ""
+            self._worker_kind = f"command-{command}"
+            self._worker_started = time.monotonic()
             self._worker = threading.Thread(
                 target=self._run_command,
                 args=(command,),
@@ -151,11 +193,14 @@ class NavigationSubsystemNode(Node):
 
     def _on_initialize(self, _request, response):
         with self._lock:
+            self._abandon_stuck_worker_locked(for_initialize=True)
             if self._worker is not None and self._worker.is_alive():
                 response.success = False
                 response.message = "navigation is busy"
                 return response
             self._active_command = None
+            self._worker_kind = "initialize"
+            self._worker_started = time.monotonic()
             self._worker = threading.Thread(
                 target=self._run_initialize,
                 daemon=True,
@@ -166,6 +211,31 @@ class NavigationSubsystemNode(Node):
         response.message = "spawn initialization accepted"
         return response
 
+    def _wait_nav2_active(self, nav, timeout_sec: float) -> None:
+        """Bound ``waitUntilNav2Active`` so a hung lifecycle cannot freeze init."""
+        done = threading.Event()
+        errors: list[BaseException] = []
+
+        def _wait() -> None:
+            try:
+                nav.waitUntilNav2Active()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                done.set()
+
+        waiter = threading.Thread(
+            target=_wait, daemon=True, name="nav2-wait-active"
+        )
+        waiter.start()
+        if not done.wait(timeout=timeout_sec):
+            raise RuntimeError(
+                f"Nav2 not active within {timeout_sec:.0f}s "
+                "(waitUntilNav2Active timed out)"
+            )
+        if errors:
+            raise errors[0]
+
     def _ensure_navigation(self) -> None:
         if self._worker_nav is not None:
             return
@@ -175,7 +245,7 @@ class NavigationSubsystemNode(Node):
         )
         # Never let BasicNavigator publish its default map (0, 0, 0) pose.
         nav.initial_pose_received = True
-        nav.waitUntilNav2Active()
+        self._wait_nav2_active(nav, self._nav2_wait_timeout_sec)
         self._worker_nav = nav
         self._tf_buffer = tf_buffer
         self._tracker = tracker
@@ -217,6 +287,8 @@ class NavigationSubsystemNode(Node):
         finally:
             with self._lock:
                 self._worker = None
+                self._worker_started = None
+                self._worker_kind = ""
 
     def _run_command(self, command: int) -> None:
         try:
@@ -272,6 +344,8 @@ class NavigationSubsystemNode(Node):
                 self._active_command = None
                 self._paused = False
                 self._worker = None
+                self._worker_started = None
+                self._worker_kind = ""
 
     def _park_out_if_needed(
         self, current_pose: tuple[float, float, float]
