@@ -37,7 +37,10 @@ SLIDING_TRAY_JOINTS = (
     "upper_tray_right_slide_joint",
 )
 SLIDING_TRAY_EXTENSION = 0.25
-SLIDING_TRAY_DEPLOY_STEPS = 360
+# Integrated multi-robot scene runs PhysX/control at 60 Hz.  These durations
+# preserve the original 120 Hz motion timing without making table service take
+# twice as long after the physics-rate reduction.
+SLIDING_TRAY_DEPLOY_STEPS = 180
 
 SODA1_PICK_PATH = "/World/ServingDrinks/SodaCan_03"
 SODA2_PICK_PATH = "/World/ServingDrinks/SodaCan_02"
@@ -56,9 +59,9 @@ OUTSIDE_BAIL_LOCAL_Y = 0.28
 # TCP offset placed link_6 outside the practical downward-tool workspace.  A
 # 120 mm TCP clearance still keeps the carried can 120 mm above the tabletop.
 TABLE_APPROACH_HEIGHT = 0.12
-VERTICAL_STEPS = 300
-INITIAL_STEPS = 240
-DETOUR_STEPS = 240
+VERTICAL_STEPS = 150
+INITIAL_STEPS = 120
+DETOUR_STEPS = 120
 
 # This is the table position formerly derived from the pizza-board centre,
 # but it is fully defined here so this task does not instantiate pizza assets.
@@ -95,6 +98,44 @@ def _quaternion_slerp(start, end, amount):
     ) / np.sin(angle)
 
 
+def _quaternion_multiply(left, right):
+    """Multiply scalar-first quaternions."""
+    lw, lx, ly, lz = np.asarray(left, dtype=float)
+    rw, rx, ry, rz = np.asarray(right, dtype=float)
+    return np.array(
+        [
+            lw * rw - lx * rx - ly * ry - lz * rz,
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+        ],
+        dtype=float,
+    )
+
+
+def _world_orientation_for_robot(canonical_world, robot_orientation):
+    """Mirror the proven yaw=pi tool pose into the current robot frame.
+
+    The original serving trajectory was tuned for the left-table robot whose
+    base yaw is pi. Positions were already transformed from robot-local to
+    world, but tool orientation remained fixed in world coordinates. A robot
+    docked at yaw=0 therefore received a tool pose rotated by pi in its local
+    frame and RMPFlow could select a folded arm branch. Preserve the exact
+    left-table pose while rotating it by the current-base/reference-base yaw
+    delta for every other docking orientation.
+    """
+    robot_orientation = np.asarray(robot_orientation, dtype=float)
+    robot_orientation /= np.linalg.norm(robot_orientation)
+    reference_orientation = np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
+    reference_inverse = reference_orientation.copy()
+    reference_inverse[1:] *= -1.0
+    local_orientation = _quaternion_multiply(
+        reference_inverse, canonical_world
+    )
+    result = _quaternion_multiply(robot_orientation, local_orientation)
+    return result / np.linalg.norm(result)
+
+
 class SodaCanPickPlace:
     """Deploy the tray and deliver only its robot-left/front soda can."""
 
@@ -105,10 +146,16 @@ class SodaCanPickPlace:
         task_name="soda1",
         pick_path=SODA1_PICK_PATH,
         place_left=True,
+        robot_root=None,
     ):
         self._stage = stage
-        self._arm_base = find_serving_robot_prim(stage, "base_link")
-        self._end_effector = find_serving_robot_prim(stage, "link_6")
+        self._robot_root = robot_root
+        self._arm_base = find_serving_robot_prim(
+            stage, "base_link", robot_root=robot_root
+        )
+        self._end_effector = find_serving_robot_prim(
+            stage, "link_6", robot_root=robot_root
+        )
         _, _, self._arm_to_world = prim_world_pose(self._arm_base)
         self._up = np.array([0.0, 0.0, 1.0])
         self._task_name = task_name
@@ -124,12 +171,16 @@ class SodaCanPickPlace:
         self._preserve_grasp_orientation = False
         self._carried_orientation = None
         self._use_seeded_ik_for_lift = False
+        self._use_seeded_ik_for_all_motion = False
+        self._seeded_ik_solver = None
+        self._seeded_ik_max_delta = np.deg2rad(10.0)
         self._continuous_rmp_lift = False
+        self._canonical_vertical_orientation = VERTICAL_EE_ORIENTATION.copy()
         self._vertical_orientation = VERTICAL_EE_ORIENTATION.copy()
         self._grasp_hold_max_error = None
         self._grasp_object_max_lateral = None
-        self._gripper_close_ramp_steps = 120
-        self._gripper_close_wait_steps = 120
+        self._gripper_close_ramp_steps = 60
+        self._gripper_close_wait_steps = 60
         self._phase = 0
         self._phase_steps = 0
         self._settled_steps = 0
@@ -143,6 +194,7 @@ class SodaCanPickPlace:
         self._can_pick_start = None
         self._grasp_hold_wrist = None
         self._grasp_hold_orientation = None
+        self._grasp_hold_joints = None
         self.done = False
         self.failed = False
 
@@ -174,8 +226,11 @@ class SodaCanPickPlace:
         missing = [name for name in required if name not in dof_names]
         if missing:
             raise RuntimeError(f"missing soda-task DOFs: {missing}")
+        self._articulation = articulation
         self._gripper_index = dof_names.index(GRIPPER_JOINT)
-        gripper_joint_prim = find_serving_robot_prim(self._stage, GRIPPER_JOINT)
+        gripper_joint_prim = find_serving_robot_prim(
+            self._stage, GRIPPER_JOINT, robot_root=self._robot_root
+        )
         self._gripper_drive = UsdPhysics.DriveAPI.Get(
             gripper_joint_prim, "angular"
         )
@@ -204,6 +259,9 @@ class SodaCanPickPlace:
         )
         gripper.set_joint_positions(np.array([GRIPPER_OPEN]))
         arm_position, arm_orientation, _ = prim_world_pose(self._arm_base)
+        self._vertical_orientation = _world_orientation_for_robot(
+            self._canonical_vertical_orientation, arm_orientation
+        )
         self._controller = RMPFlowController(
             name="soda_can_rmpflow",
             robot_articulation=articulation,
@@ -247,6 +305,7 @@ class SodaCanPickPlace:
             f"[{self._task_name}] ready with elbow-up posture bias "
             f"J2={np.degrees(ELBOW_UP_J2):.1f}deg "
             f"J3={np.degrees(ELBOW_UP_J3):.1f}deg; "
+            f"tool_q={np.round(self._vertical_orientation, 4).tolist()}; "
             f"deploying trays before reading live {self._object_label} pose",
             flush=True,
         )
@@ -264,6 +323,9 @@ class SodaCanPickPlace:
             arm_orientation,
             self._arm_to_world,
         ) = prim_world_pose(self._arm_base)
+        self._vertical_orientation = _world_orientation_for_robot(
+            self._canonical_vertical_orientation, arm_orientation
+        )
         up_vec = self._arm_to_world.TransformDir(Gf.Vec3d(0.0, 0.0, 1.0))
         self._up = np.array(up_vec, dtype=float)
         self._up = self._up / np.linalg.norm(self._up)
@@ -388,7 +450,21 @@ class SodaCanPickPlace:
         ]
         print(f"[{self._task_name}] phase={phase} {names[phase]}", flush=True)
         if phase in (2, 7):
-            if phase == 2 and self._continuous_rmp_lift:
+            if self._use_seeded_ik_for_all_motion:
+                # The plate rack reaches grasp/release on a locally seeded IK
+                # branch.  Calling RMPFlow while the fingers move makes its
+                # stale policy state pull the arm back toward another branch.
+                # Hold the measured joints and measured wrist pose instead.
+                self._grasp_hold_joints = np.asarray(
+                    self._articulation.get_joint_positions()[self._arm_indices],
+                    dtype=float,
+                ).copy()
+                (
+                    self._grasp_hold_wrist,
+                    self._grasp_hold_orientation,
+                    _,
+                ) = prim_world_pose(self._end_effector)
+            elif phase == 2 and self._continuous_rmp_lift:
                 # Preserve the exact final phase-1 command.  Reading the live
                 # wrist here and turning it into a new target creates a small
                 # policy discontinuity at the rear-tray grasp pose.
@@ -432,7 +508,7 @@ class SodaCanPickPlace:
                 self._trays_deployed = True
                 self._prepare_targets()
                 self._enter_phase(0)
-            elif self._deploy_steps >= SLIDING_TRAY_DEPLOY_STEPS + 360:
+            elif self._deploy_steps >= SLIDING_TRAY_DEPLOY_STEPS + 180:
                 self.failed = True
                 print(
                     f"[{self._task_name}] STOPPED: tray deployment failed",
@@ -442,14 +518,24 @@ class SodaCanPickPlace:
 
         self._phase_steps += 1
         if self._phase in (2, 7):
-            # Keep advancing RMPFlow while the fingers move.  Pausing it for
-            # 120 frames previously made its internal state stale and caused
-            # a large first-step transient when the vertical lift resumed.
-            hold_action = self._controller.forward(
-                target_end_effector_position=self._grasp_hold_wrist,
-                target_end_effector_orientation=self._grasp_hold_orientation,
-            )
-            articulation.apply_action(hold_action)
+            if self._use_seeded_ik_for_all_motion:
+                # Keep the exact seeded branch reached by the previous motion
+                # phase.  Only the gripper joint is allowed to move here.
+                articulation.apply_action(
+                    ArticulationAction(
+                        joint_positions=self._grasp_hold_joints,
+                        joint_indices=self._arm_indices,
+                    )
+                )
+            else:
+                # Keep advancing RMPFlow while the fingers move. Pausing it
+                # previously made its internal state stale and caused a large
+                # first-step transient when vertical lift resumed.
+                hold_action = self._controller.forward(
+                    target_end_effector_position=self._grasp_hold_wrist,
+                    target_end_effector_orientation=self._grasp_hold_orientation,
+                )
+                articulation.apply_action(hold_action)
             if self._phase == 2:
                 raw = min(
                     1.0,
@@ -539,6 +625,19 @@ class SodaCanPickPlace:
             tcp_target[:2] = start[:2]
             tcp_target[2] = start[2] + amount * (tcp_target[2] - start[2])
             transition_complete = raw >= 1.0
+        elif self._phase == 4 and self._use_seeded_ik_for_all_motion:
+            # The plate rack moves roughly half a metre from the pickup tray
+            # to the table. Sending the final Cartesian target on the first
+            # phase-4 frame produces a 60-degree IK delta and trips the branch
+            # guard. Interpolate the transfer so each seeded solution remains
+            # continuous with the measured joints.
+            transfer_steps = max(1, int(getattr(self, "_transfer_steps", 180)))
+            raw = min(1.0, self._phase_steps / float(transfer_steps))
+            amount = raw * raw * (3.0 - 2.0 * raw)
+            start = self._targets[3]
+            end = self._targets[4]
+            tcp_target = start + amount * (end - start)
+            transition_complete = raw >= 1.0
         elif self._phase in (4, 5) and self._use_bail_detour:
             raw = min(1.0, self._phase_steps / float(DETOUR_STEPS))
             amount = raw * raw * (3.0 - 2.0 * raw)
@@ -568,7 +667,62 @@ class SodaCanPickPlace:
                 self._initial_orientation, self._vertical_orientation, amount
             )
             transition_complete = raw >= 1.0
-        if self._phase == 3 and self._use_seeded_ik_for_lift:
+        if self._use_seeded_ik_for_all_motion:
+            # Plate-rack motion must remain on the branch selected by its
+            # seeded pre-approach. RMPFlow can otherwise jump from the valid
+            # elbow-up solution to a folded branch as soon as phase 1 starts,
+            # even though the Cartesian target only moves vertically.
+            if self._seeded_ik_solver is None:
+                self.failed = True
+                print(
+                    f"[{self._task_name}] STOPPED: seeded IK solver missing",
+                    flush=True,
+                )
+                return
+            current_arm = np.asarray(
+                articulation.get_joint_positions()[self._arm_indices],
+                dtype=float,
+            )
+            target_joints, ik_ok = (
+                self._seeded_ik_solver.compute_inverse_kinematics(
+                    "link_6",
+                    wrist_target,
+                    orientation,
+                    current_arm,
+                    0.003,
+                    0.03,
+                )
+            )
+            if not ik_ok:
+                self.failed = True
+                print(
+                    f"[{self._task_name}] STOPPED: seeded IK failed "
+                    f"phase={self._phase} tcp={np.round(tcp_target, 4)}",
+                    flush=True,
+                )
+                return
+            target_joints = current_arm + (
+                np.asarray(target_joints, dtype=float)
+                - current_arm
+                + np.pi
+            ) % (2.0 * np.pi) - np.pi
+            joint_step = np.abs(target_joints - current_arm)
+            if float(np.max(joint_step)) > self._seeded_ik_max_delta:
+                self.failed = True
+                print(
+                    f"[{self._task_name}] STOPPED: seeded IK branch jump "
+                    f"phase={self._phase} delta_deg="
+                    f"{np.round(np.degrees(joint_step), 1).tolist()}",
+                    flush=True,
+                )
+                return
+            articulation.apply_action(
+                ArticulationAction(
+                    joint_positions=target_joints,
+                    joint_indices=self._arm_indices,
+                )
+            )
+        elif self._phase == 3 and self._use_seeded_ik_for_lift:
             # RMPFlow can leave the rear-tray IK branch even for a few mm of
             # vertical motion.  Solve each lift sample from the *current*
             # joints instead, making the local branch explicit and continuous.
@@ -638,7 +792,7 @@ class SodaCanPickPlace:
                 f"J3={np.degrees(arm[2]):.1f}deg",
                 flush=True,
             )
-        if self._settled_steps >= 15:
+        if self._settled_steps >= 8:
             if self._phase == 3:
                 can_position, _, _ = prim_world_pose(self._can_prim)
                 can_lift = float(can_position[2] - self._can_pick_start[2])
@@ -671,7 +825,7 @@ class SodaCanPickPlace:
                         flush=True,
                     )
             self._enter_phase(self._phase + 1)
-        elif self._phase_steps >= 900:
+        elif self._phase_steps >= 450:
             self.failed = True
             print(
                 f"[{self._task_name}] STOPPED: phase={self._phase} "
@@ -686,29 +840,41 @@ class SodaCanPickPlace:
         self._lift_ik = None
         self._gripper = None
         self._can_prim = None
+        self._grasp_hold_joints = None
+        self._articulation = None
 
 
 class Soda1PickPlace(SodaCanPickPlace):
     """Robot-front/left can to the left side of the delivered pizza."""
 
-    def __init__(self, stage, wait_for_start=False):
+    def __init__(
+        self, stage, wait_for_start=False, *, payload_root="/World",
+        robot_root=None
+    ):
+        payload_root = str(payload_root).rstrip("/") or "/World"
         super().__init__(
             stage,
             wait_for_start=wait_for_start,
             task_name="soda1",
-            pick_path=SODA1_PICK_PATH,
+            pick_path=f"{payload_root}/ServingDrinks/SodaCan_03",
             place_left=True,
+            robot_root=robot_root,
         )
 
 
 class Soda2PickPlace(SodaCanPickPlace):
     """Robot-front/right can to the right side of the delivered pizza."""
 
-    def __init__(self, stage, wait_for_start=False):
+    def __init__(
+        self, stage, wait_for_start=False, *, payload_root="/World",
+        robot_root=None
+    ):
+        payload_root = str(payload_root).rstrip("/") or "/World"
         super().__init__(
             stage,
             wait_for_start=wait_for_start,
             task_name="soda2",
-            pick_path=SODA2_PICK_PATH,
+            pick_path=f"{payload_root}/ServingDrinks/SodaCan_02",
             place_left=False,
+            robot_root=robot_root,
         )

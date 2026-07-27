@@ -76,9 +76,9 @@ SLIDING_TRAY_JOINTS = (
     "upper_tray_right_slide_joint",
 )
 SLIDING_TRAY_EXTENSION = 0.25
-# Four seconds at the 120 Hz scene rate further reduces the reaction from the
+# Four seconds at the 60 Hz scene rate further reduces the reaction from the
 # loaded trays while the arm is simultaneously approaching the pizza bail.
-SLIDING_TRAY_DEPLOY_STEPS = 480
+SLIDING_TRAY_DEPLOY_STEPS = 240
 # Reachable centreline target on the destination tabletop.  At local X=+0.55
 # the 39 cm board remains fully inside the table edge while the arm can first
 # translate there at its lifted height, then descend vertically.  The former
@@ -135,18 +135,38 @@ HORIZONTAL_APPROACH_DISTANCE = 0.08
 TOP_DECK_APPROACH_DISTANCE = 0.10
 # Lift 20 cm before the J1 half-turn so the 39 cm board clears the top deck.
 TOP_DECK_SAFE_CLEARANCE = 0.20
-INITIAL_TRANSITION_STEPS = 240
-# Two seconds at 120 Hz for each 40-degree bail segment.  Smooth continuous
-# arc targets prevent the handle from being impulsively flung past RG2.
-BAIL_ARC_STEPS = 240
+INITIAL_TRANSITION_STEPS = 120
+# Give the physical hinge three seconds per segment at 60 Hz.  With two
+# articulations active, the former two-second command could finish before the
+# wooden bail caught up and then fail while the gripper was visibly on it.
+BAIL_ARC_STEPS = 180
 BAIL_PHASE4_OVERSHOOT_DEG = 60.0
 BAIL_UPRIGHT_ACCEPT_DEG = 85.0
-VERTICAL_LIFT_STEPS = 360
-J1_HALF_TURN_STEPS = 600
+VERTICAL_LIFT_STEPS = 180
+J1_HALF_TURN_STEPS = 300
 # Camera mast now occupies robot-left (+Y), so carry the raised pizza through
 # the opposite half-turn direction to keep the board/arm clear of the mast.
 J1_DELIVERY_TURN = np.pi
-PLACEMENT_DESCENT_STEPS = 360
+PLACEMENT_DESCENT_STEPS = 180
+# Keep free-space interpolation fast, but allow contact-rich bail motion and
+# final settling up to ten seconds before declaring a genuine failure.
+PIZZA_PHASE_TIMEOUT_STEPS = 600
+# Do not let the commanded hand path outrun the physical hinge.  A small lead
+# angle keeps lifting force on the handle without turning it into a lateral
+# impact when PhysX is late under the two-robot load.
+BAIL_MAX_LEAD_DEG = 8.0
+# If the physical hinge stops advancing while RG2 still encloses the handle,
+# progressively add a little more upward pursuit.  Keep this bounded: a large
+# permanent lead turns the circular lift into a lateral strike when PhysX is
+# merely one or two frames late under the two-robot load.
+BAIL_STALL_WINDOW_STEPS = 45
+BAIL_STALL_PROGRESS_DEG = 0.75
+BAIL_STALL_MAX_LEAD_DEG = 16.0
+BAIL_STALL_LEAD_RAMP_STEPS = 60
+BAIL_STALL_MAX_UPWARD_ASSIST = 0.008
+BAIL_GRASP_TCP_MAX_ERROR = 0.055
+BAIL_GRASP_BOARD_LATERAL_MAX = 0.020
+BAIL_EMPTY_GRIPPER_POSITION = 1.03
 RG2_TCP_LENGTH = 0.231066
 # Keep local X (finger separation) upward and point the assembled RG2 forward
 # axis (+Z) toward world +X.  The hand therefore starts on the handle's -X
@@ -180,10 +200,10 @@ def quaternion_slerp(start, end, amount):
     ) / np.sin(angle)
 
 
-def author_magnetic_steel_plate(stage):
+def author_magnetic_steel_plate(stage, dish_path="/World/ServingDish"):
     """Add only the board-side steel target; the magnet is in robot USD."""
     plate = UsdGeom.Cylinder.Define(
-        stage, "/World/ServingDish/MagneticSteelPlate"
+        stage, f"{dish_path}/MagneticSteelPlate"
     )
     plate.CreateAxisAttr(UsdGeom.Tokens.z)
     plate.CreateRadiusAttr(STEEL_PLATE_RADIUS)
@@ -198,7 +218,9 @@ def author_magnetic_steel_plate(stage):
         flush=True,
     )
 
-def author_wooden_pizza_board(stage, mesh_path, physics_material):
+def author_wooden_pizza_board(
+    stage, mesh_path, physics_material, payload_root="/World"
+):
     """Create one watertight round board with a two-sided lifting bail."""
     circle_angles = np.linspace(0.0, 2.0 * np.pi, 64, endpoint=False)
     outline = [
@@ -301,9 +323,14 @@ def author_wooden_pizza_board(stage, mesh_path, physics_material):
     # One local-Y revolute joint represents the two coaxial physical pivots.
     # The board root carries the robot yaw, so the separate rigid components
     # below receive that same orientation and all geometry stays robot-local.
-    dish_prim = stage.GetPrimAtPath("/World/ServingDish")
+    payload_root = str(payload_root).rstrip("/") or "/World"
+    dish_path = f"{payload_root}/ServingDish"
+    bail_path = f"{payload_root}/PizzaBoardBail"
+    grip_block_path = f"{payload_root}/PizzaBoardGripBlock"
+    grip_bearing_path = f"{payload_root}/PizzaBoardGripBearing"
+    bail_hinge_path = f"{payload_root}/PizzaBoardBailHinge"
+    dish_prim = stage.GetPrimAtPath(dish_path)
     _, board_world_orientation, board_to_world = prim_world_pose(dish_prim)
-    bail_path = "/World/PizzaBoardBail"
     bail_root = UsdGeom.Xform.Define(stage, bail_path)
     bail_pivot_local = np.array(
         [BOARD_BAIL_X, 0.0, 0.5 * BOARD_THICKNESS + BOARD_BAIL_ROD_RADIUS],
@@ -433,7 +460,6 @@ def author_wooden_pizza_board(stage, mesh_path, physics_material):
             (0.05, 0.05, 0.055),
         )
 
-    grip_block_path = "/World/PizzaBoardGripBlock"
     grip_block_local = bail_pivot_local + folded_bar_center
     grip_block_world = np.asarray(
         board_to_world.Transform(Gf.Vec3d(*map(float, grip_block_local))),
@@ -480,7 +506,7 @@ def author_wooden_pizza_board(stage, mesh_path, physics_material):
     # Bearing between the wooden grip and world-Y crossbar.  RG2 holds the
     # block while the wire bail is free to rotate inside it about the bar axis.
     grip_bearing = UsdPhysics.RevoluteJoint.Define(
-        stage, "/World/PizzaBoardGripBearing"
+        stage, grip_bearing_path
     )
     grip_bearing.CreateBody0Rel().SetTargets([Sdf.Path(bail_path)])
     grip_bearing.CreateBody1Rel().SetTargets([Sdf.Path(grip_block_path)])
@@ -491,8 +517,8 @@ def author_wooden_pizza_board(stage, mesh_path, physics_material):
     grip_bearing.CreateAxisAttr(UsdGeom.Tokens.y)
     grip_bearing.CreateCollisionEnabledAttr(False)
 
-    hinge = UsdPhysics.RevoluteJoint.Define(stage, "/World/PizzaBoardBailHinge")
-    hinge.CreateBody0Rel().SetTargets([Sdf.Path("/World/ServingDish")])
+    hinge = UsdPhysics.RevoluteJoint.Define(stage, bail_hinge_path)
+    hinge.CreateBody0Rel().SetTargets([Sdf.Path(dish_path)])
     hinge.CreateBody1Rel().SetTargets([Sdf.Path(bail_path)])
     hinge.CreateLocalPos0Attr().Set(
         Gf.Vec3f(
@@ -615,10 +641,21 @@ def author_colored_glb_meshes(stage, root_path, glb_path):
 class TrayPizzaPickPlace:
     """Top-down grasp of a folding bail followed by a vertical board lift."""
 
-    def __init__(self, stage):
+    def __init__(
+        self, stage, *, payload_root="/World", robot_root=None
+    ):
         self._stage = stage
-        self._arm_base = find_serving_robot_prim(stage, "base_link")
-        self._end_effector = find_serving_robot_prim(stage, "link_6")
+        self._payload_root = str(payload_root).rstrip("/") or "/World"
+        self._robot_root = robot_root
+        self._dish_path = f"{self._payload_root}/ServingDish"
+        self._bail_path = f"{self._payload_root}/PizzaBoardBail"
+        self._grip_block_path = f"{self._payload_root}/PizzaBoardGripBlock"
+        self._arm_base = find_serving_robot_prim(
+            stage, "base_link", robot_root=robot_root
+        )
+        self._end_effector = find_serving_robot_prim(
+            stage, "link_6", robot_root=robot_root
+        )
         _, self._arm_orientation_world, self._arm_to_world = prim_world_pose(
             self._arm_base
         )
@@ -646,6 +683,8 @@ class TrayPizzaPickPlace:
         self._initial_orientation = None
         self._delivery_orientation = None
         self._phase5_start_angle_deg = 50.0
+        self._bail_stall_reference_angle = None
+        self._bail_stall_steps = 0
         self._lift_j1_hold = None
         self._lift_tcp_start = None
         self._lift_tcp_target = None
@@ -668,8 +707,12 @@ class TrayPizzaPickPlace:
         # Invisible collision proxy; visible geometry comes exclusively from
         # the Antigravity assets below.
         self._dish = DynamicCylinder(
-            prim_path="/World/ServingDish",
-            name="serving_dish",
+            prim_path=self._dish_path,
+            name=(
+                "serving_dish"
+                if not robot_root
+                else f"serving_dish_{str(robot_root).rsplit('/', 1)[-1]}"
+            ),
             position=self.local_to_world(TOP_DECK_DISH_LOCAL),
             orientation=self._arm_orientation_world,
             radius=DISH_RADIUS,
@@ -680,7 +723,9 @@ class TrayPizzaPickPlace:
         )
         dish_body = UsdPhysics.RigidBodyAPI.Get(stage, self._dish.prim_path)
         if not dish_body:
-            raise RuntimeError("failed to create /World/ServingDish rigid body")
+            raise RuntimeError(
+                f"failed to create {self._dish_path} rigid body"
+            )
         dish_prim = stage.GetPrimAtPath(self._dish.prim_path)
         dish_physx_body = PhysxSchema.PhysxRigidBodyAPI.Apply(dish_prim)
         dish_physx_body.CreateSolverPositionIterationCountAttr(64)
@@ -731,19 +776,27 @@ class TrayPizzaPickPlace:
         )
         author_wooden_pizza_board(
             stage,
-            "/World/ServingDish/WoodenPizzaBoard",
+            f"{self._dish_path}/WoodenPizzaBoard",
             dish_material,
+            payload_root=self._payload_root,
         )
-        author_magnetic_steel_plate(stage)
-        self._bail = stage.GetPrimAtPath("/World/PizzaBoardBail")
+        author_magnetic_steel_plate(stage, self._dish_path)
+        self._bail = stage.GetPrimAtPath(self._bail_path)
         if not self._bail.IsValid():
-            raise RuntimeError("/World/PizzaBoardBail was not authored")
+            raise RuntimeError(f"{self._bail_path} was not authored")
         self._bail_crossbar = stage.GetPrimAtPath(
-            "/World/PizzaBoardBail/GeometryFrame/TopCrossbar"
+            f"{self._bail_path}/GeometryFrame/TopCrossbar"
         )
         if not self._bail_crossbar.IsValid():
             raise RuntimeError("pizza-board bail crossbar was not authored")
-        pizza_asset = UsdGeom.Xform.Define(stage, "/World/ServingDish/PizzaAsset")
+        self._grip_block = stage.GetPrimAtPath(self._grip_block_path)
+        if not self._grip_block.IsValid():
+            raise RuntimeError(
+                f"pizza-board grip block missing: {self._grip_block_path}"
+            )
+        pizza_asset = UsdGeom.Xform.Define(
+            stage, f"{self._dish_path}/PizzaAsset"
+        )
         # Source diameter is about 45 cm.  At 0.72 scale it becomes 32.4 cm on
         # the 39 cm wooden deck.  Also cancel the source mesh's off-centre
         # pivot and raise its lowest crust geometry above the plate.  This GLB
@@ -751,7 +804,7 @@ class TrayPizzaPickPlace:
         # world +Z so the pizza lies flat instead of standing vertically.
         pizza_asset.AddTranslateOp().Set(Gf.Vec3d(*PIZZA_CENTER_OFFSET))
         pizza_geometry = UsdGeom.Xform.Define(
-            stage, "/World/ServingDish/PizzaAsset/Geometry"
+            stage, f"{self._dish_path}/PizzaAsset/Geometry"
         )
         pizza_geometry.AddRotateXOp().Set(90.0)
         pizza_geometry.AddScaleOp().Set(
@@ -761,7 +814,7 @@ class TrayPizzaPickPlace:
             stage, pizza_geometry.GetPath(), SUPREME_PIZZA_GLB
         )
         if not dish_prim.IsValid():
-            raise RuntimeError("/World/ServingDish was not authored")
+            raise RuntimeError(f"{self._dish_path} was not authored")
         print(
             f"[serving] authored dish prim={dish_prim.GetPath()} "
             f"spawn={np.round(self.local_to_world(TOP_DECK_DISH_LOCAL), 4)}",
@@ -831,6 +884,40 @@ class TrayPizzaPickPlace:
             )
         )
 
+    def _validate_bail_grasp(self, articulation):
+        """Verify that RG2 encloses the wooden grip before starting the arc."""
+        wrist_position, _, _ = prim_world_pose(self._end_effector)
+        tcp_position = (
+            np.asarray(wrist_position, dtype=float)
+            - self._up_world * RG2_TCP_LENGTH
+        )
+        grip_position, _, _ = prim_world_pose(self._grip_block)
+        grip_position = np.asarray(grip_position, dtype=float)
+        tcp_error = float(np.linalg.norm(tcp_position - grip_position))
+
+        board_position = np.asarray(self._dish.get_world_pose()[0], dtype=float)
+        board_delta = board_position - self._pick_start_position
+        board_vertical = self._up_world * float(
+            np.dot(board_delta, self._up_world)
+        )
+        board_lateral = float(np.linalg.norm(board_delta - board_vertical))
+        gripper_actual = float(
+            articulation.get_joint_positions()[self._gripper_joint_index]
+        )
+        valid = (
+            tcp_error <= BAIL_GRASP_TCP_MAX_ERROR
+            and board_lateral <= BAIL_GRASP_BOARD_LATERAL_MAX
+            and gripper_actual < BAIL_EMPTY_GRIPPER_POSITION
+        )
+        print(
+            "[serving-grasp-check] "
+            f"valid={int(valid)} tcp_error={tcp_error:.4f}m "
+            f"board_lateral={board_lateral:.4f}m "
+            f"gripper={gripper_actual:.3f}",
+            flush=True,
+        )
+        return valid, tcp_error, board_lateral, gripper_actual
+
     def _apply_magnetic_retention(self):
         """Apply a weak short-range downward force like a permanent magnet."""
         if ANCHOR_BOARD_FOR_BAIL_TEST:
@@ -881,6 +968,8 @@ class TrayPizzaPickPlace:
         self._phase = phase
         self._phase_steps = 0
         self._settled_steps = 0
+        self._bail_stall_reference_angle = None
+        self._bail_stall_steps = 0
         names = [
             "move to high safe pose above folded bail",
             "descend to pre-grasp above folded bail",
@@ -1206,7 +1295,7 @@ class TrayPizzaPickPlace:
                 "[sliding-tray] parallel deployment complete",
                 flush=True,
             )
-        elif self._tray_deploy_steps >= SLIDING_TRAY_DEPLOY_STEPS + 360:
+        elif self._tray_deploy_steps >= SLIDING_TRAY_DEPLOY_STEPS + 180:
             self.failed = True
             print(
                 "[sliding-tray] STOPPED: parallel deployment did not "
@@ -1224,7 +1313,7 @@ class TrayPizzaPickPlace:
                 return
         self._phase_steps += 1
         if self._phase in (3, 10):
-            wait_steps = 120 if self._phase == 3 else 90
+            wait_steps = 60 if self._phase == 3 else 45
             target = (
                 GRIPPER_CLOSE[0]
                 if self._phase == 3
@@ -1244,6 +1333,24 @@ class TrayPizzaPickPlace:
                     flush=True,
                 )
             if self._phase_steps >= wait_steps:
+                if self._phase == 3:
+                    valid, tcp_error, board_lateral, gripper_actual = (
+                        self._validate_bail_grasp(articulation)
+                    )
+                    if not valid:
+                        self.failed = True
+                        # Open instead of dragging a missed handle through the
+                        # arc and launching the pizza sideways.
+                        self._command_gripper(articulation, GRIPPER_OPEN[0])
+                        print(
+                            "[serving-bail] STOPPED: bail grasp verification "
+                            "failed before arc; "
+                            f"tcp_error={tcp_error:.4f}m "
+                            f"board_lateral={board_lateral:.4f}m "
+                            f"gripper={gripper_actual:.3f}",
+                            flush=True,
+                        )
+                        return
                 self._enter_phase(self._phase + 1, articulation)
             return
 
@@ -1278,9 +1385,9 @@ class TrayPizzaPickPlace:
                 if raw_amount >= 1.0 and error < 0.03
                 else 0
             )
-            if self._settled_steps >= 15:
+            if self._settled_steps >= 8:
                 self._enter_phase(8, articulation)
-            elif self._phase_steps >= J1_HALF_TURN_STEPS + 300:
+            elif self._phase_steps >= J1_HALF_TURN_STEPS + 150:
                 self.failed = True
                 print(
                     "[serving-bail] STOPPED: J1 half-turn did not converge; "
@@ -1306,9 +1413,41 @@ class TrayPizzaPickPlace:
             )
             raw_amount = min(1.0, self._phase_steps / BAIL_ARC_STEPS)
             amount = raw_amount * raw_amount * (3.0 - 2.0 * raw_amount)
-            commanded_angle = np.deg2rad(
+            scheduled_angle_deg = (
                 start_angle + amount * (end_angle - start_angle)
             )
+            measured_angle_deg = self._bail_angle_deg()
+            if self._bail_stall_reference_angle is None:
+                self._bail_stall_reference_angle = measured_angle_deg
+            elif (
+                measured_angle_deg
+                >= self._bail_stall_reference_angle + BAIL_STALL_PROGRESS_DEG
+            ):
+                # The hinge is following again.  Remove the assist immediately
+                # instead of carrying an accumulated boost into the next part
+                # of the arc.
+                self._bail_stall_reference_angle = measured_angle_deg
+                self._bail_stall_steps = 0
+            elif self._phase_steps >= BAIL_STALL_WINDOW_STEPS:
+                self._bail_stall_steps += 1
+
+            stall_amount = np.clip(
+                self._bail_stall_steps / BAIL_STALL_LEAD_RAMP_STEPS,
+                0.0,
+                1.0,
+            )
+            allowed_lead_deg = BAIL_MAX_LEAD_DEG + stall_amount * (
+                BAIL_STALL_MAX_LEAD_DEG - BAIL_MAX_LEAD_DEG
+            )
+            # Closed-loop pursuit: the hand may lead the physical hinge just
+            # enough to apply lift, but never far enough to become a lateral
+            # strike when simulation frames are delayed.
+            commanded_angle_deg = min(
+                scheduled_angle_deg,
+                measured_angle_deg + allowed_lead_deg,
+            )
+            commanded_angle_deg = max(start_angle, commanded_angle_deg)
+            commanded_angle = np.deg2rad(commanded_angle_deg)
             tcp_target = (
                 self._pick_hinge
                 + BOARD_BAIL_HEIGHT
@@ -1317,12 +1456,18 @@ class TrayPizzaPickPlace:
                     + self._up_world * np.sin(commanded_angle)
                 )
                 - self._up_world * BOARD_BAIL_GRASP_INSERT_DEPTH
+                + self._up_world
+                * (stall_amount * BAIL_STALL_MAX_UPWARD_ASSIST)
             )
             transition_complete = raw_amount >= 1.0
             if self._phase_steps % 60 == 0:
                 print(
                     f"[serving-bail-arc] phase={self._phase} "
-                    f"command={np.degrees(commanded_angle):.1f}deg",
+                    f"scheduled={scheduled_angle_deg:.1f}deg "
+                    f"command={commanded_angle_deg:.1f}deg "
+                    f"actual={measured_angle_deg:.1f}deg "
+                    f"lead={allowed_lead_deg:.1f}deg "
+                    f"assist={stall_amount * BAIL_STALL_MAX_UPWARD_ASSIST * 1000.0:.1f}mm",
                     flush=True,
                 )
         elif self._phase == 6:
@@ -1425,7 +1570,7 @@ class TrayPizzaPickPlace:
             transition_complete = raw_amount >= 1.0
             if transition_complete:
                 self._settled_steps += 1
-                if self._settled_steps >= 15:
+                if self._settled_steps >= 8:
                     self._enter_phase(13, articulation)
             else:
                 self._settled_steps = 0
@@ -1535,6 +1680,18 @@ class TrayPizzaPickPlace:
         else:
             position_tolerance = 0.025
 
+        if (
+            self._phase in (0, 1, 2, 8, 9, 11)
+            and self._phase_steps % 60 == 0
+        ):
+            print(
+                f"[serving-motion] phase={self._phase} "
+                f"tcp_error={error:.4f}m "
+                f"tolerance={position_tolerance:.4f}m "
+                f"transition_complete={int(transition_complete)}",
+                flush=True,
+            )
+
         if self._phase == 11:
             position_delta = wrist_target - ee_position
             xy_error = float(np.linalg.norm(position_delta[:2]))
@@ -1556,9 +1713,9 @@ class TrayPizzaPickPlace:
             if reached
             else 0
         )
-        if self._settled_steps >= 15:
+        if self._settled_steps >= 8:
             self._enter_phase(self._phase + 1, articulation)
-        elif self._phase_steps >= 600:
+        elif self._phase_steps >= PIZZA_PHASE_TIMEOUT_STEPS:
             message = (
                 f"folding-bail phase {self._phase} did not converge; "
                 f"position error={error:.4f} m, "

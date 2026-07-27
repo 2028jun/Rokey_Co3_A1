@@ -24,6 +24,7 @@ class Order:
     items: List[OrderItem]
     total_price: int
     status: str = OrderStatus.PENDING
+    assigned_robot: str = ""
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -73,6 +74,21 @@ class OrderManager:
             return True
         return False
 
+    def assign_robot(self, order_id: str, robot_name: str) -> bool:
+        if order_id not in self.orders:
+            return False
+        self.orders[order_id].assigned_robot = str(robot_name or "")
+        self.orders[order_id].updated_at = time.time()
+        return True
+
+    def active_order_for_robot(self, robot_name: str) -> Optional[Order]:
+        for order in self.orders.values():
+            if (order.assigned_robot == robot_name
+                    and order.status not in (OrderStatus.COMPLETED,
+                                             OrderStatus.CANCELLED)):
+                return order
+        return None
+
     def _get_next_pending_id(self) -> Optional[str]:
         for oid, order in self.orders.items():
             if order.status in [OrderStatus.PENDING, OrderStatus.PICKING_UP, OrderStatus.NAVIGATING, OrderStatus.SERVING]:
@@ -88,6 +104,7 @@ class OrderManager:
                 "items": [{"name": item.name, "quantity": item.quantity, "price": item.price} for item in order.items],
                 "total_price": order.total_price,
                 "status": order.status,
+                "assigned_robot": order.assigned_robot,
                 "created_at": order.created_at,
                 "updated_at": order.updated_at
             })

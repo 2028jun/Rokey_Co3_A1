@@ -8,3 +8,16 @@
 - **Terminal Execution Rules (중요: 두 명령을 동일한 터미널에서 함께 실행금지)**:
   - **아이작심용 터미널**: `export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$HOME/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/exts/isaacsim.ros2.bridge/humble/lib"`
   - **ROS 통신용 터미널**: `source /opt/ros/humble/setup.bash`
+- **ROS build rule**: Do not invoke plain `colcon build` in this workspace. In
+  the restricted execution environment, Python's default
+  `ThreadedChildWatcher` can delay completed colcon child processes by about
+  60 seconds each. Use the workspace wrapper, which selects
+  `PidfdChildWatcher` and falls back to `SafeChildWatcher`, and disable user
+  site packages to avoid the setuptools `--uninstall` error:
+  ```bash
+  source /opt/ros/humble/setup.bash
+  PYTHONNOUSERSITE=1 ./tools/colcon_safe.py build \
+    --packages-up-to <packages...> \
+    --executor sequential \
+    --event-handlers console_start_end+ desktop_notification- status- terminal_title-
+  ```

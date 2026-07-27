@@ -68,6 +68,11 @@ def generate_launch_description():
         param_rewrites=rewrites,
         convert_types=True,
     )
+    # The three Nav2 lifecycle managers must not autostart concurrently. Under
+    # the two-robot Fast DDS load, simultaneous change_state calls can lose the
+    # response after a node has configured successfully, leaving its manager
+    # blocked forever. The sequencer below starts the groups one at a time.
+    managed_autostart = "false"
 
     group = GroupAction([
         PushRosNamespace(namespace),
@@ -92,7 +97,7 @@ def generate_launch_description():
                 "map": LaunchConfiguration("map"),
                 "params_file": navigation_params,
                 "use_sim_time": use_sim_time,
-                "autostart": autostart,
+                "autostart": managed_autostart,
             }.items(),
         ),
         IncludeLaunchDescription(
@@ -103,7 +108,7 @@ def generate_launch_description():
                 "namespace": namespace,
                 "params_file": navigation_params,
                 "use_sim_time": use_sim_time,
-                "autostart": autostart,
+                "autostart": managed_autostart,
             }.items(),
         ),
         Node(
@@ -115,8 +120,17 @@ def generate_launch_description():
         Node(
             package="nav2_lifecycle_manager", executable="lifecycle_manager",
             name="lifecycle_manager_collision_monitor", output="screen",
-            parameters=[{"use_sim_time": use_sim_time}, {"autostart": autostart},
+            # IncludeLaunchDescription arguments are strings, but a directly
+            # constructed ROS parameter must retain its boolean type.
+            parameters=[{"use_sim_time": use_sim_time}, {"autostart": False},
                         {"node_names": ["collision_monitor"]}],
+        ),
+        Node(
+            package="two_wheel_rails",
+            executable="nav2_lifecycle_sequencer",
+            name="nav2_lifecycle_sequencer",
+            output="screen",
+            parameters=[{"use_sim_time": use_sim_time}],
         ),
     ])
 

@@ -4,7 +4,8 @@
 class CommandServingSequence:
     """Run an arbitrary non-empty payload order with safe tray ownership."""
 
-    TRAY_TASK_NAMES = frozenset({"soda1", "soda2", "cutlery"})
+    TRAY_TASK_NAMES = frozenset({"soda1", "soda2", "cutlery", "plate_rack"})
+    SUPPORTED_TASK_NAMES = TRAY_TASK_NAMES | {"pizza"}
 
     def __init__(self, named_tasks):
         self._named_tasks = list(named_tasks)
@@ -13,7 +14,7 @@ class CommandServingSequence:
         names = [name for name, _ in self._named_tasks]
         if len(names) != len(set(names)):
             raise ValueError(f"serving sequence contains duplicate tasks: {names}")
-        unknown = set(names) - self.TRAY_TASK_NAMES - {"pizza"}
+        unknown = set(names) - self.SUPPORTED_TASK_NAMES
         if unknown:
             raise ValueError(f"serving sequence contains unknown tasks: {sorted(unknown)}")
         self._has_pizza = "pizza" in names
@@ -41,6 +42,12 @@ class CommandServingSequence:
             f"[serving-sequence] order={order} mode={mode} (all initialized)",
             flush=True,
         )
+
+    @property
+    def current_name(self):
+        if self.done or self.failed or self._index >= len(self._named_tasks):
+            return None
+        return self._named_tasks[self._index][0]
 
     def step(self, articulation):
         if self.done or self.failed:

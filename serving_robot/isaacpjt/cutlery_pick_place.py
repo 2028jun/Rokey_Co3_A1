@@ -30,13 +30,18 @@ PIZZA_BOARD_THICKNESS = 0.018
 class CutleryBoxPickPlace(SodaCanPickPlace):
     """Move the right-tray cutlery box directly to the table's right side."""
 
-    def __init__(self, stage, wait_for_start=False):
+    def __init__(
+        self, stage, wait_for_start=False, *, payload_root="/World",
+        robot_root=None
+    ):
+        payload_root = str(payload_root).rstrip("/") or "/World"
         super().__init__(
             stage,
             wait_for_start=wait_for_start,
             task_name="cutlery",
-            pick_path=CUTLERY_BOX_PATH,
+            pick_path=f"{payload_root}/ServingCutlery/CutleryBox",
             place_left=False,
+            robot_root=robot_root,
         )
         self._use_bail_detour = False
         self._gripper_close = CUTLERY_GRIPPER_CLOSE
@@ -45,13 +50,16 @@ class CutleryBoxPickPlace(SodaCanPickPlace):
         self._minimum_verified_lift = 0.06
         self._grasp_hold_max_error = 0.030
         self._grasp_object_max_lateral = 0.030
-        self._gripper_close_ramp_steps = 120
+        self._gripper_close_ramp_steps = 60
         # The 60 mm box contacts near 0.54 rad.  Keep only a short 30-frame
         # dwell after the smooth close; the former 0.75-rad/60-frame overdrive
         # pushed the box 25 cm across the tray.
-        self._gripper_close_wait_steps = 150
+        self._gripper_close_wait_steps = 75
         # Downward tool pose yawed 90 degrees so the finger closing direction
         # follows the rotated box's narrow 60 mm dimension.
+        self._canonical_vertical_orientation = (
+            CUTLERY_VERTICAL_ORIENTATION.copy()
+        )
         self._vertical_orientation = CUTLERY_VERTICAL_ORIENTATION.copy()
         # Keep one uninterrupted RMPFlow target stream through descent,
         # gripping and vertical lift.  The phase-1 grasp command is held while

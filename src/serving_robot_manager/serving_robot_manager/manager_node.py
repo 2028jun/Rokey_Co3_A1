@@ -34,6 +34,7 @@ UI가 /manager/order로 주문(테이블 번호, 피자1~3 개수, 음료 개수
 """
 
 import json
+import time
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Optional
@@ -219,6 +220,7 @@ class ManagerNode(Node):
         self._nav_moving_confirmed = False
         self._nav_command_accepted = False
         self._nav_command_epoch = 0
+        self._kitchen_location_since = None
         self._arm_status = None
         self._arm_working_confirmed = False
         self._arm_command_accepted = False
@@ -539,6 +541,7 @@ class ManagerNode(Node):
         self._nav_moving_confirmed = False
         self._nav_command_accepted = False
         self._nav_command_epoch += 1
+        self._kitchen_location_since = None
         command_epoch = self._nav_command_epoch
         expected_state = self._state
         generation = self._task_generation
@@ -801,16 +804,55 @@ class ManagerNode(Node):
         self._return_to_kitchen_for_next_trip()
 
     def _check_kitchen_arrival(self):
-        if (self._state == _State.RETURNING_TO_KITCHEN
-                and self._nav_command_accepted
-                and self._nav_moving_confirmed
-                and self._nav_status == NAV_STATUS_ARRIVED
-                and self._nav_location == NAV_LOCATION_KITCHEN
-                and self._nav_detail_state == 'SUCCEEDED'
-                and self._nav_detail_phase == 'completed'):
+        if self._state != _State.RETURNING_TO_KITCHEN:
+            self._kitchen_location_since = None
+            return
+        if not self._nav_command_accepted:
+            return
+
+        at_kitchen = self._nav_location == NAV_LOCATION_KITCHEN
+        if not at_kitchen:
+            self._kitchen_location_since = None
+            return
+
+        now_mono = time.monotonic()
+        if self._kitchen_location_since is None:
+            self._kitchen_location_since = now_mono
+
+        arrived = self._nav_status == NAV_STATUS_ARRIVED
+        detail_ok = (
+            self._nav_detail_state == 'SUCCEEDED'
+            and self._nav_detail_phase == 'completed'
+        )
+        if self._nav_moving_confirmed and arrived and detail_ok:
+            self._complete_kitchen_arrival(reason='full handshake')
+            return
+        if arrived and detail_ok:
+            self._complete_kitchen_arrival(reason='arrived+detail')
+            return
+        # Isaac already published kitchen location but ROS mission wait stalled
+        # on accepted. Free the robot after a short stable-location window.
+        if now_mono - self._kitchen_location_since >= 3.0:
+            self._complete_kitchen_arrival(
+                reason=(
+                    'soft kitchen arrival '
+                    f'(status={self._nav_status} detail='
+                    f'{self._nav_detail_state}/{self._nav_detail_phase})'
+                )
+            )
+
+    def _complete_kitchen_arrival(self, reason: str = '') -> None:
+        if self._state != _State.RETURNING_TO_KITCHEN:
+            return
+        self._kitchen_location_since = None
+        if reason:
+            self.get_logger().info(
+                f'🏠 [ARRIVED] 주방 대기 위치 도착 확인 완료 ({reason})'
+            )
+        else:
             self.get_logger().info('🏠 [ARRIVED] 주방 대기 위치 도착 확인 완료')
-            self._publish_table_occupancy('clear')
-            self._start_next_trip()
+        self._publish_table_occupancy('clear')
+        self._start_next_trip()
 
     # ------------------------------------------------------------------
     # 음식 스폰 상태 처리

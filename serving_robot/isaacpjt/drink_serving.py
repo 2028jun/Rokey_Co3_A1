@@ -149,9 +149,9 @@ def _author_can_visual(stage, root_path, document, binary, materials):
 
 def _author_dynamic_can(
     stage, index, world_position, world_orientation, document, binary,
-    visual_materials, physics_material
+    visual_materials, physics_material, drinks_root
 ):
-    root_path = f"/World/ServingDrinks/SodaCan_{index:02d}"
+    root_path = f"{drinks_root}/SodaCan_{index:02d}"
     root = UsdGeom.Xform.Define(stage, root_path)
     root.AddTranslateOp().Set(Gf.Vec3d(*map(float, world_position)))
     root.AddOrientOp().Set(
@@ -189,7 +189,9 @@ def _author_dynamic_can(
     return root_path
 
 
-def spawn_soda_cans(stage, count=4):
+def spawn_soda_cans(
+    stage, count=4, *, payload_root="/World", robot_root=None
+):
     """Place the requested delivery cans on the right-front upper tray."""
     if os.environ.get("MOBILE_DEMO_SODA_CANS", "1") != "1":
         print("[drinks] soda cans disabled by MOBILE_DEMO_SODA_CANS=0", flush=True)
@@ -197,7 +199,11 @@ def spawn_soda_cans(stage, count=4):
     if not SODA_CAN_GLB.is_file():
         raise FileNotFoundError(SODA_CAN_GLB)
 
-    tray = find_serving_robot_prim(stage, "upper_tray_right_link")
+    payload_root = str(payload_root).rstrip("/") or "/World"
+    drinks_root = f"{payload_root}/ServingDrinks"
+    tray = find_serving_robot_prim(
+        stage, "upper_tray_right_link", robot_root=robot_root
+    )
     _, tray_orientation, tray_to_world = prim_world_pose(tray)
     document, binary = _read_glb(SODA_CAN_GLB)
     visual_materials = _author_can_materials(stage, document)
@@ -233,6 +239,7 @@ def spawn_soda_cans(stage, count=4):
                 binary,
                 visual_materials,
                 physics_material,
+                drinks_root,
             )
         )
     print(

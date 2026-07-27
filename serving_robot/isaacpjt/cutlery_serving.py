@@ -90,13 +90,13 @@ def _wood_material(stage):
     return material
 
 
-def _author_textured_body(stage, document, binary, material):
+def _author_textured_body(stage, document, binary, material, box_path):
     primitive = document["meshes"][0]["primitives"][0]
     points = _read_accessor(document, binary, primitive["attributes"]["POSITION"])
     normals = _read_accessor(document, binary, primitive["attributes"]["NORMAL"])
     texcoords = _read_accessor(document, binary, primitive["attributes"]["TEXCOORD_0"])
     indices = [value[0] for value in _read_accessor(document, binary, primitive["indices"])]
-    mesh = UsdGeom.Mesh.Define(stage, f"{CUTLERY_BOX_PATH}/VisualBody")
+    mesh = UsdGeom.Mesh.Define(stage, f"{box_path}/VisualBody")
     # The source has a -90-degree X axis correction.  Apply it directly while
     # scaling its unit cube to the exact physical box dimensions.
     mesh.CreatePointsAttr(
@@ -121,20 +121,24 @@ def _author_textured_body(stage, document, binary, material):
     UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(material)
 
 
-def spawn_cutlery_box(stage):
+def spawn_cutlery_box(stage, *, payload_root="/World", robot_root=None):
     """Spawn one closed, graspable cutlery box on the rear right tray."""
     if os.environ.get("MOBILE_DEMO_CUTLERY_BOX", "1") != "1":
         print("[cutlery] disabled by MOBILE_DEMO_CUTLERY_BOX=0", flush=True)
         return None
     if not CUTLERY_BOX_GLB.is_file() or not CUTLERY_WOOD_TEXTURE.is_file():
         raise FileNotFoundError(CUTLERY_BOX_GLB)
-    tray = find_serving_robot_prim(stage, "upper_tray_right_link")
+    payload_root = str(payload_root).rstrip("/") or "/World"
+    box_path = f"{payload_root}/ServingCutlery/CutleryBox"
+    tray = find_serving_robot_prim(
+        stage, "upper_tray_right_link", robot_root=robot_root
+    )
     _, tray_orientation, tray_to_world = prim_world_pose(tray)
     local_z = 0.5 * 0.025 + 0.5 * CUTLERY_BOX_SIZE[2] + 0.001
     world = tray_to_world.Transform(
         Gf.Vec3d(CUTLERY_TRAY_LOCAL[0], CUTLERY_TRAY_LOCAL[1], local_z)
     )
-    root = UsdGeom.Xform.Define(stage, CUTLERY_BOX_PATH)
+    root = UsdGeom.Xform.Define(stage, box_path)
     root.AddTranslateOp().Set(world)
     tray_quaternion = Gf.Quatf(
         float(tray_orientation[0]),
@@ -161,7 +165,7 @@ def spawn_cutlery_box(stage):
         dynamic_friction=0.65,
         restitution=0.0,
     )
-    collider = UsdGeom.Cube.Define(stage, f"{CUTLERY_BOX_PATH}/Collision")
+    collider = UsdGeom.Cube.Define(stage, f"{box_path}/Collision")
     collider.CreateSizeAttr(1.0)
     collider.AddScaleOp().Set(Gf.Vec3f(*CUTLERY_BOX_SIZE))
     collider.CreateVisibilityAttr(UsdGeom.Tokens.invisible)
@@ -177,8 +181,8 @@ def spawn_cutlery_box(stage):
 
     document, binary = _read_glb(CUTLERY_BOX_GLB)
     wood = _wood_material(stage)
-    _author_textured_body(stage, document, binary, wood)
-    lid = UsdGeom.Cube.Define(stage, f"{CUTLERY_BOX_PATH}/Lid")
+    _author_textured_body(stage, document, binary, wood, box_path)
+    lid = UsdGeom.Cube.Define(stage, f"{box_path}/Lid")
     lid.CreateSizeAttr(1.0)
     lid.AddTranslateOp().Set(
         Gf.Vec3d(0.0, 0.0, 0.5 * CUTLERY_BODY_HEIGHT)
@@ -187,7 +191,7 @@ def spawn_cutlery_box(stage):
         Gf.Vec3f(CUTLERY_BOX_SIZE[0], CUTLERY_BOX_SIZE[1], CUTLERY_LID_HEIGHT)
     )
     UsdShade.MaterialBindingAPI.Apply(lid.GetPrim()).Bind(wood)
-    seam = UsdGeom.Cube.Define(stage, f"{CUTLERY_BOX_PATH}/LidSeam")
+    seam = UsdGeom.Cube.Define(stage, f"{box_path}/LidSeam")
     seam.CreateSizeAttr(1.0)
     seam.AddTranslateOp().Set(
         Gf.Vec3d(0.0, 0.0, 0.5 * CUTLERY_BODY_HEIGHT - 0.001)
@@ -202,9 +206,9 @@ def spawn_cutlery_box(stage):
     seam.CreateDisplayColorAttr([Gf.Vec3f(0.18, 0.08, 0.025)])
     print(
         "[cutlery] spawned closed wooden box "
-        f"path={CUTLERY_BOX_PATH} size={CUTLERY_BOX_SIZE}m "
+        f"path={box_path} size={CUTLERY_BOX_SIZE}m "
         f"mass={CUTLERY_BOX_MASS:.2f}kg tray_local={CUTLERY_TRAY_LOCAL} "
         "orientation=flat-long-X",
         flush=True,
     )
-    return CUTLERY_BOX_PATH
+    return box_path

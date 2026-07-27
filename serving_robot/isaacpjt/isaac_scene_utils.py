@@ -4,16 +4,23 @@ import numpy as np
 from pxr import UsdGeom
 
 
-def find_serving_robot_prim(stage, name):
-    """Return one named prim below the serving robot hierarchy."""
+def find_serving_robot_prim(stage, name, robot_root=None):
+    """Return one named prim below the selected serving robot hierarchy."""
+    if robot_root:
+        prefixes = (f"{str(robot_root).rstrip('/')}/",)
+    else:
+        prefixes = ("/World/ServingRobot", "/World/NavRobot")
     matches = [
         prim
         for prim in stage.Traverse()
         if prim.GetName() == name
-        and (str(prim.GetPath()).startswith("/World/ServingRobot") or str(prim.GetPath()).startswith("/World/NavRobot"))
+        and str(prim.GetPath()).startswith(prefixes)
     ]
     if len(matches) != 1:
-        raise RuntimeError(f"expected one serving-robot {name}, got {matches}")
+        scope = robot_root or "legacy serving-robot roots"
+        raise RuntimeError(
+            f"expected one serving-robot {name} below {scope}, got {matches}"
+        )
     return matches[0]
 
 

@@ -65,6 +65,12 @@ class HMIBridgeNode(Node):
         self.last_robot_status_recv_time = 0.0
         self.robot_connected = False
         self._robot_status_codes = {"robot1": None, "robot2": None}
+        # Orders may arrive while the sequential multi-robot startup is still
+        # bringing up robot2 and the fleet manager.  Keep them pending instead
+        # of turning a temporary service outage / busy fleet into CANCELLED.
+        self._pending_manager_orders = {}
+        self._manager_order_inflight = set()
+        self._manager_order_retry_after = {}
         self._robot_status_labels = {
             0: "IDLE",
             1: "RETURNING TO KITCHEN",
@@ -375,6 +381,31 @@ class HMIBridgeNode(Node):
                 f"📡 [HMI Backend] {robot_name} status={code} -> DRIVE MODE LIVE",
                 flush=True,
             )
+        order = order_manager.active_order_for_robot(robot_name)
+        if order is not None:
+            self._apply_order_status_code(order.order_id, code)
+
+    def _apply_order_status_code(self, order_id: str, status_code: int) -> None:
+        """Apply one worker's status only to the order assigned to it."""
+        if status_code == 1:
+            # Returning is still part of the current delivery lifecycle.
+            order_manager.update_status(order_id, OrderStatus.SERVING)
+            self.parking_brake = False
+        elif status_code == 2:
+            order_manager.update_status(order_id, OrderStatus.PICKING_UP)
+            self.parking_brake = True
+        elif status_code == 3:
+            order_manager.update_status(order_id, OrderStatus.NAVIGATING)
+            self.parking_brake = False
+        elif status_code in (4, 5):
+            order_manager.update_status(order_id, OrderStatus.SERVING)
+            self.parking_brake = True
+        elif status_code == 6:
+            order_manager.update_status(order_id, OrderStatus.COMPLETED)
+            self.parking_brake = True
+        elif status_code == 7:
+            order_manager.update_status(order_id, OrderStatus.CANCELLED)
+            self.parking_brake = True
 
     def fleet_robot_snapshot(self) -> dict:
         snapshot = {}
@@ -406,23 +437,9 @@ class HMIBridgeNode(Node):
             self.drive_mode = "LIVE"
             print(f"📡 [HMI Backend] Manager Status Received ({self.robot_state}) -> DRIVE MODE AUTO SWITCHED TO LIVE!", flush=True)
 
-        active_id = order_manager.active_order_id
-        if active_id:
-            if status_code in (1, 2):
-                order_manager.update_status(active_id, OrderStatus.PICKING_UP)
-                self.parking_brake = False
-            elif status_code == 3:
-                order_manager.update_status(active_id, OrderStatus.NAVIGATING)
-                self.parking_brake = False
-            elif status_code in (4, 5):
-                order_manager.update_status(active_id, OrderStatus.SERVING)
-                self.parking_brake = True
-            elif status_code == 6:
-                order_manager.update_status(active_id, OrderStatus.COMPLETED)
-                self.parking_brake = True
-            elif status_code == 7:
-                order_manager.update_status(active_id, OrderStatus.CANCELLED)
-                self.parking_brake = True
+        # /system/status is an aggregate fleet status and cannot identify the
+        # owning order. Order progression is handled by the namespaced worker
+        # callbacks above, otherwise robot1 can overwrite robot2's order.
 
     def order_cancelled_callback(self, msg: Int32):
         hmi_table_number = int(msg.data) + 1
@@ -440,8 +457,6 @@ class HMIBridgeNode(Node):
     ):
         if not ORDER_REQUEST_SRV_AVAILABLE or not hasattr(self, 'manager_order_client'):
             return False, "OrderRequest srv not loaded"
-        if not self.manager_order_client.service_is_ready():
-            return False, "Manager /manager/order service not ready"
 
         pizza1, pizza2, pizza3, drink, cutlery, plate = 0, 0, 0, 0, 0, 0
         for item in items:
@@ -491,25 +506,55 @@ class HMIBridgeNode(Node):
         req.plate_count = plate
         req.preferred_robot = preferred
 
+        self._pending_manager_orders[order_id] = req
+        self._manager_order_retry_after[order_id] = 0.0
+        if not self.manager_order_client.service_is_ready():
+            self.get_logger().warning(
+                f"HMI order {order_id} queued: /manager/order is not ready yet"
+            )
+            return True, "Order queued until fleet manager is ready"
+
+        self._dispatch_pending_manager_order(order_id)
+        return True, "Order dispatched to Manager via /manager/order"
+
+    def _dispatch_pending_manager_order(self, order_id: str) -> None:
+        req = self._pending_manager_orders.get(order_id)
+        if req is None or order_id in self._manager_order_inflight:
+            return
+        if not self.manager_order_client.service_is_ready():
+            return
+
         print(
             "🚀 [HMI Backend] Sending OrderRequest to Manager: "
-            f"HMI Table={hmi_table_number} -> route_id={manager_table_id}, "
-            f"preferred={preferred or 'auto'}, "
-            f"P1={pizza1}, P2={pizza2}, P3={pizza3}, "
-            f"Drink={drink}, Cutlery={cutlery}, Plate={plate}",
+            f"order={order_id}, route_id={req.table_id}, "
+            f"preferred={req.preferred_robot or 'auto'}, "
+            f"P1={req.pizza1_count}, P2={req.pizza2_count}, "
+            f"P3={req.pizza3_count}, Drink={req.drink_count}, "
+            f"Cutlery={req.cutlery_count}, Plate={req.plate_count}",
             flush=True,
         )
+        self._manager_order_inflight.add(order_id)
         future = self.manager_order_client.call_async(req)
         future.add_done_callback(
             lambda completed, oid=order_id: self._on_manager_order_response(oid, completed)
         )
-        return True, "Order dispatched to Manager via /manager/order"
 
     def _on_manager_order_response(self, order_id, future):
+        self._manager_order_inflight.discard(order_id)
         try:
             response = future.result()
             if response is not None and response.success:
                 assigned = getattr(response, "assigned_robot", "") or ""
+                self._pending_manager_orders.pop(order_id, None)
+                self._manager_order_retry_after.pop(order_id, None)
+                order_manager.assign_robot(order_id, assigned)
+                # Acceptance itself means the order is no longer pending. Use
+                # the latest latched worker state to catch status messages that
+                # arrived just before the service response.
+                order_manager.update_status(order_id, OrderStatus.PICKING_UP)
+                worker_code = self._robot_status_codes.get(assigned)
+                if worker_code is not None:
+                    self._apply_order_status_code(order_id, int(worker_code))
                 self.get_logger().info(
                     f"Manager accepted HMI order {order_id}"
                     + (f" -> {assigned}" if assigned else "")
@@ -519,8 +564,12 @@ class HMIBridgeNode(Node):
         except Exception as exc:
             reason = f"service call failed: {exc}"
 
-        order_manager.update_status(order_id, OrderStatus.CANCELLED)
-        self.get_logger().error(f"HMI order {order_id} cancelled: {reason}")
+        # Rejection commonly means both workers are temporarily occupied.
+        # Preserve the order and retry instead of reporting a false cancel.
+        self._manager_order_retry_after[order_id] = time.monotonic() + 1.0
+        self.get_logger().warning(
+            f"HMI order {order_id} remains pending: {reason}; retrying"
+        )
 
     def reset_manager_fault(self):
         if hasattr(self, 'manager_reset_client') and self.manager_reset_client.service_is_ready():
@@ -538,6 +587,14 @@ class HMIBridgeNode(Node):
         # Robot status liveness check
         if now - self.last_robot_status_recv_time > 3.0:
             self.robot_connected = False
+
+        if (hasattr(self, 'manager_order_client')
+                and self.manager_order_client.service_is_ready()):
+            monotonic_now = time.monotonic()
+            for order_id in list(self._pending_manager_orders):
+                retry_after = self._manager_order_retry_after.get(order_id, 0.0)
+                if monotonic_now >= retry_after:
+                    self._dispatch_pending_manager_order(order_id)
             
         # Run Mock Navigation Engine unconditionally when drive_mode == 'MOCK'
         if self.drive_mode == "MOCK" and order_manager.active_order_id:

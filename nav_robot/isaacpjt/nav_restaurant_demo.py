@@ -524,11 +524,71 @@ def attach_front_rplidar_ros2(stage):
 
 
 def add_parking_brake(stage, articulation_path):
-    pass
+    """Fix one robot articulation at its current world pose during serving."""
+    articulation_path = str(articulation_path).rstrip("/")
+    articulation_prim = stage.GetPrimAtPath(articulation_path)
+    if not articulation_prim.IsValid():
+        raise RuntimeError(
+            f"parking brake articulation is missing: {articulation_path}"
+        )
+
+    # Keep the joint below the owning robot root so two NavBridge instances
+    # cannot overwrite or remove each other's parking brake.
+    robot_root = (
+        articulation_path.split("/Robot/", 1)[0]
+        if "/Robot/" in articulation_path
+        else articulation_path.rsplit("/", 1)[0]
+    )
+    brake_path = f"{robot_root}/ParkingBrake"
+    if stage.GetPrimAtPath(brake_path).IsValid():
+        stage.RemovePrim(brake_path)
+
+    transform = UsdGeom.XformCache().GetLocalToWorldTransform(
+        articulation_prim
+    )
+    position = transform.ExtractTranslation()
+    rotation = transform.ExtractRotationQuat()
+    imaginary = rotation.GetImaginary()
+
+    joint = UsdPhysics.FixedJoint.Define(stage, brake_path)
+    joint.CreateBody1Rel().SetTargets([Sdf.Path(articulation_path)])
+    joint.CreateLocalPos0Attr().Set(Gf.Vec3f(*map(float, position)))
+    joint.CreateLocalRot0Attr().Set(
+        Gf.Quatf(
+            float(rotation.GetReal()),
+            Gf.Vec3f(*map(float, imaginary)),
+        )
+    )
+    joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+    joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    print(
+        f"[parking-brake] locked robot={robot_root} "
+        f"pose=({position[0]:.3f},{position[1]:.3f})",
+        flush=True,
+    )
+    return brake_path
 
 
-def remove_parking_brake(stage):
-    pass
+def remove_parking_brake(stage, articulation_path=None):
+    """Remove one robot brake, or all legacy brakes when no robot is given."""
+    if articulation_path is not None:
+        articulation_path = str(articulation_path).rstrip("/")
+        robot_root = (
+            articulation_path.split("/Robot/", 1)[0]
+            if "/Robot/" in articulation_path
+            else articulation_path.rsplit("/", 1)[0]
+        )
+        brake_paths = [f"{robot_root}/ParkingBrake"]
+    else:
+        brake_paths = [
+            str(prim.GetPath())
+            for prim in stage.Traverse()
+            if prim.GetName() == "ParkingBrake"
+        ]
+    for brake_path in brake_paths:
+        if stage.GetPrimAtPath(brake_path).IsValid():
+            stage.RemovePrim(brake_path)
+            print(f"[parking-brake] released path={brake_path}", flush=True)
 
 
 def open_restaurant_and_robot(open_stage: bool = True):
@@ -604,16 +664,31 @@ def configure_joint_drives(stage):
 
 
 def configure_physics_stability(stage, articulation_path: str):
-    """CPU PhysX + base damping — ported from serving_robot mobile demo."""
+    """Configure stable 60 Hz PhysX, with GPU dynamics as an opt-in test."""
     scene_prim = stage.GetPrimAtPath("/World/PhysicsScene")
     if not scene_prim.IsValid():
         raise RuntimeError("restaurant PhysicsScene is missing")
     physx_scene = PhysxSchema.PhysxSceneAPI.Apply(scene_prim)
     physx_scene.CreateEnableStabilizationAttr(True)
-    # Kitchen has many legacy triangle-mesh colliders; CPU PhysX is more robust.
-    physx_scene.CreateEnableGPUDynamicsAttr(False)
-    physx_scene.CreateBroadphaseTypeAttr("MBP")
-    physx_scene.CreateTimeStepsPerSecondAttr(120)
+    use_gpu_physics = os.environ.get("NAV_ROBOT_GPU_PHYSX", "0") == "1"
+    if use_gpu_physics:
+        # Isaac Sim 5.1 requires the GPU broadphase together with GPU dynamics.
+        # CCD is unsupported by that pipeline. Keep this opt-in because this
+        # restaurant contains legacy triangle-mesh colliders that have been
+        # more stable with CPU PhysX/MBP.
+        physx_scene.CreateEnableCCDAttr(False)
+        physx_scene.CreateBroadphaseTypeAttr("GPU")
+        physx_scene.CreateEnableGPUDynamicsAttr(True)
+        physics_label = "GPU/GPU-broadphase"
+    else:
+        physx_scene.CreateEnableGPUDynamicsAttr(False)
+        physx_scene.CreateBroadphaseTypeAttr("MBP")
+        physics_label = "CPU/MBP"
+    # Two complete mobile manipulators, cameras and LiDARs cannot reliably
+    # sustain the former CPU PhysX 120 Hz budget in real time.  The serving
+    # controllers already use a 60 Hz control period, so matching PhysX to
+    # 60 Hz restores wall-clock speed without changing commanded velocities.
+    physx_scene.CreateTimeStepsPerSecondAttr(60)
 
     articulation_api = PhysxSchema.PhysxArticulationAPI.Apply(
         stage.GetPrimAtPath(articulation_path)
@@ -623,7 +698,8 @@ def configure_physics_stability(stage, articulation_path: str):
     articulation_api.CreateStabilizationThresholdAttr(0.01)
     articulation_api.CreateSleepThresholdAttr(0.05)
     print(
-        "[nav_robot] physics=CPU/120Hz stabilization=on solver=32/4",
+        f"[nav_robot] physics={physics_label}/60Hz "
+        "stabilization=on solver=32/4",
         flush=True,
     )
 
@@ -1229,6 +1305,26 @@ class NavBridge(Node):
         self.stage = stage
         self.robot_name = robot_name
         self.robot_root = robot_root
+        self.payload_root = (
+            f"/World/RobotPayloads/{robot_name}"
+            if robot_name
+            else "/World"
+        )
+        self.delivered_root = (
+            f"/World/Delivered/{robot_name}"
+            if robot_name
+            else "/World/Delivered"
+        )
+        if self.stage is not None and self.robot_name:
+            UsdGeom.Scope.Define(self.stage, "/World/RobotPayloads")
+            UsdGeom.Scope.Define(self.stage, self.payload_root)
+            UsdGeom.Scope.Define(self.stage, "/World/Delivered")
+            UsdGeom.Scope.Define(self.stage, self.delivered_root)
+        self.get_logger().info(
+            f"payload isolation robot={self.robot_name or 'default'} "
+            f"payload_root={self.payload_root} "
+            f"delivered_root={self.delivered_root}"
+        )
         self.wheel_indices = np.asarray(
             [dof_names.index(name) for name in WHEEL_JOINTS], dtype=np.int32
         )
@@ -1265,6 +1361,7 @@ class NavBridge(Node):
         self._active_two_wheel_mission_id = ""
         self._active_two_wheel_target = None
         self._active_two_wheel_goal = None
+        self._completed_mission_latch = None
         self._navigation_paused = False
         self._navigation_pause_started = None
         self._navigation_location = 4
@@ -1475,9 +1572,12 @@ class NavBridge(Node):
         if table_id not in (0, 1, 2, 3):
             return False
         trip_number = self._delivered_trip_counts.get(table_id, 0) + 1
-        archive_root = f"/World/Delivered/Table{table_id}/Trip{trip_number}"
+        table_root = f"{self.delivered_root}/Table{table_id}"
+        archive_root = f"{table_root}/Trip{trip_number}"
         UsdGeom.Scope.Define(self.stage, "/World/Delivered")
-        UsdGeom.Scope.Define(self.stage, f"/World/Delivered/Table{table_id}")
+        if self.robot_name:
+            UsdGeom.Scope.Define(self.stage, self.delivered_root)
+        UsdGeom.Scope.Define(self.stage, table_root)
         UsdGeom.Scope.Define(self.stage, archive_root)
         root_layer = self.stage.GetRootLayer()
         for source_path in payload_paths:
@@ -1723,8 +1823,14 @@ class NavBridge(Node):
                 if not busy:
                     self._active_two_wheel_mission_id = mission_id
                     self._active_two_wheel_target = None
+                    self._completed_mission_latch = None
                     self._navigation_paused = False
                     self._navigation_pause_started = None
+                    self._obstacle_stop = False
+                    self._obstacle_stop_started = None
+                    self._obstacle_stop_from_peer = False
+                    self._clearance_start = None
+                    self._obstacle_scale = 1.0
                     self._direct_nav = dict(
                         mode="park_out",
                         target=None,
@@ -1789,6 +1895,7 @@ class NavBridge(Node):
 
         self._active_two_wheel_mission_id = mission_id
         self._active_two_wheel_target = target
+        self._completed_mission_latch = None
         # A fresh mission must not inherit a stale path-yield pause.
         self._navigation_paused = False
         self._navigation_pause_started = None
@@ -2589,6 +2696,14 @@ class NavBridge(Node):
             self.navigation_location_pub.publish(Int32(data=target))
             if self._active_two_wheel_mission_id:
                 mission_id = self._active_two_wheel_mission_id
+                # Keep completed status warm so ROS wait loops cannot miss the
+                # first burst and remain stuck on state=accepted.
+                self._completed_mission_latch = {
+                    "mission_id": mission_id,
+                    "target": target,
+                    "until": time.monotonic() + 12.0,
+                    "last_pub": 0.0,
+                }
                 for _ in range(5):
                     self._publish_two_wheel_mission_status(
                         "completed", "completed", target=target,
@@ -2629,38 +2744,22 @@ class NavBridge(Node):
         if mission is None:
             return None
         if self._navigation_paused or self._obstacle_stop:
-            # Legacy peer-stop must never freeze motion — clear and continue.
+            # Legacy peer-stop must never freeze motion - clear and continue.
             if self._obstacle_stop and self._obstacle_stop_from_peer:
                 self._finish_obstacle_stop(float("inf"))
+            # Table park-out must reverse even if the dock furniture / peer /
+            # person polygon trips a stop. Freezing here left phase=
+            # park_out_backoff until ROS timed out -> manager sticky FAILED ->
+            # HMI cancelled the other robot's order.
+            if mission.get("mode") == "park_out":
+                if self._obstacle_stop:
+                    self._finish_obstacle_stop(float("inf"))
+                if self._navigation_paused:
+                    self._navigation_paused = False
+                    self._navigation_pause_started = None
             elif self._navigation_paused or self._obstacle_stop:
-                # Paused/blocked park-out used to wedge forever because the
-                # timeout check lived below this early return. Fail fast so the
-                # peer is not held by a sticky parking_out fleet intent.
-                if mission.get("mode") == "park_out":
-                    now = time.monotonic()
-                    wall = float(mission.get("wall_start", mission.get("stage_start", now)))
-                    if now - wall > 40.0:
-                        self._finish_park_out(
-                            False,
-                            "park_out blocked timeout "
-                            f"(paused={self._navigation_paused} "
-                            f"obstacle={self._obstacle_stop})",
-                        )
-                        return 0.0, 0.0
-                    if (
-                        mission.get("phase") == "align_opposite"
-                        and not self._obstacle_stop
-                    ):
-                        yaw_error = self._angle_error(mission["target_yaw"], yaw)
-                        if abs(yaw_error) < math.radians(2.5):
-                            self._finish_park_out(True)
-                            return 0.0, 0.0
-                        wz = float(np.clip(1.8 * yaw_error, -0.65, 0.65))
-                        if abs(wz) < 0.18:
-                            wz = math.copysign(0.18, yaw_error)
-                        return 0.0, wz
                 if (
-                    mission.get("mode") not in ("park_out", "legacy_table")
+                    mission.get("mode") not in ("legacy_table",)
                     and not self._obstacle_stop
                 ):
                     stages = mission.get("stages") or []
@@ -2713,9 +2812,14 @@ class NavBridge(Node):
                 remaining = mission["distance"] - progress
                 yaw_error = self._angle_error(start_yaw, yaw)
                 done = remaining <= 0.025
+                if not done:
+                    if progress >= 0.22 and now - mission["stage_start"] > 5.0:
+                        done = True
+                    elif progress >= 0.12 and now - mission["stage_start"] > 10.0:
+                        done = True
                 vx = 0.0 if done else -min(
                     mission["speed"],
-                    max(0.045, remaining * 0.8),
+                    max(0.06, remaining * 0.8),
                 )
                 wz = 0.0 if done else float(
                     np.clip(1.6 * yaw_error, -0.25, 0.25)
@@ -2725,7 +2829,7 @@ class NavBridge(Node):
                     f"yaw_error={math.degrees(yaw_error):.1f}deg"
                 )
                 timeout = max(
-                    12.0,
+                    14.0,
                     mission["distance"] / max(mission["speed"], 0.05) + 8.0,
                 )
                 if done:
@@ -2739,24 +2843,29 @@ class NavBridge(Node):
 
             else:
                 yaw_error = self._angle_error(mission["target_yaw"], yaw)
-                done = abs(yaw_error) < math.radians(2.5)
-                if (
-                    not done
-                    and now - mission["stage_start"] > 8.0
-                    and abs(yaw_error) < math.radians(10.0)
-                ):
-                    done = True
+                done = abs(yaw_error) < math.radians(8.0)
+                if not done:
+                    if (
+                        now - mission["stage_start"] > 3.0
+                        and abs(yaw_error) < math.radians(20.0)
+                    ):
+                        done = True
+                    elif (
+                        now - mission["stage_start"] > 8.0
+                        and abs(yaw_error) < math.radians(35.0)
+                    ):
+                        done = True
                 vx = 0.0
                 wz = 0.0
                 if not done:
-                    wz = float(np.clip(2.2 * yaw_error, -0.80, 0.80))
-                    if abs(wz) < 0.22:
-                        wz = math.copysign(0.22, yaw_error)
+                    wz = float(np.clip(2.4 * yaw_error, -0.90, 0.90))
+                    if abs(wz) < 0.30:
+                        wz = math.copysign(0.30, yaw_error)
                 detail = (
                     f"target_yaw={math.degrees(mission['target_yaw']):.1f}deg "
                     f"yaw_error={math.degrees(yaw_error):.1f}deg"
                 )
-                timeout = 35.0
+                timeout = 20.0
                 if done:
                     self._finish_park_out(True)
                     return 0.0, 0.0
@@ -2770,6 +2879,28 @@ class NavBridge(Node):
                 )
 
             if now - mission["stage_start"] > timeout:
+                if phase == "backoff":
+                    start_yaw = mission["start_yaw"]
+                    dx = x - mission["start_x"]
+                    dy = y - mission["start_y"]
+                    progress = -(
+                        dx * math.cos(start_yaw)
+                        + dy * math.sin(start_yaw)
+                    )
+                    if progress >= 0.15:
+                        mission["phase"] = "align_opposite"
+                        mission["stage_start"] = now
+                        mission["last_log"] = 0.0
+                        self.get_logger().warning(
+                            "park-out reverse soft-complete after timeout; "
+                            f"{detail}"
+                        )
+                        return 0.0, 0.0
+                if phase == "align_opposite":
+                    self._finish_park_out(
+                        True, f"align soft-complete; {detail}"
+                    )
+                    return 0.0, 0.0
                 self._finish_park_out(
                     False, f"{mission['phase']} timeout; {detail}"
                 )
@@ -3183,25 +3314,34 @@ class NavBridge(Node):
                 # Preserve the completed trip as visual-only USD geometry.
                 # Live payload physics remains at stable paths and is reused;
                 # deleting or moving it invalidates Isaac's tensor views.
-                payload_paths = (
-                    "/World/ServingDish",
-                    "/World/PizzaBoardBail",
-                    "/World/PizzaBoardBailHinge",
-                    "/World/PizzaBoardGripBearing",
-                    "/World/PizzaBoardGripBlock",
-                    "/World/ServingDrinks",
-                    "/World/ServingCutlery",
-                    "/World/ServingPlateRack",
+                payload_paths = tuple(
+                    f"{self.payload_root}/{name}"
+                    for name in (
+                        "ServingDish",
+                        "PizzaBoardBail",
+                        "PizzaBoardBailHinge",
+                        "PizzaBoardGripBearing",
+                        "PizzaBoardGripBlock",
+                        "ServingDrinks",
+                        "ServingCutlery",
+                        "ServingPlateRack",
+                    )
                 )
                 reused_payload_paths = set()
                 if pizza_requested:
                     reused_payload_paths.update(payload_paths[:5])
                 if drink_count:
-                    reused_payload_paths.add("/World/ServingDrinks")
+                    reused_payload_paths.add(
+                        f"{self.payload_root}/ServingDrinks"
+                    )
                 if cutlery_requested:
-                    reused_payload_paths.add("/World/ServingCutlery")
+                    reused_payload_paths.add(
+                        f"{self.payload_root}/ServingCutlery"
+                    )
                 if plate_rack_requested:
-                    reused_payload_paths.add("/World/ServingPlateRack")
+                    reused_payload_paths.add(
+                        f"{self.payload_root}/ServingPlateRack"
+                    )
                 existing_payloads = [
                     path
                     for path in payload_paths
@@ -3228,15 +3368,29 @@ class NavBridge(Node):
                             xformable.ClearXformOpOrder()
                 self._spawned_serving_tasks = {}
                 if drink_count and 'spawn_soda_cans' in globals():
-                    spawn_soda_cans(self.stage, count=drink_count)
+                    spawn_soda_cans(
+                        self.stage,
+                        count=drink_count,
+                        payload_root=self.payload_root,
+                        robot_root=self.robot_root,
+                    )
                 if cutlery_requested and 'spawn_cutlery_box' in globals():
-                    spawn_cutlery_box(self.stage)
+                    spawn_cutlery_box(
+                        self.stage,
+                        payload_root=self.payload_root,
+                        robot_root=self.robot_root,
+                    )
                 if plate_rack_requested and 'spawn_plate_rack' in globals():
-                    spawn_plate_rack(self.stage, plate_count=plate_count)
+                    spawn_plate_rack(
+                        self.stage,
+                        plate_count=plate_count,
+                        payload_root=self.payload_root,
+                        robot_root=self.robot_root,
+                    )
                     self._plate_rack_in_transport = True
                     self._pending_plate_count = plate_count
                     rack_prim = self.stage.GetPrimAtPath(
-                        "/World/ServingPlateRack"
+                        f"{self.payload_root}/ServingPlateRack"
                     )
                     visible_plates = [
                         str(prim.GetPath())
@@ -3254,11 +3408,17 @@ class NavBridge(Node):
                     # Constructor authors the physical dish at the kitchen.
                     # Keep this exact object for delivery: constructing it a
                     # second time would re-author the same USD prim hierarchy.
-                    pizza_task = TrayPizzaPickPlace(self.stage)
+                    pizza_task = TrayPizzaPickPlace(
+                        self.stage,
+                        payload_root=self.payload_root,
+                        robot_root=self.robot_root,
+                    )
                     self._spawned_serving_tasks = {
                         "pizza": pizza_task,
                     }
-                    dish_prim = self.stage.GetPrimAtPath("/World/ServingDish")
+                    dish_prim = self.stage.GetPrimAtPath(
+                        f"{self.payload_root}/ServingDish"
+                    )
                     if dish_prim.IsValid():
                         dish_body = UsdPhysics.RigidBodyAPI.Get(self.stage, dish_prim.GetPath())
                         if dish_body:
@@ -3268,14 +3428,21 @@ class NavBridge(Node):
                             )
                 # Verify required prims exist on Stage for requested items
                 missing_prims = []
-                if pizza_requested and not self.stage.GetPrimAtPath("/World/ServingDish").IsValid():
-                    missing_prims.append("/World/ServingDish")
-                if drink_count and not self.stage.GetPrimAtPath("/World/ServingDrinks").IsValid():
-                    missing_prims.append("/World/ServingDrinks")
-                if cutlery_requested and not self.stage.GetPrimAtPath("/World/ServingCutlery").IsValid():
-                    missing_prims.append("/World/ServingCutlery")
-                if plate_rack_requested and not self.stage.GetPrimAtPath("/World/ServingPlateRack").IsValid():
-                    missing_prims.append("/World/ServingPlateRack")
+                required_roots = {
+                    "pizza": f"{self.payload_root}/ServingDish",
+                    "drinks": f"{self.payload_root}/ServingDrinks",
+                    "cutlery": f"{self.payload_root}/ServingCutlery",
+                    "plates": f"{self.payload_root}/ServingPlateRack",
+                }
+                requested_roots = (
+                    [("pizza", pizza_requested), ("drinks", drink_count > 0),
+                     ("cutlery", cutlery_requested),
+                     ("plates", plate_rack_requested)]
+                )
+                for label, requested in requested_roots:
+                    path = required_roots[label]
+                    if requested and not self.stage.GetPrimAtPath(path).IsValid():
+                        missing_prims.append(path)
 
                 if missing_prims:
                     raise RuntimeError(f"Food spawn missing required prims on Stage: {missing_prims}")
@@ -3316,24 +3483,33 @@ class NavBridge(Node):
                 if drink_count >= 1:
                     named_tasks.append(
                         ("soda1", Soda1PickPlace(
-                            self.stage, wait_for_start=bool(named_tasks)
+                            self.stage,
+                            wait_for_start=bool(named_tasks),
+                            payload_root=self.payload_root,
+                            robot_root=self.robot_root,
                         ))
                     )
                 if drink_count >= 2:
                     named_tasks.append(
                         ("soda2", Soda2PickPlace(
-                            self.stage, wait_for_start=bool(named_tasks)
+                            self.stage,
+                            wait_for_start=bool(named_tasks),
+                            payload_root=self.payload_root,
+                            robot_root=self.robot_root,
                         ))
                     )
                 if cutlery_requested:
                     named_tasks.append(
                         ("cutlery", CutleryBoxPickPlace(
-                            self.stage, wait_for_start=bool(named_tasks)
+                            self.stage,
+                            wait_for_start=bool(named_tasks),
+                            payload_root=self.payload_root,
+                            robot_root=self.robot_root,
                         ))
                     )
                 if plate_rack_requested:
                     rack_prim = self.stage.GetPrimAtPath(
-                        "/World/ServingPlateRack"
+                        f"{self.payload_root}/ServingPlateRack"
                     )
                     visible_plate_count = 0
                     if rack_prim.IsValid():
@@ -3357,14 +3533,20 @@ class NavBridge(Node):
                         spawn_plate_rack(
                             self.stage,
                             plate_count=self._pending_plate_count,
+                            payload_root=self.payload_root,
+                            robot_root=self.robot_root,
                         )
-                        if not follow_plate_rack_transport(self.stage):
+                        if not follow_plate_rack_transport(
+                            self.stage,
+                            payload_root=self.payload_root,
+                            robot_root=self.robot_root,
+                        ):
                             raise RuntimeError(
                                 "plate rack recovery spawn could not be placed "
                                 "on the left tray"
                             )
                         rack_prim = self.stage.GetPrimAtPath(
-                            "/World/ServingPlateRack"
+                            f"{self.payload_root}/ServingPlateRack"
                         )
                     self.get_logger().info(
                         "[PlateRack] arm preflight passed "
@@ -3373,7 +3555,10 @@ class NavBridge(Node):
                     )
                     named_tasks.append(
                         ("plate_rack", PlateRackPickPlace(
-                            self.stage, wait_for_start=bool(named_tasks)
+                            self.stage,
+                            wait_for_start=bool(named_tasks),
+                            payload_root=self.payload_root,
+                            robot_root=self.robot_root,
                         ))
                     )
                 if not named_tasks:
@@ -3390,7 +3575,7 @@ class NavBridge(Node):
                 self.get_logger().error(
                     f"integrated serving initialization failed: {exc}"
                 )
-                remove_parking_brake(self.stage)
+                remove_parking_brake(self.stage, self.articulation.prim_path)
                 self.arm_status_pub.publish(Int32(data=3))
 
         if (
@@ -3401,7 +3586,11 @@ class NavBridge(Node):
                 or self._active_serving_task.current_name != "plate_rack"
             )
         ):
-            if not follow_plate_rack_transport(self.stage):
+            if not follow_plate_rack_transport(
+                self.stage,
+                payload_root=self.payload_root,
+                robot_root=self.robot_root,
+            ):
                 self.get_logger().error(
                     "[plate-rack] transport follow failed during navigation"
                 )
@@ -3426,7 +3615,7 @@ class NavBridge(Node):
                 self._active_serving_task.close()
                 self._active_serving_task = None
                 self._active_delivery_table = None
-                remove_parking_brake(self.stage)
+                remove_parking_brake(self.stage, self.articulation.prim_path)
                 self.arm_status_pub.publish(Int32(data=3))
                 self.get_logger().error("[integrated-serving] delivery failed")
             elif self._active_serving_task.done:
@@ -3530,7 +3719,7 @@ class NavBridge(Node):
                 self._arm_stow_command = None
                 self._arm_stow_last_update = None
                 self._arm_stow_last_log = None
-                remove_parking_brake(self.stage)
+                remove_parking_brake(self.stage, self.articulation.prim_path)
                 self.arm_status_pub.publish(Int32(data=3))
                 self.get_logger().error(
                     "[integrated-serving] arm failed to reach stow within 30s"
@@ -3583,7 +3772,7 @@ class NavBridge(Node):
                 self._tray_home_step = 0
                 self._completed_delivery_table = self._active_delivery_table
                 self._active_delivery_table = None
-                remove_parking_brake(self.stage)
+                remove_parking_brake(self.stage, self.articulation.prim_path)
                 self.arm_status_pub.publish(Int32(data=2))
                 self.get_logger().info(
                     "[integrated-serving] trays retracted; delivery complete"
@@ -3597,7 +3786,7 @@ class NavBridge(Node):
                 self._tray_home_start = None
                 self._tray_home_step = 0
                 self._active_delivery_table = None
-                remove_parking_brake(self.stage)
+                remove_parking_brake(self.stage, self.articulation.prim_path)
                 self.arm_status_pub.publish(Int32(data=3))
                 self.get_logger().error(
                     "[integrated-serving] trays failed to retract within 20s"
@@ -3606,6 +3795,24 @@ class NavBridge(Node):
         now = time.monotonic()
         dt = min(max(now - self._last_cmd_time, 1.0 / 240.0), 0.05)
         self._last_cmd_time = now
+
+        latch = self._completed_mission_latch
+        if latch is not None:
+            if now <= float(latch.get("until", 0.0)):
+                if now - float(latch.get("last_pub", 0.0)) >= 0.5:
+                    latch["last_pub"] = now
+                    self._publish_two_wheel_mission_status(
+                        "completed",
+                        "completed",
+                        target=latch.get("target"),
+                        mission_id=latch.get("mission_id"),
+                    )
+                    if latch.get("target") is not None:
+                        self.navigation_location_pub.publish(
+                            Int32(data=int(latch["target"]))
+                        )
+            else:
+                self._completed_mission_latch = None
 
         direct_command = self._update_direct_navigation(x, y, yaw)
         with self._lock:

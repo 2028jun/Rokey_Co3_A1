@@ -6,7 +6,7 @@ import copy
 
 import rclpy
 from geometry_msgs.msg import Point32, PolygonStamped, TransformStamped
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Path
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import LaserScan
@@ -29,6 +29,17 @@ class RvizTfAggregator(Node):
         self._scan_publishers = {}
         self._grid_publishers = {}
         self._polygon_publishers = {}
+        self._path_publishers = {}
+        path_qos = QoSProfile(
+            depth=5,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        live_path_qos = QoSProfile(
+            depth=5,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
         for robot in self._robots:
             self.create_subscription(
                 OccupancyGrid, f"/{robot}/map", self._relay_map, static_qos
@@ -48,6 +59,24 @@ class RvizTfAggregator(Node):
                 LaserScan, f"/{robot}/scan",
                 lambda msg, name=robot: self._relay_scan(msg, name), 10,
             )
+            for source, suffix, source_qos in (
+                ("plan", "plan", live_path_qos),
+                ("local_plan", "local_plan", live_path_qos),
+                ("orthogonal_path/selected", "selected_path", path_qos),
+                ("orthogonal_path/dock_approach", "dock_approach", path_qos),
+            ):
+                key = (robot, suffix)
+                self._path_publishers[key] = self.create_publisher(
+                    Path, f"/rviz/{robot}/{suffix}", path_qos
+                )
+                self.create_subscription(
+                    Path,
+                    f"/{robot}/{source}",
+                    lambda msg, name=robot, label=suffix: self._relay_path(
+                        msg, name, label
+                    ),
+                    source_qos,
+                )
             for source, suffix in (
                 ("local_costmap/costmap", "local_costmap"),
                 ("global_costmap/costmap", "global_costmap"),
@@ -179,6 +208,14 @@ class RvizTfAggregator(Node):
         out = copy.deepcopy(msg)
         out.header.frame_id = self._frame(out.header.frame_id, robot)
         self._grid_publishers[(robot, label)].publish(out)
+
+    def _relay_path(self, msg: Path, robot: str, label: str) -> None:
+        out = copy.deepcopy(msg)
+        out.header.frame_id = self._frame(out.header.frame_id, robot)
+        for pose in out.poses:
+            source_frame = pose.header.frame_id or msg.header.frame_id
+            pose.header.frame_id = self._frame(source_frame, robot)
+        self._path_publishers[(robot, label)].publish(out)
 
     def _relay_polygon(
         self, msg: PolygonStamped, robot: str, label: str
