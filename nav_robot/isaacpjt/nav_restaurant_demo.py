@@ -86,6 +86,7 @@ from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Int32, String
 from std_srvs.srv import SetBool
+from tf2_msgs.msg import TFMessage
 
 # The colcon workspace builds this custom interface for system Python 3.10,
 # while Isaac Sim 5.1 embeds Python 3.11.  Do not abort the entire navigation
@@ -104,13 +105,13 @@ except (ImportError, ModuleNotFoundError) as _task_command_import_error:
 sys.path.insert(0, str(SERVING_WORKSPACE / "isaacpjt"))
 sys.path.insert(0, str(SERVING_WORKSPACE / "isaacpjt/M0609/rmpflow"))
 sys.path.insert(0, str(WORKSPACE / "isaacpjt/M0609/rmpflow"))
+# Defaults when serving food modules cannot be imported (nav-only path).
+GRIP_CONTACT_STATIC_FRICTION = float(os.environ.get("NAV_GRIP_STATIC_FRICTION", "6.0"))
+GRIP_CONTACT_DYNAMIC_FRICTION = float(os.environ.get("NAV_GRIP_DYNAMIC_FRICTION", "5.0"))
+GRIPPER_DRIVE_MAX_FORCE = float(os.environ.get("NAV_GRIPPER_DRIVE_MAX_FORCE", "40.0"))
 try:
     from drink_serving import spawn_soda_cans
     from cutlery_serving import spawn_cutlery_box
-    from plate_rack_serving import (
-        follow_plate_rack_transport,
-        spawn_plate_rack,
-    )
     from pizza_serving import (
         GRIP_CONTACT_DYNAMIC_FRICTION,
         GRIP_CONTACT_STATIC_FRICTION,
@@ -120,9 +121,16 @@ try:
     from soda1_delivery import Soda1PickPlace
     from soda2_delivery import Soda2PickPlace
     from cutlery_pick_place import CutleryBoxPickPlace
-    from plate_rack_pick_place import PlateRackPickPlace
+    try:
+        from plate_rack_serving import (
+            follow_plate_rack_transport,
+            spawn_plate_rack,
+        )
+        from plate_rack_pick_place import PlateRackPickPlace
+    except ImportError as _plate_exc:
+        print(f"[warn] plate-rack module import: {_plate_exc}", flush=True)
     print(
-        "[food_spawn] loaded pizza, soda1, soda2, cutlery and plate-rack modules",
+        "[food_spawn] loaded pizza, soda1, soda2, cutlery modules",
         flush=True,
     )
 except Exception as _food_import_exc:
@@ -275,11 +283,37 @@ FRONT_LIDAR_FRAME = "base_scan"
 FRONT_LIDAR_TOPIC = "/scan"
 
 LIDAR_MIN_RANGE = 0.20
+PEER_HARD_STOP_M = 1.10
+# Shared-pose + lidar right-of-way for corridor head-ons.
+PEER_ENGAGE_M = 2.50
+PEER_STOP_M = 1.00
+PEER_CLEAR_M = 1.35
+PEER_CONTACT_M = 0.40
+PEER_YIELD_AHEAD_DEG = 55.0
+# Lane offset is ~0.55; allow pass once lateral gap exceeds lane separation.
+PEER_SAFE_LATERAL_M = 0.85
+# Opposite head-on: hold longer before any creep (prevents T3/T4 collide).
+PEER_YIELD_MAX_HOLD_SEC = 12.0
+PEER_YIELD_MAX_HOLD_OPPOSITE_SEC = 45.0
+# West docks (0,2) vs east docks (1,3) — opposite-side trips conflict in spine.
+FLEET_WEST_TABLES = frozenset({0, 2})
+FLEET_EAST_TABLES = frozenset({1, 3})
+PEER_YIELD_PEER_PHASES = frozenset(
+    {"approaching", "returning", "holding", "navigating"}
+)
+# Corridor half-separation so simultaneous trips do not share the spine.
+FLEET_AISLE_OFFSET_M = 0.70
+FLEET_PASS_EXTRA_M = 0.30
 LIDAR_MAX_RANGE = 12.0
 LIDAR_SAMPLES = 180
 LIDAR_PERIOD_SEC = 0.10
 LIDAR_SENSOR_FORWARD = 0.48
 LIDAR_SENSOR_HEIGHT = 0.45
+PERSON_LIDAR_PROXY_PATH = "/World/CrossingPedestrian_person_lidar_collider"
+PERSON_LIDAR_PROXY_RADIUS = float(
+    os.environ.get("NAV_CROSSING_COLLIDER_RADIUS", "0.30")
+)
+PERSON_LIDAR_ENABLED_ATTR = "userProperties:lidarEnabled"
 
 # Robot-local safety rectangles for _direct_nav's obstacle check (mission
 # driving never touches ROS cmd_vel, so it cannot be protected by
@@ -298,6 +332,21 @@ _front_lidar_render_product = None
 _front_lidar_writer = None
 _embedded_lidar_render_product = None
 _embedded_lidar_writer = None
+
+
+def set_robot_context(root: str, spawn_position: Gf.Vec3d) -> None:
+    """Select the robot instance used by the legacy setup helpers."""
+    global ROBOT_ROOT, SPAWN_POSITION, ARTICULATION_CANDIDATES, TABLE_CAMERA_PATH
+    ROBOT_ROOT = root
+    SPAWN_POSITION = spawn_position
+    ARTICULATION_CANDIDATES = [
+        f"{root}/Robot/ridgeback_base_link",
+        f"{root}/Robot",
+    ]
+    TABLE_CAMERA_PATH = (
+        f"{root}/Robot/ridgeback_base_link/ridgeback_base_link/"
+        "fixed_table_depth_camera/realsense_d455/RSD455/Camera_Pseudo_Depth"
+    )
 
 
 def quaternion_to_yaw(orientation) -> float:
@@ -336,6 +385,10 @@ def attach_m0609_visuals(stage):
             continue
         visual_path = matches[0].GetPath().AppendChild("visuals")
         visual_prim = stage.OverridePrim(visual_path)
+        # Dual-robot: break shared instance prototypes before retargeting.
+        if visual_prim.IsInstanceable():
+            visual_prim.SetInstanceable(False)
+        visual_prim.GetReferences().ClearReferences()
         visual_prim.GetReferences().SetReferences(
             [
                 Sdf.Reference(
@@ -449,10 +502,68 @@ def attach_fixed_table_depth_camera(stage):
 
             rsd_path = sensor_path.AppendChild("RSD455")
             rsd_prim = stage.OverridePrim(rsd_path)
+            if rsd_prim.IsInstanceable():
+                rsd_prim.SetInstanceable(False)
+            rsd_prim.GetReferences().ClearReferences()
             rsd_prim.GetReferences().SetReferences(
                 [Sdf.Reference(str(D455_ASSET_USD), Sdf.Path("/Root/RSD455"))]
             )
             print("[nav_robot] attached fixed table depth camera mast & D455 sensor", flush=True)
+
+
+def sanitize_embedded_rsd455(stage, robot_root: str) -> None:
+    """Keep D455 welded to the mast: strip nested rigid-body physics.
+
+    The Isaac ``rsd455.usd`` authors ``PhysicsRigidBodyAPI`` / PhysX rigid-body
+    schemas on ``/Root/RSD455``.  Nested under the mobile-base articulation that
+    becomes a detachable dynamic body.  With two robots the PhysX pose of that
+    body can desync from the USD xform stack and render as a RealSense Case at
+    the dining-hall origin while Prim paths still look correct under each mast.
+
+    ``UsdPhysics.RigidBodyAPI`` alone is not enough to check — the composed prim
+    often keeps ``PhysxRigidBodyAPI`` + ``physics:rigidBodyEnabled=true``.
+    """
+    rsd_path = (
+        f"{robot_root}/Robot/ridgeback_base_link/ridgeback_base_link/"
+        "fixed_table_depth_camera/realsense_d455/RSD455"
+    )
+    rsd_prim = stage.GetPrimAtPath(rsd_path)
+    if not rsd_prim.IsValid():
+        if os.environ.get("NAV_ROBOT_PRIM_DEBUG", "0") == "1":
+            print(
+                f"[nav_robot] sanitize_embedded_rsd455: missing prim {rsd_path}",
+                flush=True,
+            )
+        return
+    stripped = 0
+    touched = []
+    for prim in Usd.PrimRange(rsd_prim):
+        changed = False
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            prim.RemoveAPI(UsdPhysics.RigidBodyAPI)
+            changed = True
+        if prim.HasAPI(PhysxSchema.PhysxRigidBodyAPI):
+            prim.RemoveAPI(PhysxSchema.PhysxRigidBodyAPI)
+            changed = True
+        if prim.HasAPI(UsdPhysics.MassAPI):
+            prim.RemoveAPI(UsdPhysics.MassAPI)
+            changed = True
+        if prim.HasAPI(UsdPhysics.CollisionAPI):
+            prim.RemoveAPI(UsdPhysics.CollisionAPI)
+            changed = True
+        enabled = prim.GetAttribute("physics:rigidBodyEnabled")
+        if enabled and enabled.IsValid():
+            enabled.Set(False)
+            changed = True
+        if changed:
+            stripped += 1
+            touched.append(str(prim.GetPath()))
+    if stripped:
+        print(
+            f"[nav_robot] stripped rigid-body/collision under {rsd_path} "
+            f"n={stripped} roots_touched={touched[:8]}",
+            flush=True,
+        )
 
 
 def attach_front_rplidar_ros2(stage):
@@ -499,7 +610,7 @@ def remove_parking_brake(stage):
     pass
 
 
-def open_restaurant_and_robot():
+def open_restaurant_and_robot(open_stage: bool = True):
     if not RESTAURANT_USD.is_file():
         raise FileNotFoundError(RESTAURANT_USD)
 
@@ -507,17 +618,21 @@ def open_restaurant_and_robot():
         raise FileNotFoundError(ROBOT_USD)
 
     context = omni.usd.get_context()
-    if not context.open_stage(str(RESTAURANT_USD)):
-        raise RuntimeError(f"failed to open {RESTAURANT_USD}")
-    for _ in range(30):
-        simulation_app.update()
+    if open_stage:
+        if not context.open_stage(str(RESTAURANT_USD)):
+            raise RuntimeError(f"failed to open {RESTAURANT_USD}")
+        for _ in range(30):
+            simulation_app.update()
 
     stage = context.get_stage()
     spawn = UsdGeom.Xform.Define(stage, ROBOT_ROOT)
     spawn.AddTranslateOp().Set(SPAWN_POSITION)
     spawn.AddOrientOp().Set(yaw_to_quat(SPAWN_YAW))
     robot = UsdGeom.Xform.Define(stage, f"{ROBOT_ROOT}/Robot")
-    robot.GetPrim().GetReferences().AddReference(
+    robot_prim = robot.GetPrim()
+    # Dual references of the same ROBOT_USD must not share instance prototypes.
+    robot_prim.SetInstanceable(False)
+    robot_prim.GetReferences().AddReference(
         str(ROBOT_USD), Sdf.Path(ROBOT_ASSET_ROOT)
     )
     for _ in range(5):
@@ -544,8 +659,107 @@ def open_restaurant_and_robot():
     # asset.  Without this composition fix link_2's visual pieces can resolve
     # at the layer origin even though the physical link/joint poses are valid.
     attach_m0609_visuals(stage)
+    # Strip nested RSD455 rigid-body so dual-robot PhysX cannot detach the Case.
+    sanitize_embedded_rsd455(stage, robot_root=ROBOT_ROOT)
     print("[nav_robot] using embedded D455 and RPLIDAR sensor layer", flush=True)
     return stage
+
+
+def add_three_by_three_restaurant_tiles(stage):
+    """Tile the original dining/decor content over a wall-free 3x3 floor."""
+    tiles_root = UsdGeom.Xform.Define(stage, "/World/RestaurantTiles")
+    created = 0
+    external_tables = 0
+    external_plants = 0
+    disabled_colliders = 0
+    disabled_rigid_bodies = 0
+    plant_patterns = {
+        (0, 0): (0,),
+        (0, 2): (1, 3),
+        (1, 0): (2,),
+        (1, 1): (0, 3),
+        (1, 2): (),
+        (2, 0): (1, 2),
+        (2, 1): (),
+        (2, 2): (3,),
+    }
+    # Keep the kitchen on the north (+Y) side untouched. The original dining
+    # room is the north row; expansion proceeds only sideways and southward.
+    for row, offset_y in enumerate((0.0, -10.0, -20.0)):
+        for column, offset_x in enumerate((-12.0, 0.0, 12.0)):
+            if offset_x == 0.0 and offset_y == 0.0:
+                continue
+            tile_path = (
+                f"{tiles_root.GetPath()}/Tile_{row}_{column}"
+            )
+            tile = UsdGeom.Xform.Define(stage, tile_path)
+            tile.AddTranslateOp().Set(Gf.Vec3d(offset_x, offset_y, 0.0))
+            dining_copy = UsdGeom.Xform.Define(
+                stage, f"{tile_path}/Dining"
+            )
+            dining_copy.GetPrim().GetReferences().AddInternalReference(
+                Sdf.Path("/World/Dining")
+            )
+            for prim in Usd.PrimRange(dining_copy.GetPrim()):
+                if prim.GetName().startswith("TableSet_"):
+                    external_tables += 1
+                if prim.HasAPI(UsdPhysics.CollisionAPI):
+                    UsdPhysics.CollisionAPI(
+                        prim
+                    ).CreateCollisionEnabledAttr(False)
+                    disabled_colliders += 1
+                if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                    UsdPhysics.RigidBodyAPI(
+                        prim
+                    ).CreateRigidBodyEnabledAttr(False)
+                    disabled_rigid_bodies += 1
+
+            decor_copy = UsdGeom.Xform.Define(stage, f"{tile_path}/Decor")
+            for plant_index in plant_patterns[(row, column)]:
+                for source_name in (
+                    f"Plant_{plant_index:02d}",
+                    f"PlantCollider_{plant_index:02d}",
+                ):
+                    plant_copy = stage.DefinePrim(
+                        f"{decor_copy.GetPath()}/{source_name}"
+                    )
+                    plant_copy.GetReferences().AddInternalReference(
+                        Sdf.Path(f"/World/Decor/{source_name}")
+                    )
+                external_plants += 1
+            created += 1
+
+    active_colliders = []
+    active_rigid_bodies = []
+    for prim in Usd.PrimRange(tiles_root.GetPrim()):
+        if "/Dining/" not in str(prim.GetPath()):
+            continue
+        if prim.HasAPI(UsdPhysics.CollisionAPI):
+            enabled = UsdPhysics.CollisionAPI(
+                prim
+            ).GetCollisionEnabledAttr().Get()
+            if enabled is not False:
+                active_colliders.append(str(prim.GetPath()))
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            enabled = UsdPhysics.RigidBodyAPI(
+                prim
+            ).GetRigidBodyEnabledAttr().Get()
+            if enabled is not False:
+                active_rigid_bodies.append(str(prim.GetPath()))
+    if external_tables != 32 or active_colliders or active_rigid_bodies:
+        raise RuntimeError(
+            "external table physics verification failed: "
+            f"tables={external_tables} active_colliders={active_colliders} "
+            f"active_rigid_bodies={active_rigid_bodies}"
+        )
+    print(
+        f"[restaurant] tiles=3x3 added={created} floor=36x30m "
+        f"outer_walls=8 kitchen_bump=1 external_tables={external_tables} "
+        f"external_plants={external_plants} "
+        f"disabled_colliders={disabled_colliders} "
+        f"disabled_rigid_bodies={disabled_rigid_bodies}",
+        flush=True,
+    )
 
 
 def configure_joint_drives(stage):
@@ -801,15 +1015,13 @@ def log_stray_robot_geometry(stage):
         print("[stray-geometry] no USD Boundable under NavRobot near origin", flush=True)
 
 
-def initialize_robot(articulation_path: str):
+def initialize_robot(articulation_path: str, name: str = "nav_ridgeback"):
     timeline = omni.timeline.get_timeline_interface()
     timeline.play()
     for _ in range(2):
         simulation_app.update()
 
-    articulation = SingleArticulation(
-        prim_path=articulation_path, name="nav_ridgeback"
-    )
+    articulation = SingleArticulation(prim_path=articulation_path, name=name)
     articulation.initialize()
     if not articulation.handles_initialized:
         raise RuntimeError(f"invalid articulation handle: {articulation_path}")
@@ -982,7 +1194,13 @@ def create_sensor_ros_graph(lidar_path: str, camera_path: str):
     )
 
 
-def connect_embedded_sensor_ros(stage):
+def connect_embedded_sensor_ros(
+    stage,
+    *,
+    robot_root=ROBOT_ROOT,
+    robot_name="",
+    publish_clock=True,
+):
     """Connect the D455/RPLIDAR already contained in the two-wheel USD."""
     global _embedded_lidar_render_product, _embedded_lidar_writer
     camera_width = int(os.environ.get("NAV_CAMERA_WIDTH", "1280"))
@@ -991,9 +1209,7 @@ def connect_embedded_sensor_ros(stage):
         raise ValueError(
             "NAV_CAMERA_WIDTH and NAV_CAMERA_HEIGHT must be positive"
         )
-    base_path = (
-        f"{ROBOT_ROOT}/Robot/ridgeback_base_link/ridgeback_base_link"
-    )
+    base_path = f"{robot_root}/Robot/ridgeback_base_link/ridgeback_base_link"
     sensor_mount = f"{base_path}/fixed_table_depth_camera/realsense_d455"
     depth_camera = f"{sensor_mount}/RSD455/Camera_Pseudo_Depth"
     lidar_path = f"{base_path}/base_scan/RPLIDAR_S2E"
@@ -1002,30 +1218,47 @@ def connect_embedded_sensor_ros(stage):
             raise RuntimeError(f"embedded sensor prim is missing: {required}")
 
     keys = og.Controller.Keys
+    nodes = [
+        ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+        ("Context", "isaacsim.ros2.bridge.ROS2Context"),
+        ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
+        ("RenderProduct", "isaacsim.core.nodes.IsaacCreateRenderProduct"),
+        ("ColorPub", "isaacsim.ros2.bridge.ROS2CameraHelper"),
+        ("DepthPub", "isaacsim.ros2.bridge.ROS2CameraHelper"),
+    ]
+    connections = [
+        ("OnPlaybackTick.outputs:tick", "RenderProduct.inputs:execIn"),
+        ("Context.outputs:context", "ColorPub.inputs:context"),
+        ("Context.outputs:context", "DepthPub.inputs:context"),
+        ("RenderProduct.outputs:execOut", "ColorPub.inputs:execIn"),
+        ("RenderProduct.outputs:renderProductPath", "ColorPub.inputs:renderProductPath"),
+        ("RenderProduct.outputs:execOut", "DepthPub.inputs:execIn"),
+        ("RenderProduct.outputs:renderProductPath", "DepthPub.inputs:renderProductPath"),
+    ]
+    if publish_clock:
+        nodes.append(("PublishClock", "isaacsim.ros2.bridge.ROS2PublishClock"))
+        connections.extend([
+            ("OnPlaybackTick.outputs:tick", "PublishClock.inputs:execIn"),
+            ("Context.outputs:context", "PublishClock.inputs:context"),
+            ("ReadSimTime.outputs:simulationTime", "PublishClock.inputs:timeStamp"),
+        ])
+    camera_prefix = f"{robot_name}/" if robot_name else ""
     og.Controller.edit(
-        {"graph_path": f"{ROBOT_ROOT}/EmbeddedSensorsROS2", "evaluator_name": "execution"},
+        {"graph_path": f"{robot_root}/EmbeddedSensorsROS2", "evaluator_name": "execution"},
         {
-            keys.CREATE_NODES: [
-                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
-                ("Context", "isaacsim.ros2.bridge.ROS2Context"),
-                ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
-                ("PublishClock", "isaacsim.ros2.bridge.ROS2PublishClock"),
-                ("RenderProduct", "isaacsim.core.nodes.IsaacCreateRenderProduct"),
-                ("ColorPub", "isaacsim.ros2.bridge.ROS2CameraHelper"),
-                ("DepthPub", "isaacsim.ros2.bridge.ROS2CameraHelper"),
-            ],
+            keys.CREATE_NODES: nodes,
             keys.SET_VALUES: [
                 ("RenderProduct.inputs:cameraPrim", [usdrt.Sdf.Path(depth_camera)]),
                 ("RenderProduct.inputs:width", camera_width),
                 ("RenderProduct.inputs:height", camera_height),
-                ("ColorPub.inputs:nodeNamespace", "camera/color"),
+                ("ColorPub.inputs:nodeNamespace", f"{camera_prefix}camera/color"),
                 ("ColorPub.inputs:topicName", "image_raw"),
                 ("ColorPub.inputs:frameId", "d455_color_optical_frame"),
                 ("ColorPub.inputs:type", "rgb"),
                 # Publish every rendered frame.  The previous value of 3
                 # capped the RGB stream to one image per four sim frames.
                 ("ColorPub.inputs:frameSkipCount", 0),
-                ("DepthPub.inputs:nodeNamespace", "camera/depth"),
+                ("DepthPub.inputs:nodeNamespace", f"{camera_prefix}camera/depth"),
                 ("DepthPub.inputs:topicName", "image_raw"),
                 ("DepthPub.inputs:frameId", "d455_depth_optical_frame"),
                 ("DepthPub.inputs:type", "depth"),
@@ -1033,23 +1266,13 @@ def connect_embedded_sensor_ros(stage):
                 # so RGB inference gets the shared GPU budget.
                 ("DepthPub.inputs:frameSkipCount", 29),
             ],
-            keys.CONNECT: [
-                ("OnPlaybackTick.outputs:tick", "PublishClock.inputs:execIn"),
-                ("OnPlaybackTick.outputs:tick", "RenderProduct.inputs:execIn"),
-                ("Context.outputs:context", "PublishClock.inputs:context"),
-                ("Context.outputs:context", "ColorPub.inputs:context"),
-                ("Context.outputs:context", "DepthPub.inputs:context"),
-                ("ReadSimTime.outputs:simulationTime", "PublishClock.inputs:timeStamp"),
-                ("RenderProduct.outputs:execOut", "ColorPub.inputs:execIn"),
-                ("RenderProduct.outputs:renderProductPath", "ColorPub.inputs:renderProductPath"),
-                ("RenderProduct.outputs:execOut", "DepthPub.inputs:execIn"),
-                ("RenderProduct.outputs:renderProductPath", "DepthPub.inputs:renderProductPath"),
-            ],
+            keys.CONNECT: connections,
         },
     )
 
     print(
-        f"[ros] embedded D455 RGB/depth {camera_width}x{camera_height} and /clock connected",
+        f"[ros] {robot_name or 'default'} embedded D455 RGB/depth "
+        f"{camera_width}x{camera_height} clock={int(publish_clock)} connected",
         flush=True,
     )
 
@@ -1166,11 +1389,27 @@ class CommandServingSequence:
 class NavBridge(Node):
     """cmd_vel subscriber + odom/TF publisher + food spawn & arm serving server."""
 
-    def __init__(self, articulation, dof_names, stage=None):
-        super().__init__("nav_robot_isaac_bridge")
+    def __init__(
+        self,
+        articulation,
+        dof_names,
+        stage=None,
+        *,
+        robot_name="",
+        robot_root=ROBOT_ROOT,
+    ):
+        namespace = f"/{robot_name}" if robot_name else ""
+        node_name = (
+            f"nav_robot_isaac_bridge_{robot_name}"
+            if robot_name
+            else "nav_robot_isaac_bridge"
+        )
+        super().__init__(node_name, namespace=namespace)
         self.articulation = articulation
         self.dof_names = dof_names
         self.stage = stage
+        self.robot_name = robot_name
+        self.robot_root = robot_root
         self.wheel_indices = np.asarray(
             [dof_names.index(name) for name in WHEEL_JOINTS], dtype=np.int32
         )
@@ -1206,6 +1445,8 @@ class NavBridge(Node):
         self._direct_nav_request = None
         self._active_two_wheel_mission_id = ""
         self._active_two_wheel_target = None
+        self._active_two_wheel_goal = None
+        self._completed_mission_latch = None
         self._navigation_paused = False
         self._navigation_pause_started = None
         self._navigation_location = 4
@@ -1216,6 +1457,8 @@ class NavBridge(Node):
         self._hand_test_controller = None
         self._obstacle_stop = False
         self._obstacle_stop_started = None
+        self._obstacle_stop_from_peer = False
+        self._peer_hit_this_scan = False
         self._clearance_start = None
         self._obstacle_scale = 1.0
         self._last_scan_time = 0.0
@@ -1238,10 +1481,10 @@ class NavBridge(Node):
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
         )
-        self.scan_pub = self.create_publisher(LaserScan, "/scan", sensor_qos)
-        self.nav_scan_pub = self.create_publisher(LaserScan, "/nav_robot/scan", sensor_qos)
-        self.two_wheel_scan_pub = self.create_publisher(LaserScan, "/two_wheel/scan_raw", sensor_qos)
-        self.create_subscription(Twist, "/nav_robot/cmd_vel", self._on_cmd_vel, qos)
+        self.scan_pub = self.create_publisher(LaserScan, "scan", sensor_qos)
+        self.nav_scan_pub = self.create_publisher(LaserScan, "nav_robot/scan", sensor_qos)
+        self.two_wheel_scan_pub = self.create_publisher(LaserScan, "two_wheel/scan_raw", sensor_qos)
+        self.create_subscription(Twist, "nav_robot/cmd_vel", self._on_cmd_vel, qos)
         # nav2_collision_monitor sits between the controller/velocity_smoother
         # output and the robot: it re-publishes "cmd_vel" as "cmd_vel_safe"
         # after gating it against the stop/slowdown polygons in
@@ -1250,32 +1493,40 @@ class NavBridge(Node):
         # (which also publish to "cmd_vel") get the same safety gate.
         self.create_subscription(Twist, "cmd_vel_safe", self._on_cmd_vel, qos)
         self.create_subscription(
-            PoseStamped, "/nav_robot/teleport", self._on_teleport, qos
+            PoseStamped, "nav_robot/teleport", self._on_teleport, qos
         )
         self.create_subscription(
-            PoseStamped, "/two_wheel/teleport", self._on_teleport, qos
+            PoseStamped, "two_wheel/teleport", self._on_teleport, qos
         )
-        self.odom_pub = self.create_publisher(Odometry, "/nav_robot/odom", qos)
-        self.two_wheel_odom_pub = self.create_publisher(Odometry, "/two_wheel/odom_raw", qos)
-        self.obstacle_pub = self.create_publisher(String, "/serving_robot/obstacle_event", qos)
-        self.tf_broadcaster = TransformBroadcaster(self)
-        self.static_tf_broadcaster = StaticTransformBroadcaster(self)
+        self.odom_pub = self.create_publisher(Odometry, "nav_robot/odom", qos)
+        self.two_wheel_odom_pub = self.create_publisher(Odometry, "two_wheel/odom_raw", qos)
+        self.obstacle_pub = self.create_publisher(String, "serving_robot/obstacle_event", qos)
+        self.tf_pub = self.create_publisher(TFMessage, "tf", 100)
+        static_tf_qos = QoSProfile(
+            depth=100,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.static_tf_pub = self.create_publisher(
+            TFMessage, "tf_static", static_tf_qos
+        )
 
         # Subsystems Services & Publishers for Manager Node
-        self.spawn_status_pub = self.create_publisher(Int32, "/food_spawn/status", transient_local_qos)
-        self.arm_status_pub = self.create_publisher(Int32, "/arm/status", transient_local_qos)
-        self.navigation_status_pub = self.create_publisher(
-            Int32, "/navigation/status", transient_local_qos
-        )
+        self.spawn_status_pub = self.create_publisher(Int32, "food_spawn/status", transient_local_qos)
+        self.arm_status_pub = self.create_publisher(Int32, "arm/status", transient_local_qos)
+        # navigation/status Int32 is owned ONLY by navigation_subsystem.
+        # Isaac used to also publish it (plus a 1Hz MOVING/ARRIVED heartbeat),
+        # which made manager treat mid-attempt failures / idle gaps as terminal
+        # ARRIVED/FAILED and cancelled orders. Keep location for TF-less HMI.
         self.navigation_location_pub = self.create_publisher(
-            Int32, "/navigation/current_location", transient_local_qos
+            Int32, "navigation/current_location", transient_local_qos
         )
 
         # Standard Int32 topic subscribers for Isaac Sim food spawning & arm serving
-        self.create_subscription(Int32, "/food_spawn/trigger", self._on_food_spawn_trigger, qos)
-        self.create_subscription(Int32, "/arm/trigger", self._on_arm_trigger, qos)
+        self.create_subscription(Int32, "food_spawn/trigger", self._on_food_spawn_trigger, qos)
+        self.create_subscription(Int32, "arm/trigger", self._on_arm_trigger, qos)
         self.create_subscription(
-            Int32, "/navigation/trigger", self._on_navigation_trigger, qos
+            Int32, "navigation/trigger", self._on_navigation_trigger, qos
         )
 
         mission_qos = QoSProfile(
@@ -1285,36 +1536,62 @@ class NavBridge(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
         self.two_wheel_mission_status_pub = self.create_publisher(
-            String, "/two_wheel/mission_status", mission_qos
+            String, "two_wheel/mission_status", mission_qos
         )
         self.create_subscription(
             String,
-            "/two_wheel/mission_command",
+            "two_wheel/mission_command",
             self._on_two_wheel_mission_command,
             mission_qos,
         )
+        # Fleet right-of-way: shared pose_xy + lidar; later order yields.
+        self._fleet_priorities = {}
+        self._fleet_active = {}
+        self._fleet_phases = {}
+        self._fleet_poses = {}
+        self._fleet_table_ids = {}
+        self._my_fleet_priority = None
+        self._live_pose = None
+        self._peer_swerve_wz = 0.0
+        self._peer_yielding = False
+        self._peer_yield_last_log = 0.0
+        self._peer_yield_started = None
+        self._peer_near_angle = 0.0
+        self._peer_near_prev = float("inf")
+        fleet_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        for peer in ("robot1", "robot2"):
+            self.create_subscription(
+                String,
+                f"/{peer}/fleet/intent",
+                lambda msg, name=peer: self._on_fleet_intent(name, msg),
+                fleet_qos,
+            )
 
         self._obstacle_test_controller = None
         self.create_service(
             SetBool,
-            "/hand_test/set_visible",
+            "hand_test/set_visible",
             self._on_hand_test_set_visible,
         )
         self.create_service(
             SetBool,
-            "/obstacle_test/set_visible",
+            "obstacle_test/set_visible",
             self._on_obstacle_test_set_visible,
         )
 
         if TaskCommand is not None:
             self.create_service(
                 TaskCommand,
-                "/food_spawn/command",
+                "food_spawn/command",
                 self._on_food_spawn_command,
             )
             self.create_service(
                 TaskCommand,
-                "/arm/command",
+                "arm/command",
                 self._on_arm_command,
             )
 
@@ -1343,7 +1620,6 @@ class NavBridge(Node):
         }
         self._publish_static_sensor_tf()
         self.navigation_location_pub.publish(Int32(data=4))
-        self.navigation_status_pub.publish(Int32(data=2))
         subsystem_services = (
             ", /food_spawn/command, /arm/command"
             if TaskCommand is not None
@@ -1351,8 +1627,8 @@ class NavBridge(Node):
         )
         print(
             f"[ros] active services: /navigation/command{subsystem_services}\n"
-            "[ros] active status topics: /navigation/status, "
-            "/food_spawn/status, /arm/status",
+            "[ros] status: navigation/status owned by ROS subsystem only; "
+            "Isaac publishes location + two_wheel/mission_status",
             flush=True,
         )
 
@@ -1593,6 +1869,7 @@ class NavBridge(Node):
                 )
                 self._active_two_wheel_mission_id = ""
                 self._active_two_wheel_target = None
+                self._active_two_wheel_goal = None
             return
 
         if kind in ("pause", "resume"):
@@ -1641,6 +1918,14 @@ class NavBridge(Node):
                 if not busy:
                     self._active_two_wheel_mission_id = mission_id
                     self._active_two_wheel_target = None
+                    self._completed_mission_latch = None
+                    self._navigation_paused = False
+                    self._navigation_pause_started = None
+                    self._obstacle_stop = False
+                    self._obstacle_stop_started = None
+                    self._obstacle_stop_from_peer = False
+                    self._clearance_start = None
+                    self._obstacle_scale = 1.0
                     self._direct_nav = dict(
                         mode="park_out",
                         target=None,
@@ -1648,6 +1933,7 @@ class NavBridge(Node):
                         distance=distance,
                         speed=min(speed, 0.20),
                         stage_start=time.monotonic(),
+                        wall_start=time.monotonic(),
                         last_log=0.0,
                     )
                     self._target_vx = 0.0
@@ -1704,9 +1990,25 @@ class NavBridge(Node):
 
         self._active_two_wheel_mission_id = mission_id
         self._active_two_wheel_target = target
+        self._completed_mission_latch = None
+        # A fresh mission must not inherit a stale path-yield pause.
+        self._navigation_paused = False
+        self._navigation_pause_started = None
 
         points = payload.get("points", [])
         dock = payload.get("dock", payload.get("goal"))
+        self._active_two_wheel_goal = None
+        if target in (0, 1, 2, 3, 4) and isinstance(dock, dict):
+            try:
+                self._active_two_wheel_goal = (
+                    float(dock["x"]),
+                    float(dock["y"]),
+                    float(dock.get("yaw", -math.pi / 2.0)),
+                )
+            except (KeyError, TypeError, ValueError):
+                self.get_logger().warning(
+                    f"[Mission RX] invalid target dock; using default: {dock}"
+                )
         self.get_logger().info(
             f"[Mission RX] id={mission_id} target={target} "
             f"points={len(points) if isinstance(points, list) else '?'} "
@@ -1726,6 +2028,7 @@ class NavBridge(Node):
             )
             self._active_two_wheel_mission_id = ""
             self._active_two_wheel_target = None
+            self._active_two_wheel_goal = None
 
     def _on_navigation_trigger(self, msg: Int32):
         self._queue_navigation(int(msg.data))
@@ -1770,12 +2073,10 @@ class NavBridge(Node):
                 self.get_logger().warning(
                     "preempting active navigation for kitchen return"
                 )
-                self.navigation_status_pub.publish(Int32(data=1))
                 return True
             self._direct_nav_request = target
             self._target_vx = 0.0
             self._target_wz = 0.0
-        self.navigation_status_pub.publish(Int32(data=1))
         self.get_logger().info(
             f"direct wheel navigation queued: target_id={target} (Nav2 bypassed)"
         )
@@ -1794,7 +2095,7 @@ class NavBridge(Node):
             st.transform.rotation.z = math.sin(oyaw * 0.5)
             st.transform.rotation.w = math.cos(oyaw * 0.5)
             static_tfs.append(st)
-        self.static_tf_broadcaster.sendTransform(static_tfs)
+        self.static_tf_pub.publish(TFMessage(transforms=static_tfs))
 
     def _on_cmd_vel(self, msg: Twist):
         if abs(float(msg.linear.y)) > 1e-3 and not self._warned_vy:
@@ -1855,12 +2156,42 @@ class NavBridge(Node):
         robot_prefix = (
             str(self.articulation.prim_path)
             if hasattr(self.articulation, "prim_path")
-            else "/World/NavRobot"
+            else self.robot_root
         )
+        # Always exclude the whole robot USD root; articulation path alone can
+        # miss tray/sensor prims and false-classify them as a peer robot.
+        own_roots = [
+            p for p in (self.robot_root, robot_prefix) if p
+        ]
+
+        def _is_own_hit(body: str) -> bool:
+            return any(body.startswith(root) for root in own_roots)
+
+        # The walking person uses a non-contact capsule.  Read its current
+        # world position and intersect it analytically with each planar ray,
+        # preserving /scan detection without any PhysX contact response.
+        person_proxy = self.stage.GetPrimAtPath(PERSON_LIDAR_PROXY_PATH)
+        person_xy = None
+        if person_proxy.IsValid():
+            enabled_attr = person_proxy.GetAttribute(
+                PERSON_LIDAR_ENABLED_ATTR
+            )
+            enabled = (
+                bool(enabled_attr.Get()) if enabled_attr.IsValid() else False
+            )
+            if enabled:
+                matrix = UsdGeom.Xformable(
+                    person_proxy
+                ).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+                translation = matrix.ExtractTranslation()
+                person_xy = (float(translation[0]), float(translation[1]))
 
         ranges = []
         obstacle_ranges = []
         person_hits = []
+        self._peer_hit_this_scan = False
+        self._peer_near_dist = float("inf")
+        self._peer_near_angle = 0.0
         for index in range(LIDAR_SAMPLES):
             angle = angle_min + index * angle_increment
             world_angle = yaw + angle
@@ -1882,26 +2213,72 @@ class NavBridge(Node):
                 else ""
             )
 
-            if hit and hit.get("hit") and not rigid_body.startswith(robot_prefix):
+            own_hit = (
+                (bool(rigid_body) and _is_own_hit(rigid_body))
+                or (bool(collision_prim) and _is_own_hit(collision_prim))
+            )
+            if hit and hit.get("hit") and not own_hit:
                 distance = float(hit["distance"])
             else:
                 distance = math.inf
+
+            person_distance = math.inf
+            if person_xy is not None:
+                offset_x = origin[0] - person_xy[0]
+                offset_y = origin[1] - person_xy[1]
+                projection = (
+                    offset_x * direction[0] + offset_y * direction[1]
+                )
+                radius_term = (
+                    offset_x * offset_x
+                    + offset_y * offset_y
+                    - PERSON_LIDAR_PROXY_RADIUS
+                    * PERSON_LIDAR_PROXY_RADIUS
+                )
+                discriminant = projection * projection - radius_term
+                if discriminant >= 0.0:
+                    root = math.sqrt(discriminant)
+                    near = -projection - root
+                    far = -projection + root
+                    candidate = near if near >= LIDAR_MIN_RANGE else far
+                    if LIDAR_MIN_RANGE <= candidate <= LIDAR_MAX_RANGE:
+                        person_distance = candidate
+
+            virtual_person_hit = person_distance < distance
+            if virtual_person_hit:
+                distance = person_distance
 
             if distance < LIDAR_MIN_RANGE:
                 distance = math.inf
 
             ranges.append(distance)
 
-            # Filter for dynamic person / obstacle detection: ignore static environment (tables, chairs, walls, kitchen)
+            # Filter for dynamic obstacles: people always stop us.
+            # Peer NavRobot*: only the later-order (lower priority) robot stops.
+            # The earlier-order robot ignores the peer so it can keep moving /
+            # use its lane while the later robot waits.
             hit_path = (rigid_body + " " + collision_prim).lower()
-            is_person = (
-                "/World/CorridorObstacleTestPerson" in (rigid_body + collision_prim)
-                or "person" in hit_path
-                or "character" in hit_path
-                or "obstacle" in hit_path
-                or "human" in hit_path
-                or "hand" in hit_path
+            is_peer_robot = (
+                "navrobot" in hit_path
+                and not own_hit
             )
+            # Do not match bare "hand" — robot arms / trays false-trigger stops.
+            is_person = virtual_person_hit or (
+                "/World/CorridorObstacleTestPerson" in (rigid_body + collision_prim)
+                or "crossingpedestrian" in hit_path
+                or "/person" in hit_path
+                or "character" in hit_path
+                or "human" in hit_path
+            )
+            stop_for_peer = False
+            if is_peer_robot and math.isfinite(distance):
+                # NEVER hard-stop for the peer robot. Mutual peer-stop at
+                # ~0.3m caused permanent face-to-face pending. Pass with
+                # opposite-lane swerve instead (person obstacles still stop).
+                if distance < self._peer_near_dist:
+                    self._peer_near_dist = distance
+                    self._peer_near_angle = float(angle)
+                self._peer_hit_this_scan = True
             if is_person and math.isfinite(distance):
                 obstacle_ranges.append(distance)
                 hit_x = origin[0] + direction[0] * distance
@@ -1985,9 +2362,313 @@ class NavBridge(Node):
             f"obstacle event published: {message.data}"
         )
 
+    def _fleet_aisle_x(self) -> float:
+        """Per-robot corridor lane so simultaneous trips do not share x=0."""
+        if (self.robot_name or "") == "robot1":
+            base = -FLEET_AISLE_OFFSET_M
+            sign = -1.0
+        elif (self.robot_name or "") == "robot2":
+            base = FLEET_AISLE_OFFSET_M
+            sign = 1.0
+        else:
+            return 0.0
+        peer = self._peer_name()
+        peer_dist, _, _ = self._peer_fused_distance()
+        if (
+            self._peer_in_aisle(peer)
+            and math.isfinite(peer_dist)
+            and peer_dist < PEER_ENGAGE_M
+        ):
+            extra = FLEET_PASS_EXTRA_M * max(
+                0.0, min(1.0, (PEER_ENGAGE_M - peer_dist) / PEER_ENGAGE_M)
+            )
+            return base + sign * extra
+        return base
+
+    def _on_fleet_intent(self, robot_name: str, msg: String):
+        try:
+            payload = json.loads(msg.data)
+        except Exception:
+            return
+        active = bool(payload.get("active", False))
+        self._fleet_active[robot_name] = active
+        phase = str(payload.get("phase", "idle") or "idle").lower()
+        now = time.monotonic()
+        if active:
+            try:
+                self._fleet_priorities[robot_name] = float(payload.get("priority", 0.0))
+            except (TypeError, ValueError):
+                self._fleet_priorities[robot_name] = 0.0
+            self._fleet_phases[robot_name] = phase
+            raw_table = payload.get("table_id")
+            if raw_table is None:
+                self._fleet_table_ids.pop(robot_name, None)
+            else:
+                try:
+                    self._fleet_table_ids[robot_name] = int(raw_table)
+                except (TypeError, ValueError):
+                    self._fleet_table_ids.pop(robot_name, None)
+            pose_xy = payload.get("pose_xy")
+            if isinstance(pose_xy, dict):
+                try:
+                    self._fleet_poses[robot_name] = (
+                        float(pose_xy["x"]),
+                        float(pose_xy["y"]),
+                        now,
+                    )
+                except (KeyError, TypeError, ValueError):
+                    pass
+        else:
+            self._fleet_priorities.pop(robot_name, None)
+            self._fleet_phases.pop(robot_name, None)
+            self._fleet_poses.pop(robot_name, None)
+            self._fleet_table_ids.pop(robot_name, None)
+        if robot_name == (self.robot_name or ""):
+            self._my_fleet_priority = self._fleet_priorities.get(robot_name)
+        if self._obstacle_stop and self._obstacle_stop_from_peer:
+            with self._lock:
+                if self._obstacle_stop and self._obstacle_stop_from_peer:
+                    self._finish_obstacle_stop(float("inf"))
+
+    def _peer_swerve_bias(self, peer_hit: bool, nearest: float) -> float:
+        """Legacy hook: constant-sign yaw bias is unsafe (wrong for northbound)."""
+        return 0.0
+
+    def _peer_name(self) -> str:
+        return "robot2" if (self.robot_name or "") == "robot1" else "robot1"
+
+    @staticmethod
+    def _table_side(table_id) -> str | None:
+        if table_id is None:
+            return None
+        tid = int(table_id)
+        if tid in FLEET_WEST_TABLES:
+            return "west"
+        if tid in FLEET_EAST_TABLES:
+            return "east"
+        return None
+
+    def _peer_map_distance(self) -> tuple[float, float | None]:
+        peer = self._peer_name()
+        pose = self._fleet_poses.get(peer)
+        live = self._live_pose
+        if pose is None or live is None:
+            return float("inf"), None
+        px, py, _stamp = pose
+        x, y, yaw = live
+        dx = float(px) - float(x)
+        dy = float(py) - float(y)
+        dist = math.hypot(dx, dy)
+        bearing = self._angle_error(math.atan2(dy, dx), yaw)
+        return dist, bearing
+
+    def _peer_fused_distance(self) -> tuple[float, float, float | None]:
+        map_dist, map_bearing = self._peer_map_distance()
+        lidar_dist = float(getattr(self, "_peer_near_dist", float("inf")))
+        lidar_angle = float(getattr(self, "_peer_near_angle", 0.0))
+        candidates = []
+        if math.isfinite(map_dist):
+            candidates.append((map_dist, map_bearing))
+        if math.isfinite(lidar_dist):
+            candidates.append((lidar_dist, lidar_angle))
+        if not candidates:
+            return float("inf"), map_dist, None
+        peer_dist, bearing = min(candidates, key=lambda item: item[0])
+        return peer_dist, map_dist, bearing
+
+    def _peer_in_aisle(self, peer: str) -> bool:
+        if not self._fleet_active.get(peer, False):
+            return False
+        phase = str(self._fleet_phases.get(peer, "idle") or "idle").lower()
+        return phase in PEER_YIELD_PEER_PHASES
+
+    def _peer_out_of_conflict_zone(self) -> bool:
+        """Peer finished aisle / docked bay — free to move."""
+        peer = self._peer_name()
+        if not self._fleet_active.get(peer, False):
+            return True
+        phase = str(self._fleet_phases.get(peer, "idle") or "idle").lower()
+        if phase in ("idle", "occupying", "serving"):
+            return True
+        pose = self._fleet_poses.get(peer)
+        if pose is not None:
+            x, y, _stamp = pose
+            if abs(float(x)) >= 1.60 and phase in (
+                "occupying",
+                "serving",
+                "approaching",
+            ):
+                return True
+            if float(y) >= 4.50:
+                return phase in ("idle", "returning")
+            if 0.30 <= float(y) < 4.70 and abs(float(x)) < 1.20:
+                return False
+            return phase in ("idle", "returning")
+        return phase in ("idle", "returning")
+
+    def _opposite_side_conflict(self) -> bool:
+        """True when peer and I target opposite sides and peer still owns aisle."""
+        peer = self._peer_name()
+        if not self._peer_in_aisle(peer):
+            return False
+        if self._peer_out_of_conflict_zone():
+            return False
+        my_side = self._table_side(self._fleet_table_ids.get(self.robot_name or ""))
+        peer_side = self._table_side(self._fleet_table_ids.get(peer))
+        return bool(my_side and peer_side and my_side != peer_side)
+
+    def _should_yield_to_peer(self) -> bool:
+        peer = self._peer_name()
+        if not self._fleet_active.get(peer, False):
+            return False
+        if self._peer_out_of_conflict_zone():
+            return False
+        my_p = self._my_fleet_priority
+        peer_p = self._fleet_priorities.get(peer)
+        if my_p is None and peer_p is None:
+            return (self.robot_name or "") == "robot2"
+        if my_p is None:
+            return False
+        if peer_p is None:
+            return False
+        if abs(float(my_p) - float(peer_p)) < 1e-9:
+            return (self.robot_name or "") == "robot2"
+        # priority = -monotonic → later has larger value and must yield.
+        return float(my_p) > float(peer_p)
+
+    def _peer_lateral_gap(self) -> float:
+        live = self._live_pose
+        pose = self._fleet_poses.get(self._peer_name())
+        if live is None or pose is None:
+            return 0.0
+        return abs(float(pose[0]) - float(live[0]))
+
+    def _apply_peer_right_of_way(self, vx: float, wz: float, *, context: str = ""):
+        """Later order yields for head-on / opposite-side peers."""
+        peer = self._peer_name()
+        peer_dist, map_dist, bearing = self._peer_fused_distance()
+        lidar_dist = float(getattr(self, "_peer_near_dist", float("inf")))
+        now = time.monotonic()
+        self._peer_near_prev = peer_dist
+        opposite = self._opposite_side_conflict()
+        lat = self._peer_lateral_gap()
+        ahead = False
+        behind = False
+        if bearing is not None:
+            ahead = abs(bearing) < math.radians(PEER_YIELD_AHEAD_DEG)
+            behind = abs(bearing) > math.radians(110.0)
+
+        def _resume(reason: str):
+            if self._peer_yielding:
+                held = now - (self._peer_yield_started or now)
+                self._peer_yielding = False
+                self._peer_yield_started = None
+                self.get_logger().info(
+                    f"peer yield end ({reason}) held={held:.1f}s "
+                    f"dist={peer_dist if math.isfinite(peer_dist) else float('inf'):.2f}m "
+                    f"map={map_dist if math.isfinite(map_dist) else float('inf'):.2f}m "
+                    f"lidar={lidar_dist if math.isfinite(lidar_dist) else float('inf'):.2f}m "
+                    f"context={context}"
+                )
+            return vx, wz
+
+        ctx = (context or "").lower()
+        if ctx in ("pivot",) or ctx.startswith("legacy:rotate") or "align" in ctx:
+            return _resume("pivot")
+
+        if self._peer_out_of_conflict_zone():
+            return _resume("peer-clear-zone")
+
+        engage = PEER_ENGAGE_M if opposite else PEER_CLEAR_M
+        if (not math.isfinite(peer_dist)) or peer_dist > engage:
+            return _resume("clear")
+
+        if not self._peer_in_aisle(peer) and not opposite:
+            return _resume("not-aisle")
+
+        # Beside pass only when NOT opposite head-on (lanes already separate).
+        if (
+            (not opposite)
+            and lat >= PEER_SAFE_LATERAL_M
+            and peer_dist > PEER_CONTACT_M
+            and not ahead
+        ):
+            return _resume("beside")
+        if behind and peer_dist > PEER_CONTACT_M and not opposite:
+            return _resume("behind")
+
+        if not self._should_yield_to_peer():
+            if peer_dist < PEER_STOP_M and abs(vx) > 1e-3:
+                vx = math.copysign(max(0.16, abs(vx) * 0.80), vx)
+            return _resume("priority")
+
+        held = (
+            (now - self._peer_yield_started)
+            if self._peer_yielding and self._peer_yield_started
+            else 0.0
+        )
+        max_hold = (
+            PEER_YIELD_MAX_HOLD_OPPOSITE_SEC if opposite else PEER_YIELD_MAX_HOLD_SEC
+        )
+        # Creep only after long hold and never while truly head-on & close.
+        if (
+            held >= max_hold
+            and peer_dist > PEER_STOP_M
+            and not (opposite and ahead)
+        ):
+            if abs(vx) > 1e-3:
+                vx = math.copysign(max(0.08, abs(vx) * 0.40), vx)
+            return _resume("yield-timeout-creep")
+
+        if peer_dist > PEER_STOP_M and not (opposite and ahead):
+            if abs(vx) > 1e-3:
+                vx = math.copysign(max(0.08, abs(vx) * 0.50), vx)
+            if self._peer_yielding:
+                return _resume("peel")
+            return vx, wz
+
+        if opposite and ahead and peer_dist > PEER_STOP_M:
+            if abs(vx) > 1e-3:
+                vx = math.copysign(max(0.06, abs(vx) * 0.25), vx)
+
+        if not self._peer_yielding:
+            self._peer_yielding = True
+            self._peer_yield_started = now
+            self._peer_yield_last_log = now
+            ang = math.degrees(bearing) if bearing is not None else float("nan")
+            self.get_logger().warning(
+                f"yielding to {peer}: dist={peer_dist:.2f}m "
+                f"map={map_dist if math.isfinite(map_dist) else float('inf'):.2f}m "
+                f"lidar={lidar_dist if math.isfinite(lidar_dist) else float('inf'):.2f}m "
+                f"angle={ang:.0f}deg lat={lat:.2f}m ahead={ahead} opposite={opposite} "
+                f"my_table={self._fleet_table_ids.get(self.robot_name or '')} "
+                f"peer_table={self._fleet_table_ids.get(peer)} "
+                f"my_p={self._my_fleet_priority} peer_p={self._fleet_priorities.get(peer)} "
+                f"context={context}"
+            )
+        elif now - self._peer_yield_last_log >= 1.0:
+            self._peer_yield_last_log = now
+            self.get_logger().warning(
+                f"still yielding to {peer}: dist={peer_dist:.2f}m "
+                f"held={held:.1f}s lat={lat:.2f}m ahead={ahead} "
+                f"opposite={opposite} context={context}"
+            )
+
+        # Hard-stop for opposite ownership or true head-on proximity.
+        if peer_dist <= PEER_CONTACT_M:
+            return 0.0, 0.0
+        if ahead and peer_dist <= PEER_STOP_M:
+            return 0.0, 0.0
+        if opposite:
+            return 0.0, 0.0
+        if abs(vx) > 1e-3:
+            vx = math.copysign(max(0.06, abs(vx) * 0.30), vx)
+        return vx, wz
+
     def _clear_obstacle_state(self):
         self._obstacle_stop = False
         self._obstacle_stop_started = None
+        self._obstacle_stop_from_peer = False
         self._clearance_start = None
         self._obstacle_scale = 1.0
 
@@ -2005,6 +2686,10 @@ class NavBridge(Node):
                 self._clear_obstacle_state()
                 return
 
+            if mission["mode"] == "park_out":
+                # Reverse off a table must not freeze on dock furniture hits.
+                self._clear_obstacle_state()
+                return
             if mission["mode"] == "legacy_table":
                 stage = mission.get("stage")
                 if stage not in ("move_to_pre_dock", "final_approach"):
@@ -2018,7 +2703,10 @@ class NavBridge(Node):
                     return
                 kind = stages[index].get("kind")
                 if kind not in ("axis_x", "axis_y"):
+                    # Pivot must stay pure yaw — drop sticky peer swerve from
+                    # the previous translate stage so it cannot cancel wz.
                     self._clear_obstacle_state()
+                    self._peer_swerve_wz = 0.0
                     return
 
             # Robot-local (not just forward-cone) safety check: classify each
@@ -2050,12 +2738,23 @@ class NavBridge(Node):
 
             nearest = min(slowdown_hits) if slowdown_hits else float("inf")
             close_points = stop_hits
+            peer_hit = bool(getattr(self, "_peer_hit_this_scan", False))
+            peer_near = float(getattr(self, "_peer_near_dist", float("inf")))
+            # Swerve for nearby peers; never leave a sticky peer hard-stop.
+            if self._obstacle_stop and self._obstacle_stop_from_peer:
+                self._finish_obstacle_stop(peer_near)
+            swerve_range = peer_near if peer_near <= 2.0 else float("inf")
+            self._peer_swerve_wz = self._peer_swerve_bias(
+                peer_hit or math.isfinite(swerve_range),
+                nearest if (peer_hit and math.isfinite(nearest)) else swerve_range,
+            )
 
             now = time.monotonic()
 
             if not self._obstacle_stop:
                 if len(close_points) >= 3:
-                    self._start_obstacle_stop(nearest)
+                    # Person (or non-peer) polygon stop only.
+                    self._start_obstacle_stop(nearest, from_peer=False)
                 elif slowdown_hits:
                     self._obstacle_scale = OBSTACLE_SLOWDOWN_RATIO
                 else:
@@ -2079,20 +2778,23 @@ class NavBridge(Node):
                 if now - getattr(self, "_last_obstacle_log", 0.0) >= 0.5:
                     self._last_obstacle_log = now
                     self.get_logger().info(
-                        f"obstacle distance={nearest:.2f}m scale={self._obstacle_scale:.2f} stop={self._obstacle_stop}"
+                        f"obstacle distance={nearest:.2f}m scale={self._obstacle_scale:.2f} "
+                        f"stop={self._obstacle_stop} peer={self._obstacle_stop_from_peer}"
                     )
 
-    def _start_obstacle_stop(self, distance: float):
+    def _start_obstacle_stop(self, distance: float, from_peer: bool = False):
         if self._obstacle_stop:
             return
         self._obstacle_stop = True
         self._obstacle_stop_started = time.monotonic()
+        self._obstacle_stop_from_peer = bool(from_peer)
         self._clearance_start = None
         self._obstacle_scale = 0.0
         self._target_vx = 0.0
         self._target_wz = 0.0
         self.get_logger().warning(
-            f"주변 장애물(사람) 정지영역 진입: distance={distance:.2f}m, 주행 정지"
+            f"주변 장애물 정지영역 진입: distance={distance:.2f}m, 주행 정지"
+            + (" (peer yield)" if from_peer else "")
         )
 
     def _finish_obstacle_stop(self, distance: float):
@@ -2101,12 +2803,15 @@ class NavBridge(Node):
         paused_for = time.monotonic() - (self._obstacle_stop_started or time.monotonic())
         if self._direct_nav is not None and "stage_start" in self._direct_nav:
             self._direct_nav["stage_start"] += paused_for
+        was_peer = self._obstacle_stop_from_peer
         self._obstacle_stop = False
         self._obstacle_stop_started = None
+        self._obstacle_stop_from_peer = False
         self._clearance_start = None
         self._obstacle_scale = 1.0
         self.get_logger().info(
-            f"전방 장애물(사람) 해제: distance={distance:.2f}m >= 1.2m, 0.5s 안전 지연 완료, 주행 재개"
+            f"전방 장애물 해제: distance={distance:.2f}m, 주행 재개"
+            + (" (peer clear)" if was_peer else "")
         )
 
     def _apply_pending_teleport(self):
@@ -2177,6 +2882,11 @@ class NavBridge(Node):
         return np.clip(wheels, -8.0, 8.0)
 
     def _start_direct_navigation(self, target, x, y, yaw):
+        kitchen_dock = self._active_two_wheel_goal or (
+            0.0,
+            5.25,
+            -math.pi / 2.0,
+        )
         # The manager deliberately sends target=4 again at the beginning of a
         # new order even after the previous return already reported kitchen.
         # Treat that verification request as an arrival acknowledgement.  A
@@ -2184,13 +2894,12 @@ class NavBridge(Node):
         if (
             target == 4
             and self._navigation_location == 4
-            and math.hypot(x - 0.0, y - 5.25) <= 0.10
+            and math.hypot(x - kitchen_dock[0], y - kitchen_dock[1]) <= 0.10
         ):
             self._direct_nav = None
             self._cmd_vx = self._cmd_wz = 0.0
             self._target_vx = self._target_wz = 0.0
             self.navigation_location_pub.publish(Int32(data=4))
-            self.navigation_status_pub.publish(Int32(data=2))
             if self._active_two_wheel_mission_id:
                 mission_id = self._active_two_wheel_mission_id
                 self._publish_two_wheel_mission_status(
@@ -2202,15 +2911,29 @@ class NavBridge(Node):
                 )
                 self._active_two_wheel_mission_id = ""
                 self._active_two_wheel_target = None
+                self._active_two_wheel_goal = None
             self.get_logger().info(
                 "already at kitchen; acknowledged redundant target=4 "
                 "without moving"
             )
             return
+        aisle_x = self._fleet_aisle_x()
         stages = (
-            build_kitchen_route(x, y)
+            build_kitchen_route(
+                x, y, kitchen_dock=kitchen_dock, aisle_x=aisle_x
+            )
             if target == 4
-            else build_table_route(target, x, y)
+            else build_table_route(
+                target,
+                x,
+                y,
+                table_dock=self._active_two_wheel_goal,
+                aisle_x=aisle_x,
+            )
+        )
+        self.get_logger().info(
+            f"route aisle_x={aisle_x:.2f} robot={self.robot_name or 'default'} "
+            f"target={target}"
         )
 
         # Normalize only the first kitchen translation after park-out.
@@ -2260,6 +2983,7 @@ class NavBridge(Node):
         }
         self._obstacle_stop = False
         self._obstacle_stop_started = None
+        self._obstacle_stop_from_peer = False
         self._clearance_start = None
         self._cmd_vx = 0.0
         self._cmd_wz = 0.0
@@ -2278,30 +3002,34 @@ class NavBridge(Node):
         self._target_vx = self._target_wz = 0.0
         self._obstacle_stop = False
         self._obstacle_stop_started = None
+        self._obstacle_stop_from_peer = False
         self._clearance_start = None
 
         if mission_id:
             if success:
-                self._publish_two_wheel_mission_status(
-                    "completed",
-                    "park_out_aligned",
-                    mission_id=mission_id,
-                )
+                for _ in range(5):
+                    self._publish_two_wheel_mission_status(
+                        "completed",
+                        "park_out_aligned",
+                        mission_id=mission_id,
+                    )
                 self.get_logger().info(
                     f"[Mission TX] park-out completed id={mission_id}"
                 )
             else:
-                self._publish_two_wheel_mission_status(
-                    "failed",
-                    "execution_failed",
-                    reason=reason,
-                    mission_id=mission_id,
-                )
+                for _ in range(5):
+                    self._publish_two_wheel_mission_status(
+                        "failed",
+                        "execution_failed",
+                        reason=reason,
+                        mission_id=mission_id,
+                    )
                 self.get_logger().error(
                     f"[Mission TX] park-out failed id={mission_id}: {reason}"
                 )
         self._active_two_wheel_mission_id = ""
         self._active_two_wheel_target = None
+        self._active_two_wheel_goal = None
 
     def _finish_direct_navigation(self, success, reason=""):
         mission = self._direct_nav
@@ -2311,18 +3039,28 @@ class NavBridge(Node):
         self._direct_nav = None
         self._obstacle_stop = False
         self._obstacle_stop_started = None
+        self._obstacle_stop_from_peer = False
         self._clearance_start = None
         self._cmd_vx = self._cmd_wz = 0.0
         self._target_vx = self._target_wz = 0.0
         if success:
             self._navigation_location = target
             self.navigation_location_pub.publish(Int32(data=target))
-            self.navigation_status_pub.publish(Int32(data=2))
             if self._active_two_wheel_mission_id:
                 mission_id = self._active_two_wheel_mission_id
-                self._publish_two_wheel_mission_status(
-                    "completed", "completed", target=target
-                )
+                # Keep completed status warm — ROS wait loops can miss the
+                # first burst and otherwise sit forever on state=accepted.
+                self._completed_mission_latch = {
+                    "mission_id": mission_id,
+                    "target": target,
+                    "until": time.monotonic() + 12.0,
+                    "last_pub": 0.0,
+                }
+                for _ in range(5):
+                    self._publish_two_wheel_mission_status(
+                        "completed", "completed", target=target,
+                        mission_id=mission_id,
+                    )
                 self.get_logger().info(
                     f"[Mission TX] completed id={mission_id} target={target}"
                 )
@@ -2330,15 +3068,18 @@ class NavBridge(Node):
                 self._active_two_wheel_target = None
             self.get_logger().info(f"direct navigation complete target={target}")
         else:
-            self.navigation_status_pub.publish(Int32(data=3))
+            # String mission_status only — ROS retries attempts. Never publish
+            # navigation/status Int32 from Isaac (manager sticky FAILED).
             if self._active_two_wheel_mission_id:
                 mission_id = self._active_two_wheel_mission_id
-                self._publish_two_wheel_mission_status(
-                    "failed",
-                    "execution_failed",
-                    reason=reason,
-                    target=target,
-                )
+                for _ in range(5):
+                    self._publish_two_wheel_mission_status(
+                        "failed",
+                        "execution_failed",
+                        reason=reason,
+                        target=target,
+                        mission_id=mission_id,
+                    )
                 self.get_logger().error(
                     f"[Mission TX] failed id={mission_id} target={target}: "
                     f"{reason}"
@@ -2348,13 +3089,49 @@ class NavBridge(Node):
             self.get_logger().error(
                 f"direct navigation failed target={target}: {reason}"
             )
+        self._active_two_wheel_goal = None
 
     def _update_direct_navigation(self, x, y, yaw):
+        self._live_pose = (float(x), float(y), float(yaw))
         mission = self._direct_nav
         if mission is None:
             return None
         if self._navigation_paused or self._obstacle_stop:
-            return 0.0, 0.0
+            # Legacy peer-stop must never freeze motion — clear and continue.
+            if self._obstacle_stop and self._obstacle_stop_from_peer:
+                self._finish_obstacle_stop(float("inf"))
+            # Table park-out must reverse even if the dock furniture / peer /
+            # person polygon trips a stop. Freezing here left phase=
+            # park_out_backoff until ROS timed out → manager sticky FAILED →
+            # HMI cancelled the other robot's order.
+            if mission.get("mode") == "park_out":
+                if self._obstacle_stop:
+                    self._finish_obstacle_stop(float("inf"))
+                if self._navigation_paused:
+                    self._navigation_paused = False
+                    self._navigation_pause_started = None
+            elif self._navigation_paused or self._obstacle_stop:
+                if (
+                    mission.get("mode") not in ("legacy_table",)
+                    and not self._obstacle_stop
+                ):
+                    stages = mission.get("stages") or []
+                    index = int(mission.get("index", 0))
+                    if index < len(stages) and stages[index].get("kind") == "pivot":
+                        error = self._angle_error(stages[index]["yaw"], yaw)
+                        if abs(error) < math.radians(8.0):
+                            mission["index"] = index + 1
+                            mission["stage_start"] = time.monotonic()
+                            if mission["index"] >= len(stages):
+                                self._finish_direct_navigation(True)
+                                return 0.0, 0.0
+                            return 0.0, 0.0
+                        wz = float(np.clip(1.8 * error, -0.65, 0.65))
+                        if abs(wz) < 0.22:
+                            wz = math.copysign(0.22, error)
+                        return 0.0, wz
+                if self._navigation_paused or self._obstacle_stop:
+                    return 0.0, 0.0
 
         if mission["mode"] == "park_out":
             now = time.monotonic()
@@ -2388,9 +3165,15 @@ class NavBridge(Node):
                 remaining = mission["distance"] - progress
                 yaw_error = self._angle_error(start_yaw, yaw)
                 done = remaining <= 0.025
+                # Soft-complete: leave the dock even if reverse stalls short.
+                if not done:
+                    if progress >= 0.22 and (now - mission["stage_start"]) > 5.0:
+                        done = True
+                    elif progress >= 0.12 and (now - mission["stage_start"]) > 10.0:
+                        done = True
                 vx = 0.0 if done else -min(
                     mission["speed"],
-                    max(0.045, remaining * 0.8),
+                    max(0.06, remaining * 0.8),
                 )
                 wz = 0.0 if done else float(
                     np.clip(1.6 * yaw_error, -0.25, 0.25)
@@ -2400,7 +3183,7 @@ class NavBridge(Node):
                     f"yaw_error={math.degrees(yaw_error):.1f}deg"
                 )
                 timeout = max(
-                    12.0,
+                    14.0,
                     mission["distance"] / max(mission["speed"], 0.05) + 8.0,
                 )
                 if done:
@@ -2414,18 +3197,23 @@ class NavBridge(Node):
 
             else:
                 yaw_error = self._angle_error(mission["target_yaw"], yaw)
-                done = abs(yaw_error) < math.radians(2.5)
+                done = abs(yaw_error) < math.radians(8.0)
+                if not done:
+                    if now - mission["stage_start"] > 3.0 and abs(yaw_error) < math.radians(20.0):
+                        done = True
+                    elif now - mission["stage_start"] > 8.0 and abs(yaw_error) < math.radians(35.0):
+                        done = True
                 vx = 0.0
                 wz = 0.0
                 if not done:
-                    wz = float(np.clip(1.8 * yaw_error, -0.65, 0.65))
-                    if abs(wz) < 0.18:
-                        wz = math.copysign(0.18, yaw_error)
+                    wz = float(np.clip(2.4 * yaw_error, -0.90, 0.90))
+                    if abs(wz) < 0.30:
+                        wz = math.copysign(0.30, yaw_error)
                 detail = (
                     f"target_yaw={math.degrees(mission['target_yaw']):.1f}deg "
                     f"yaw_error={math.degrees(yaw_error):.1f}deg"
                 )
-                timeout = 25.0
+                timeout = 20.0
                 if done:
                     self._finish_park_out(True)
                     return 0.0, 0.0
@@ -2439,6 +3227,27 @@ class NavBridge(Node):
                 )
 
             if now - mission["stage_start"] > timeout:
+                # Prefer completing park-out over sticky FAILED when nearly done.
+                if phase == "backoff":
+                    start_yaw = mission["start_yaw"]
+                    dx = x - mission["start_x"]
+                    dy = y - mission["start_y"]
+                    progress = -(
+                        dx * math.cos(start_yaw)
+                        + dy * math.sin(start_yaw)
+                    )
+                    if progress >= 0.15:
+                        mission["phase"] = "align_opposite"
+                        mission["stage_start"] = now
+                        mission["last_log"] = 0.0
+                        self.get_logger().warning(
+                            "park-out reverse soft-complete after timeout; "
+                            f"{detail}"
+                        )
+                        return 0.0, 0.0
+                if phase == "align_opposite":
+                    self._finish_park_out(True, f"align soft-complete; {detail}")
+                    return 0.0, 0.0
                 self._finish_park_out(
                     False, f"{mission['phase']} timeout; {detail}"
                 )
@@ -2457,23 +3266,45 @@ class NavBridge(Node):
 
         if kind == "pivot":
             error = self._angle_error(stage["yaw"], yaw)
-            done = abs(error) < math.radians(2.5)
+            # Skip near-aligned pivots immediately — corridor starts often sit
+            # at ~10deg and used to wedge forever under peer lat bias.
+            done = abs(error) < math.radians(8.0)
             if not done:
-                wz = float(np.clip(1.8 * error, -0.65, 0.65))
-                if abs(wz) < 0.18:
-                    wz = math.copysign(0.18, error)
-            timeout = 25.0
+                if elapsed > 2.0 and abs(error) < math.radians(15.0):
+                    done = True
+                elif elapsed > 5.0 and abs(error) < math.radians(25.0):
+                    done = True
+            if not done:
+                wz = float(np.clip(2.6 * error, -0.95, 0.95))
+                if abs(wz) < 0.40:
+                    wz = math.copysign(0.40, error)
+            timeout = 18.0
             detail = f"yaw_error={math.degrees(error):.1f}deg"
         else:
             axis = x if kind == "axis_x" else y
+            # Live retarget corridor x to the peer-aware lane so a head-on
+            # pair peels apart even if the stage was planned on a narrow aisle.
+            if kind == "axis_x" and abs(float(stage.get("value", 0.0))) <= 0.85:
+                stage["value"] = self._fleet_aisle_x()
             error = stage["value"] - axis
             done = abs(error) <= 0.05
             desired_yaw = stage["yaw"]
             yaw_error = self._angle_error(desired_yaw, yaw)
             if not done:
-                requested = min(abs(stage["speed"]), max(0.045, abs(error) * 0.8))
-                vx = math.copysign(requested, stage["speed"])
-                wz = float(np.clip(1.6 * yaw_error, -0.28, 0.28))
+                # If heading is blown out, stop translating and re-align.
+                # Otherwise peer lane bias drives the nose into a table bay
+                # (kitchen return → east tables) while still rolling forward.
+                if abs(yaw_error) > math.radians(30.0):
+                    vx = 0.0
+                    wz = float(np.clip(2.2 * yaw_error, -0.80, 0.80))
+                    if abs(wz) < 0.30:
+                        wz = math.copysign(0.30, yaw_error)
+                else:
+                    requested = min(
+                        abs(stage["speed"]), max(0.045, abs(error) * 0.8)
+                    )
+                    vx = math.copysign(requested, stage["speed"])
+                    wz = float(np.clip(1.8 * yaw_error, -0.45, 0.45))
             timeout = 90.0
             detail = f"axis_error={error:.3f}m yaw_error={math.degrees(yaw_error):.1f}deg"
 
@@ -2517,10 +3348,42 @@ class NavBridge(Node):
             next_kind = mission["stages"][mission["index"]]["kind"]
             self.get_logger().info(f"direct stage complete; next={next_kind}")
             return (0.0, 0.0)
-        return (vx * self._obstacle_scale, wz)
+        # Lane hold only while translating and roughly aligned. Constant-sign
+        # peer swerve + raw (aisle-x) on northbound axis_y turned robot1 CW
+        # into +X and parked it in the east table bay (table 4).
+        if kind == "axis_y" and abs(vx) > 1e-3:
+            desired_yaw = float(stage["yaw"])
+            yaw_error = self._angle_error(desired_yaw, yaw)
+            if abs(yaw_error) < math.radians(25.0):
+                aisle = self._fleet_aisle_x()
+                lat_err = aisle - x
+                # Heading-aware crosstrack: northbound (+Y) needs
+                # wz = -k*(aisle-x); southbound the opposite.
+                lane_wz = -1.15 * lat_err * math.sin(desired_yaw)
+                peer_near = float(
+                    getattr(self, "_peer_near_dist", float("inf"))
+                )
+                limit = 0.28
+                peer = self._peer_name()
+                aisle_peer = self._peer_in_aisle(peer)
+                if (
+                    aisle_peer
+                    and math.isfinite(peer_near)
+                    and peer_near < 2.0
+                ):
+                    limit = 0.35
+                    slow = 0.55 if peer_near < 0.8 else 0.85
+                    vx = math.copysign(max(0.12, abs(vx) * slow), vx)
+                lane_wz = float(np.clip(lane_wz, -limit, limit))
+                wz = float(np.clip(wz + lane_wz, -0.55, 0.55))
+        vx, wz = self._apply_peer_right_of_way(
+            vx * self._obstacle_scale, wz, context=kind
+        )
+        return (vx, wz)
 
     def _update_legacy_table_navigation(self, mission, x, y, yaw):
         """Original mobile_manipulator_demo TableNavigationServer controller."""
+        self._live_pose = (float(x), float(y), float(yaw))
         goal_x, goal_y, goal_yaw = mission["goal"]
         pre_x = goal_x - 0.65 * math.cos(goal_yaw)
         pre_y = goal_y - 0.65 * math.sin(goal_yaw)
@@ -2736,6 +3599,9 @@ class NavBridge(Node):
         if now - mission["stage_start"] > timeout:
             self._finish_direct_navigation(False, f"{stage} timeout; {detail}")
             return (0.0, 0.0)
+        vx, wz = self._apply_peer_right_of_way(
+            vx, wz, context=f"legacy:{stage}"
+        )
         return (vx, wz)
 
     def tick(self, _sim_time_sec: float = 0.0):
@@ -2744,15 +3610,9 @@ class NavBridge(Node):
         now_monotonic = time.monotonic()
         if now_monotonic - self._last_navigation_heartbeat >= 1.0:
             self._last_navigation_heartbeat = now_monotonic
-            navigation_active = (
-                self._direct_nav is not None
-                or self._direct_nav_request is not None
-            )
+            # Location only — never publish navigation/status from Isaac.
             self.navigation_location_pub.publish(
                 Int32(data=self._navigation_location)
-            )
-            self.navigation_status_pub.publish(
-                Int32(data=1 if navigation_active else 2)
             )
 
         position, orientation = self.articulation.get_world_pose()
@@ -3238,6 +4098,24 @@ class NavBridge(Node):
         dt = min(max(now - self._last_cmd_time, 1.0 / 240.0), 0.05)
         self._last_cmd_time = now
 
+        latch = getattr(self, "_completed_mission_latch", None)
+        if latch is not None:
+            if now <= float(latch.get("until", 0.0)):
+                if now - float(latch.get("last_pub", 0.0)) >= 0.5:
+                    latch["last_pub"] = now
+                    self._publish_two_wheel_mission_status(
+                        "completed",
+                        "completed",
+                        target=latch.get("target"),
+                        mission_id=latch.get("mission_id"),
+                    )
+                    if latch.get("target") is not None:
+                        self.navigation_location_pub.publish(
+                            Int32(data=int(latch["target"]))
+                        )
+            else:
+                self._completed_mission_latch = None
+
         direct_command = self._update_direct_navigation(x, y, yaw)
         with self._lock:
             target_vx = self._target_vx
@@ -3319,7 +4197,7 @@ class NavBridge(Node):
         tf.transform.translation.z = float(position[2])
         tf.transform.rotation.z = math.sin(yaw * 0.5)
         tf.transform.rotation.w = math.cos(yaw * 0.5)
-        self.tf_broadcaster.sendTransform(tf)
+        self.tf_pub.publish(TFMessage(transforms=[tf]))
 
         self._last_pose = (x, y, yaw)
 
@@ -3343,24 +4221,80 @@ def main():
                 flush=True,
             )
 
-    stage = open_restaurant_and_robot()
-    configure_joint_drives(stage)
-    configure_wheel_contact_material(stage)
-    configure_gripper_contact_material(stage)
-    articulation_path = find_articulation_path(stage)
-    configure_physics_stability(stage, articulation_path)
-    articulation, dof_names = initialize_robot(articulation_path)
+    multi_robot = os.environ.get("NAV_MULTI_ROBOT", "0") == "1"
+    robot_configs = (
+        [
+            {
+                "name": "robot1",
+                "root": "/World/NavRobot1",
+                "spawn": Gf.Vec3d(-0.90, 5.25, 0.01),
+            },
+            {
+                "name": "robot2",
+                "root": "/World/NavRobot2",
+                "spawn": Gf.Vec3d(0.90, 5.25, 0.01),
+            },
+        ]
+        if multi_robot
+        else [
+            {
+                "name": "",
+                "root": "/World/NavRobot",
+                "spawn": SPAWN_POSITION,
+            }
+        ]
+    )
 
-    # The robot USD already contains its D455 and RTX RPLIDAR.  Creating the
-    # old PhysX nav_lidar here produced a second white lidar body at the world
-    # origin, which looked like a detached M0609 link.
-    connect_embedded_sensor_ros(stage)
+    stage = None
+    robot_records = []
+    for index, config in enumerate(robot_configs):
+        set_robot_context(config["root"], config["spawn"])
+        stage = open_restaurant_and_robot(open_stage=index == 0)
+        if index == 0:
+            add_three_by_three_restaurant_tiles(stage)
+        configure_wheel_contact_material(stage)
+        configure_gripper_contact_material(stage)
+        articulation_path = find_articulation_path(stage)
+        configure_physics_stability(stage, articulation_path)
+        robot_records.append((config, articulation_path))
+
+    # The drive authoring pass may safely cover both complete robot
+    # articulations after they have been composed into the stage.
+    configure_joint_drives(stage)
+    initialized_records = []
+    for index, (config, articulation_path) in enumerate(robot_records):
+        set_robot_context(config["root"], config["spawn"])
+        articulation, dof_names = initialize_robot(
+            articulation_path,
+            name=config["name"] or "nav_ridgeback",
+        )
+        # Articulation init can rematerialize nested sensor physics schemas.
+        sanitize_embedded_rsd455(stage, robot_root=config["root"])
+        # Preserve each complete robot's embedded D455.  Only the first graph
+        # publishes the shared simulation clock.
+        connect_embedded_sensor_ros(
+            stage,
+            robot_root=config["root"],
+            robot_name=config["name"],
+            publish_clock=index == 0,
+        )
+        initialized_records.append((config, articulation, dof_names))
 
     if not rclpy.ok():
         rclpy.init(args=[])
-    bridge = NavBridge(articulation, dof_names, stage)
+    bridges = []
     executor = SingleThreadedExecutor()
-    executor.add_node(bridge)
+    for config, articulation, dof_names in initialized_records:
+        bridge = NavBridge(
+            articulation,
+            dof_names,
+            stage,
+            robot_name=config["name"],
+            robot_root=config["root"],
+        )
+        bridges.append(bridge)
+        executor.add_node(bridge)
+    bridge = bridges[0]
 
     timeline = omni.timeline.get_timeline_interface()
     if not timeline.is_playing():
@@ -3368,7 +4302,8 @@ def main():
 
     print(
         f"[nav_robot] domain={os.environ.get('ROS_DOMAIN_ID', '0')} "
-        f"spawn=({SPAWN_POSITION[0]:.2f},{SPAWN_POSITION[1]:.2f}) "
+        f"mode={'multi-integrated' if multi_robot else 'single-integrated'} "
+        f"robots={[(item['name'] or 'default', tuple(item['spawn'])) for item in robot_configs]} "
         f"yaw={SPAWN_YAW:.2f}",
         flush=True,
     )
@@ -3462,7 +4397,9 @@ def main():
                     crossing_pedestrian_controller = None
             try:
                 sim_time = timeline.get_current_time()
-                bridge.tick(float(sim_time))
+                for config, active_bridge in zip(robot_configs, bridges):
+                    set_robot_context(config["root"], config["spawn"])
+                    active_bridge.tick(float(sim_time))
             except Exception as exc:
                 print(f"[err] tick error: {exc}", flush=True)
     finally:
@@ -3471,7 +4408,8 @@ def main():
         if crossing_pedestrian_controller is not None:
             crossing_pedestrian_controller.shutdown()
         executor.shutdown()
-        bridge.destroy_node()
+        for active_bridge in bridges:
+            active_bridge.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
         simulation_app.close()
