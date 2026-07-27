@@ -284,6 +284,16 @@ FRONT_LIDAR_TOPIC = "/scan"
 
 LIDAR_MIN_RANGE = 0.20
 PEER_HARD_STOP_M = 1.10
+# Yield only for a real head-on close pass; resume as soon as gap opens.
+PEER_YIELD_RANGE_M = 0.85
+PEER_YIELD_CLEAR_M = 1.05
+PEER_YIELD_HARD_M = 0.65
+PEER_YIELD_MAX_SEC = 1.2
+PEER_YIELD_AHEAD_DEG = 40.0
+# Peer must be moving in the aisle — ignore table serve / park-out ghosts.
+PEER_YIELD_PEER_PHASES = frozenset(
+    {"approaching", "returning", "holding"}
+)
 # Corridor half-separation so simultaneous trips do not share the spine.
 FLEET_AISLE_OFFSET_M = 0.55
 FLEET_PASS_EXTRA_M = 0.30
@@ -1369,6 +1379,12 @@ class NavBridge(Node):
         self._fleet_phases = {}
         self._my_fleet_priority = None
         self._peer_swerve_wz = 0.0
+        self._peer_yielding = False
+        self._peer_yield_last_log = 0.0
+        self._peer_yield_started = None
+        self._peer_yield_gave_up = False
+        self._peer_near_angle = 0.0
+        self._peer_near_prev = float("inf")
         for peer in ("robot1", "robot2"):
             self.create_subscription(
                 String,
@@ -1997,6 +2013,7 @@ class NavBridge(Node):
         person_hits = []
         self._peer_hit_this_scan = False
         self._peer_near_dist = float("inf")
+        self._peer_near_angle = 0.0
         for index in range(LIDAR_SAMPLES):
             angle = angle_min + index * angle_increment
             world_angle = yaw + angle
@@ -2080,7 +2097,9 @@ class NavBridge(Node):
                 # NEVER hard-stop for the peer robot. Mutual peer-stop at
                 # ~0.3m caused permanent face-to-face pending. Pass with
                 # opposite-lane swerve instead (person obstacles still stop).
-                self._peer_near_dist = min(self._peer_near_dist, distance)
+                if distance < self._peer_near_dist:
+                    self._peer_near_dist = distance
+                    self._peer_near_angle = float(angle)
                 self._peer_hit_this_scan = True
             if is_person and math.isfinite(distance):
                 obstacle_ranges.append(distance)
@@ -2180,7 +2199,12 @@ class NavBridge(Node):
         else:
             return 0.0
         peer_near = float(getattr(self, "_peer_near_dist", float("inf")))
-        if math.isfinite(peer_near) and peer_near < 2.0:
+        peer = self._peer_name()
+        if (
+            self._peer_in_aisle(peer)
+            and math.isfinite(peer_near)
+            and peer_near < 2.0
+        ):
             extra = FLEET_PASS_EXTRA_M * max(0.0, min(1.0, (2.0 - peer_near) / 1.4))
             return base + sign * extra
         return base
@@ -2218,6 +2242,150 @@ class NavBridge(Node):
         `_update_direct_navigation` toward `_fleet_aisle_x()`.
         """
         return 0.0
+
+    def _peer_name(self) -> str:
+        return "robot2" if (self.robot_name or "") == "robot1" else "robot1"
+
+    def _peer_in_aisle(self, peer: str) -> bool:
+        """True only when the peer is also travelling the shared corridor."""
+        if not self._fleet_active.get(peer, False):
+            return False
+        phase = str(self._fleet_phases.get(peer, "idle") or "idle").lower()
+        return phase in PEER_YIELD_PEER_PHASES
+
+    def _should_yield_to_peer(self) -> bool:
+        """Earlier fleet priority keeps going; later order waits.
+
+        Priority is -monotonic_time at order start, so earlier => larger value.
+        On a tie (or missing priorities), robot2 yields so both never stop.
+        """
+        peer = self._peer_name()
+        if not self._peer_in_aisle(peer):
+            return False
+        my_p = self._my_fleet_priority
+        peer_p = self._fleet_priorities.get(peer)
+        if my_p is None and peer_p is None:
+            return (self.robot_name or "") == "robot2"
+        if my_p is None:
+            return True
+        if peer_p is None:
+            return False
+        if abs(float(my_p) - float(peer_p)) < 1e-9:
+            return (self.robot_name or "") == "robot2"
+        return float(my_p) < float(peer_p)
+
+    def _apply_peer_right_of_way(self, vx: float, wz: float, *, context: str = ""):
+        """Brief head-on yield only. Never freeze pivots or empty-corridor ghosts."""
+        peer_near = float(getattr(self, "_peer_near_dist", float("inf")))
+        peer_angle = float(getattr(self, "_peer_near_angle", 0.0))
+        now = time.monotonic()
+        prev = float(getattr(self, "_peer_near_prev", float("inf")))
+        # Closing = gap shrinking; opening/stable means no need to wait.
+        closing = math.isfinite(peer_near) and (
+            (not math.isfinite(prev)) or peer_near < prev - 0.025
+        )
+        self._peer_near_prev = peer_near
+
+        def _creep():
+            nonlocal vx
+            if abs(vx) < 1e-3:
+                vx = 0.14
+            else:
+                vx = math.copysign(max(0.12, abs(vx) * 0.55), vx)
+            return vx, wz
+
+        def _resume(reason: str):
+            if self._peer_yielding:
+                held = now - (self._peer_yield_started or now)
+                self._peer_yielding = False
+                self._peer_yield_started = None
+                self.get_logger().info(
+                    f"peer yield end ({reason}) held={held:.1f}s "
+                    f"dist={peer_near if math.isfinite(peer_near) else float('inf'):.2f}m "
+                    f"context={context}"
+                )
+            if reason in (
+                "clear",
+                "beside",
+                "priority",
+                "pivot",
+                "not-aisle",
+                "opening",
+                "not-ahead",
+            ):
+                self._peer_yield_gave_up = False
+            return vx, wz
+
+        # Pivots / dock turns must never hard-stop — U-turn looked like a wait
+        # with an empty aisle when lidar briefly swept the peer.
+        ctx = (context or "").lower()
+        if ctx in ("pivot",) or ctx.startswith("legacy:rotate") or "align" in ctx:
+            return _resume("pivot")
+
+        if (not math.isfinite(peer_near)) or peer_near > PEER_YIELD_CLEAR_M:
+            return _resume("clear")
+
+        peer = self._peer_name()
+        if not self._peer_in_aisle(peer):
+            # Peer serving / parking at a table is not an aisle blocker.
+            return _resume("not-aisle")
+
+        ahead = abs(peer_angle) < math.radians(PEER_YIELD_AHEAD_DEG)
+        if peer_near > PEER_YIELD_HARD_M and not ahead:
+            return _resume("beside")
+
+        # Separating or parallel — keep rolling; only head-on closers wait.
+        if not closing and peer_near > PEER_YIELD_HARD_M:
+            return _resume("opening")
+
+        if peer_near > PEER_YIELD_RANGE_M and not self._peer_yielding:
+            return vx, wz
+
+        if not self._should_yield_to_peer():
+            if peer_near < PEER_YIELD_HARD_M and abs(vx) > 1e-3:
+                vx = math.copysign(max(0.16, abs(vx) * 0.80), vx)
+            return _resume("priority")
+
+        if self._peer_yield_gave_up:
+            return _creep()
+
+        # Medium range: slow, do not full-stop (avoids empty-looking stalls).
+        if peer_near > PEER_YIELD_HARD_M:
+            if abs(vx) > 1e-3:
+                vx = math.copysign(max(0.10, abs(vx) * 0.45), vx)
+            if self._peer_yielding:
+                return _resume("opening")
+            return vx, wz
+
+        if not self._peer_yielding:
+            self._peer_yielding = True
+            self._peer_yield_started = now
+            self._peer_yield_last_log = now
+            self.get_logger().warning(
+                f"yielding to {peer}: dist={peer_near:.2f}m "
+                f"angle={math.degrees(peer_angle):.0f}deg "
+                f"phase={self._fleet_phases.get(peer)} "
+                f"my_p={self._my_fleet_priority} "
+                f"peer_p={self._fleet_priorities.get(peer)} "
+                f"context={context}"
+            )
+        elif now - self._peer_yield_last_log >= 1.0:
+            self._peer_yield_last_log = now
+            self.get_logger().warning(
+                f"still yielding to {peer}: dist={peer_near:.2f}m "
+                f"held={now - (self._peer_yield_started or now):.1f}s "
+                f"context={context}"
+            )
+
+        held = now - (self._peer_yield_started or now)
+        if held >= PEER_YIELD_MAX_SEC:
+            self._peer_yield_gave_up = True
+            _resume("timeout-creep")
+            return _creep()
+
+        # Full stop only inside the hard bubble on a closing head-on.
+        return 0.0, 0.0
+
     def _clear_obstacle_state(self):
         self._obstacle_stop = False
         self._obstacle_stop_started = None
@@ -2916,13 +3084,22 @@ class NavBridge(Node):
                     getattr(self, "_peer_near_dist", float("inf"))
                 )
                 limit = 0.28
-                if math.isfinite(peer_near) and peer_near < 2.0:
+                peer = self._peer_name()
+                aisle_peer = self._peer_in_aisle(peer)
+                if (
+                    aisle_peer
+                    and math.isfinite(peer_near)
+                    and peer_near < 2.0
+                ):
                     limit = 0.35
-                    slow = 0.50 if peer_near < 0.8 else 0.80
+                    slow = 0.55 if peer_near < 0.8 else 0.85
                     vx = math.copysign(max(0.12, abs(vx) * slow), vx)
                 lane_wz = float(np.clip(lane_wz, -limit, limit))
                 wz = float(np.clip(wz + lane_wz, -0.55, 0.55))
-        return (vx * self._obstacle_scale, wz)
+        vx, wz = self._apply_peer_right_of_way(
+            vx * self._obstacle_scale, wz, context=kind
+        )
+        return (vx, wz)
 
     def _update_legacy_table_navigation(self, mission, x, y, yaw):
         """Original mobile_manipulator_demo TableNavigationServer controller."""
@@ -3141,6 +3318,9 @@ class NavBridge(Node):
         if now - mission["stage_start"] > timeout:
             self._finish_direct_navigation(False, f"{stage} timeout; {detail}")
             return (0.0, 0.0)
+        vx, wz = self._apply_peer_right_of_way(
+            vx, wz, context=f"legacy:{stage}"
+        )
         return (vx, wz)
 
     def tick(self, _sim_time_sec: float = 0.0):
