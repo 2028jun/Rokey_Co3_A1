@@ -72,6 +72,10 @@ class NavigationSubsystemNode(Node):
         self._tracker = None
         self._controller: SimplifiedPathNavigator | None = None
         self._active_command: int | None = None
+        # Keep the last destination that this process actually completed.
+        # AMCL/map localization can briefly be stale after table docking, so
+        # it must not be the only signal used to decide whether to park out.
+        self._last_successful_location: int | None = None
         self._paused = False
         self._last_phase = "idle"
         self._last_mission_id = ""
@@ -208,6 +212,7 @@ class NavigationSubsystemNode(Node):
                 syaw,
             ):
                 raise RuntimeError("spawn teleport/AMCL synchronization failed")
+            self._last_successful_location = KITCHEN_COMMAND
             self._location_pub.publish(Int32(data=KITCHEN_COMMAND))
             self._publish_status(
                 NAV_ARRIVED, "SUCCEEDED", "initialized"
@@ -234,7 +239,8 @@ class NavigationSubsystemNode(Node):
                 raise RuntimeError("current localization unavailable")
 
             if command == KITCHEN_COMMAND:
-                self._park_out_if_needed(current)
+                force_park_out = self._last_successful_location in TABLE_COMMANDS
+                self._park_out_if_needed(current, force=force_park_out)
                 current = wait_for_existing_localization(
                     self._worker_nav,
                     self._tf_buffer,
@@ -261,8 +267,11 @@ class NavigationSubsystemNode(Node):
             )
             if not ok:
                 raise RuntimeError(
-                    self._failure_reason or f"{label} mission failed"
+                    self._failure_reason
+                    or self._controller.last_failure_reason
+                    or f"{label} mission failed"
                 )
+            self._last_successful_location = command
             self._location_pub.publish(Int32(data=command))
             self._publish_status(NAV_ARRIVED, "SUCCEEDED", "completed")
         except Exception as exc:  # noqa: BLE001
@@ -274,13 +283,22 @@ class NavigationSubsystemNode(Node):
                 self._worker = None
 
     def _park_out_if_needed(
-        self, current_pose: tuple[float, float, float]
+        self,
+        current_pose: tuple[float, float, float],
+        *,
+        force: bool = False,
     ) -> None:
         px, py, pyaw = current_pose
         near_table_row = min(abs(py + 2.20), abs(py - 0.70)) <= 0.70
         parked_at_table = abs(px) >= 1.15 and near_table_row
-        if not parked_at_table:
+        if not parked_at_table and not force:
             return
+
+        if force and not parked_at_table:
+            self.get_logger().warning(
+                "forcing park-out after a completed table mission despite "
+                f"localization pose=({px:.2f}, {py:.2f})"
+            )
 
         expected_yaw = math.pi if px < 0.0 else 0.0
         yaw_error = math.atan2(

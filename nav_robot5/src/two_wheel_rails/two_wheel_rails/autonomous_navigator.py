@@ -293,6 +293,7 @@ class SimplifiedPathNavigator:
         self._corridor_claim_grace_sec = 2.5
 
         self._last_status: dict | None = None
+        self._last_failure_reason = ""
 
         path_qos = QoSProfile(
             depth=1,
@@ -1177,8 +1178,10 @@ class SimplifiedPathNavigator:
         label: str = "goal",
         position_then_align: bool = False,
     ) -> bool:
+        self._last_failure_reason = ""
         if not self._wait_for_navigation_inputs(timeout_sec=8.0):
-            print(f"[{label}] navigation aborted: required inputs are unavailable", flush=True)
+            self._last_failure_reason = "required navigation inputs are unavailable"
+            print(f"[{label}] navigation aborted: {self._last_failure_reason}", flush=True)
             return False
 
         gx = goal.pose.position.x
@@ -1250,6 +1253,9 @@ class SimplifiedPathNavigator:
                 if not self._wait_for_table_free(
                     table_id, self._hold_wait_timeout_sec
                 ):
+                    self._last_failure_reason = (
+                        f"timeout waiting for table_{table_id} to become free"
+                    )
                     self._publish_fleet_intent(active=False)
                     return False
                 print(
@@ -1264,13 +1270,15 @@ class SimplifiedPathNavigator:
 
         map_p = self._map_pose()
         if map_p is None:
-            print(f"[{label}] planning failed: cannot resolve map pose", flush=True)
+            self._last_failure_reason = "planning failed: cannot resolve map pose"
+            print(f"[{label}] {self._last_failure_reason}", flush=True)
             return False
         start_pt = (map_p[0], map_p[1])
         try:
             points = self._plan_orthogonal_path(start_pt, approach_pt)
         except RuntimeError as exc:
-            print(f"[{label}] orthogonal planning failed: {exc}", flush=True)
+            self._last_failure_reason = f"orthogonal planning failed: {exc}"
+            print(f"[{label}] {self._last_failure_reason}", flush=True)
             return False
 
         if self._intent_priority == 0.0:
@@ -1310,7 +1318,14 @@ class SimplifiedPathNavigator:
             return True
 
         self._publish_fleet_intent(active=False)
+        if not self._last_failure_reason:
+            self._last_failure_reason = f"{label} route mission failed"
         return False
+
+    @property
+    def last_failure_reason(self) -> str:
+        return self._last_failure_reason
+
     def _wait_for_navigation_inputs(self, timeout_sec: float = 8.0) -> bool:
         # Fast path for normal operation: startup readiness was already cached
         # by _warm_navigation_inputs before the order arrived.
