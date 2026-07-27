@@ -27,6 +27,10 @@ export ROS_LOCALHOST_ONLY=0
 ./tools/t2_ros.sh
 ```
 
+이 launch는 각 로봇의 로컬 raw 카메라를 JPEG 품질 90으로 압축해
+`/robot*/camera/color/image_raw/compressed`로 발행합니다. 원격 구독자가
+연결되기 전에는 JPEG 인코딩을 수행하지 않습니다.
+
 `robot1`, `robot2` 모두 `Navigation is fully initialized and ready!`를 출력할
 때까지 주문을 넣지 않습니다. 기본값은 전체 서빙 활성화 및 로컬 YOLO
 비활성화입니다.
@@ -40,7 +44,7 @@ export ROS_LOCALHOST_ONLY=0
 ./tools/run_remote_yolo.sh
 ```
 
-### 터미널 4 — 메인 컴퓨터: HMI
+### 터미널 4 — HMI 컴퓨터
 
 ```bash
 cd /home/rokey/cobot3_ws
@@ -50,6 +54,11 @@ export ROS_DOMAIN_ID=101
 export ROS_LOCALHOST_ONLY=0
 ./tools/t3_hmi.sh
 ```
+
+HMI를 별도 컴퓨터에서 실행해도 됩니다. 메인·YOLO 컴퓨터와 같은
+`ROS_DOMAIN_ID`를 사용하고 `ROS_LOCALHOST_ONLY=0`으로 설정하십시오. HMI는
+두 로봇의 `/robot*/camera/color/image_raw/compressed`만 구독하며 JPEG를
+재인코딩하지 않고 브라우저로 전달합니다.
 
 브라우저에서 주문 화면 `http://localhost:8000`, 관리자·테스트 화면
 `http://localhost:8000/admin`을 엽니다.
@@ -173,6 +182,8 @@ enable_serving_workers:=true
 navigation_only:=false
 serialize_shared_payloads:=false
 enable_local_hand_detection:=false
+enable_jpeg_transport:=true
+jpeg_quality:=90
 use_sim_time:=true
 ```
 
@@ -193,7 +204,8 @@ ros2 launch serving_hmi hmi.launch.py
 ```
 
 브라우저에서 `http://localhost:8000`을 엽니다. HMI 카메라 기본 연결은
-`/robot1/camera/color/image_raw`, 위치 연결은 `/robot1/nav_robot/odom`입니다.
+`/robot1/camera/color/image_raw/compressed`, 위치 연결은
+`/robot1/nav_robot/odom`입니다.
 
 **터미널 4: 별도 YOLO 컴퓨터**
 
@@ -476,9 +488,11 @@ export ROS_LOCALHOST_ONLY=0
 ./tools/run_remote_yolo.sh
 ```
 
-외부 감지기는 기존 토픽 계약을 변경하지 않습니다.
+외부 감지기는 JPEG 토픽만 구독하므로 무압축 영상은 메인 컴퓨터 밖으로
+전송되지 않습니다. 안전 출력 토픽 계약은 변경되지 않습니다.
 
-- 입력: `/robot1/camera/color/image_raw`, `/robot2/camera/color/image_raw`
+- 입력: `/robot1/camera/color/image_raw/compressed`,
+  `/robot2/camera/color/image_raw/compressed`
 - 서빙 상태 입력: `/robot1/serving_robot/table_arrived`,
   `/robot2/serving_robot/table_arrived`
 - 안전 출력: `/robot1/hand_safety/intrusion`,
@@ -487,16 +501,17 @@ export ROS_LOCALHOST_ONLY=0
 연결 확인은 양쪽 컴퓨터에서 다음과 같이 합니다.
 
 ```bash
-ros2 topic hz /robot1/camera/color/image_raw
-ros2 topic hz /robot2/camera/color/image_raw
+ros2 topic hz /robot1/camera/color/image_raw/compressed
+ros2 topic hz /robot2/camera/color/image_raw/compressed
+ros2 topic bw /robot1/camera/color/image_raw/compressed
 ros2 node list | grep hand_detector
 ros2 topic echo /robot1/hand_safety/intrusion
 ```
 
 카메라 해상도는 `1280x960`으로 유지되고 기본 발행률은 로봇당 15 Hz입니다.
-무압축 RGB 두 스트림은 이론상 약 111 MB/s이므로 Wi-Fi보다 1 GbE 이상의
-유선 네트워크를 권장합니다. 패킷 손실이 있으면 해상도를 낮추지 말고 먼저
-ROS image transport 압축 또는 2.5 GbE를 적용하십시오.
+기본 JPEG 품질은 90이며 실제 대역폭은 장면 복잡도에 따라 달라집니다.
+품질을 바꿀 때는 메인 launch에 `jpeg_quality:=85`처럼 지정하십시오. 원격
+YOLO의 해상도와 15 Hz 추론 설정은 그대로 유지됩니다.
 
 원격 YOLO를 사용할 수 없는 진단 상황에서만 메인 컴퓨터에서 다음과 같이
 로컬 감지기를 임시 활성화합니다. 동시에 원격 감지기를 실행하면 같은 출력

@@ -3,6 +3,7 @@ import sys
 import json
 import time
 import asyncio
+import base64
 import threading
 from typing import Set
 
@@ -53,7 +54,9 @@ class HMIBridgeNode(Node):
             self.get_parameter('robot_namespace').value
         ).strip('/')
         topic_prefix = f'/{robot_namespace}' if robot_namespace else ''
-        self.camera_topic = f'{topic_prefix}/camera/color/image_raw'
+        self.camera_topic = (
+            f'{topic_prefix}/camera/color/image_raw/compressed'
+        )
         self.odom_topic = f'{topic_prefix}/nav_robot/odom'
         
         # System status state
@@ -170,17 +173,18 @@ class HMIBridgeNode(Node):
                 status_qos,
             ))
 
-        # Per-robot camera and odometry subscriptions. The multi-robot launch
-        # publishes both streams below their robot namespaces.
-        from sensor_msgs.msg import Image
+        # Subscribe only to JPEG transport. If this HMI runs on another PC,
+        # subscribing to Image here would pull both 1280x960 raw streams over
+        # DDS and recreate the network saturation avoided by remote YOLO.
+        from sensor_msgs.msg import CompressedImage
         self.last_camera_base64 = ""
         self.last_camera_recv_time = 0.0
         self.last_camera_error_time = 0.0
         self._robot_telemetry_subs = []
         for robot_name in ("robot1", "robot2"):
             self._robot_telemetry_subs.append(self.create_subscription(
-                Image,
-                f'/{robot_name}/camera/color/image_raw',
+                CompressedImage,
+                f'/{robot_name}/camera/color/image_raw/compressed',
                 self._make_camera_callback(robot_name),
                 qos_profile_sensor_data,
             ))
@@ -261,43 +265,19 @@ class HMIBridgeNode(Node):
 
     @staticmethod
     def _encode_camera_frame(msg):
-        import base64
-        import cv2
-        import numpy as np
-
-        height = msg.height
-        width = msg.width
-        encoding = msg.encoding.lower()
-        channels = {
-            'mono8': 1,
-            'rgb8': 3,
-            'bgr8': 3,
-            'rgba8': 4,
-            'bgra8': 4,
-        }.get(encoding)
-        if channels is None:
-            raise ValueError(f"unsupported image encoding: {msg.encoding}")
-
-        row_bytes = int(msg.step) if msg.step else width * channels
-        rows = np.frombuffer(msg.data, dtype=np.uint8).reshape(height, row_bytes)
-        pixels = rows[:, :width * channels]
-        img = (
-            pixels.reshape(height, width)
-            if channels == 1
-            else pixels.reshape(height, width, channels)
+        """Wrap an existing JPEG message for the browser without transcoding."""
+        image_format = str(msg.format).lower()
+        if 'jpeg' not in image_format and 'jpg' not in image_format:
+            raise ValueError(
+                f"unsupported compressed image format: {msg.format}"
+            )
+        payload = bytes(msg.data)
+        if not payload:
+            raise ValueError("compressed camera payload is empty")
+        return (
+            "data:image/jpeg;base64,"
+            + base64.b64encode(payload).decode('ascii')
         )
-        if encoding == 'rgb8':
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        elif encoding == 'rgba8':
-            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-        elif encoding == 'bgra8':
-            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-
-        ok, buffer = cv2.imencode(
-            '.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 60])
-        if not ok:
-            raise RuntimeError("JPEG encoding failed")
-        return "data:image/jpeg;base64," + base64.b64encode(buffer).decode('utf-8')
 
     def _make_camera_callback(self, robot_name):
         def callback(msg):
@@ -341,52 +321,6 @@ class HMIBridgeNode(Node):
             self.robot_connected = True
             self.last_robot_status_recv_time = time.time()
         return callback
-
-    def _legacy_table_camera_callback(self, msg):
-        try:
-            import cv2
-            import numpy as np
-            import base64
-
-            height = msg.height
-            width = msg.width
-            encoding = msg.encoding.lower()
-            channels = {
-                'mono8': 1,
-                'rgb8': 3,
-                'bgr8': 3,
-                'rgba8': 4,
-                'bgra8': 4,
-            }.get(encoding)
-            if channels is None:
-                raise ValueError(f"unsupported image encoding: {msg.encoding}")
-
-            row_bytes = int(msg.step) if msg.step else width * channels
-            rows = np.frombuffer(msg.data, dtype=np.uint8).reshape(height, row_bytes)
-            pixels = rows[:, :width * channels]
-            if channels == 1:
-                img = pixels.reshape(height, width)
-            else:
-                img = pixels.reshape(height, width, channels)
-            if encoding == 'rgb8':
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            elif encoding == 'rgba8':
-                img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-            elif encoding == 'bgra8':
-                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-
-            ok, buffer = cv2.imencode(
-                '.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 60])
-            if not ok:
-                raise RuntimeError("JPEG encoding failed")
-            b64_str = base64.b64encode(buffer).decode('utf-8')
-            self.last_camera_base64 = f"data:image/jpeg;base64,{b64_str}"
-            self.last_camera_recv_time = time.time()
-        except Exception as e:
-            now = time.time()
-            if now - self.last_camera_error_time >= 5.0:
-                self.last_camera_error_time = now
-                self.get_logger().warning(f"Camera frame conversion failed: {e}")
 
     def clock_callback(self, msg: Clock):
         now_wall = time.time()

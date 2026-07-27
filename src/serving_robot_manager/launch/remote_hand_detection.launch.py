@@ -17,7 +17,8 @@ def _detector(robot_name: str, use_sim_time, device, process_rate):
             output="screen",
             parameters=[{
                 "use_sim_time": use_sim_time,
-                "input_topic": "camera/color/image_raw",
+                "input_topic": "camera/color/image_raw/compressed",
+                "input_transport": "compressed",
                 "roi_intrusion_topic": "hand_safety/intrusion",
                 "table_arrived_topic": "serving_robot/table_arrived",
                 "confidence": 0.70,

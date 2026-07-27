@@ -35,6 +35,8 @@ def _worker(
     enable_serving,
     navigation_only,
     enable_local_hand_detection,
+    enable_jpeg_transport,
+    jpeg_quality,
 ):
     nav_share = get_package_share_directory("two_wheel_rails")
     nav_launch = os.path.join(nav_share, "launch", "nav2.launch.py")
@@ -89,6 +91,20 @@ def _worker(
             condition=IfCondition(enable_serving),
         ),
         Node(
+            package="hand_safety",
+            executable="jpeg_compressor_node",
+            name="camera_jpeg_compressor",
+            output="screen",
+            parameters=[{
+                "input_topic": "camera/color/image_raw",
+                "output_topic": "camera/color/image_raw/compressed",
+                "jpeg_quality": ParameterValue(
+                    jpeg_quality, value_type=int
+                ),
+            }],
+            condition=IfCondition(enable_jpeg_transport),
+        ),
+        Node(
             package="hand_safety", executable="hand_detector_node",
             name="hand_detector", output="screen",
             parameters=[{
@@ -117,6 +133,8 @@ def generate_launch_description():
     enable_local_hand_detection = LaunchConfiguration(
         "enable_local_hand_detection"
     )
+    enable_jpeg_transport = LaunchConfiguration("enable_jpeg_transport")
+    jpeg_quality = LaunchConfiguration("jpeg_quality")
     serialize_shared_payloads = LaunchConfiguration("serialize_shared_payloads")
     nav_share = get_package_share_directory("two_wheel_rails")
     config = os.path.join(nav_share, "config")
@@ -125,11 +143,13 @@ def generate_launch_description():
         "robot1", "-0.90", os.path.join(config, "routes_robot1.yaml"),
         use_sim_time, enable_serving, navigation_only,
         enable_local_hand_detection,
+        enable_jpeg_transport, jpeg_quality,
     )
     robot2_worker = _worker(
         "robot2", "0.90", os.path.join(config, "routes_robot2.yaml"),
         use_sim_time, enable_serving, navigation_only,
         enable_local_hand_detection,
+        enable_jpeg_transport, jpeg_quality,
     )
     robot1_gate = Node(
         package="two_wheel_rails",
@@ -206,6 +226,19 @@ def generate_launch_description():
                 "is false because remote_hand_detection.launch.py runs on "
                 "the separate GPU worker."
             ),
+        ),
+        DeclareLaunchArgument(
+            "enable_jpeg_transport",
+            default_value="true",
+            description=(
+                "Compress each local raw camera stream for the remote YOLO "
+                "worker. Encoding remains idle until a subscriber connects."
+            ),
+        ),
+        DeclareLaunchArgument(
+            "jpeg_quality",
+            default_value="90",
+            description="JPEG quality for remote camera transport (1-100)",
         ),
         DeclareLaunchArgument(
             "serialize_shared_payloads",

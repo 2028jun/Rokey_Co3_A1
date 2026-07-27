@@ -25,10 +25,11 @@ from rclpy.qos import (
     ReliabilityPolicy,
     qos_profile_sensor_data,
 )
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage, Image
 from std_msgs.msg import Bool, String
 from ultralytics import YOLO
 
+from hand_safety.jpeg_codec import decode_jpeg
 from hand_safety.roi_intrusion import box_intrudes_roi, get_roi_polygon
 
 
@@ -47,6 +48,7 @@ class HandDetectorNode(Node):
             "input_topic",
             "/camera/color/image_raw",
         )
+        self.declare_parameter("input_transport", "raw")
         self.declare_parameter(
             "output_image_topic", "/hand_detection/image"
         )
@@ -88,6 +90,9 @@ class HandDetectorNode(Node):
         self.input_topic = str(
             self.get_parameter("input_topic").value
         )
+        self.input_transport = str(
+            self.get_parameter("input_transport").value
+        ).lower()
         output_image_topic = str(
             self.get_parameter("output_image_topic").value
         )
@@ -153,6 +158,10 @@ class HandDetectorNode(Node):
 
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError("confidence must be between 0.0 and 1.0")
+        if self.input_transport not in {"raw", "compressed"}:
+            raise ValueError(
+                "input_transport must be either 'raw' or 'compressed'"
+            )
         if not 0.0 <= self.iou <= 1.0:
             raise ValueError("iou must be between 0.0 and 1.0")
         if self.image_size <= 0:
@@ -223,7 +232,7 @@ class HandDetectorNode(Node):
 
         self.bridge = CvBridge()
         self.frame_lock = threading.Lock()
-        self.latest_message: Image | None = None
+        self.latest_message: Image | CompressedImage | None = None
         self.frame_sequence = 0
         self.last_processed_sequence = 0
         self.previous_time: float | None = None
@@ -250,8 +259,13 @@ class HandDetectorNode(Node):
         # Sensor-data QoS keeps the camera queue short, so the executor gets
         # recent frames instead of building an unbounded image backlog.
         self.image_callback_group = MutuallyExclusiveCallbackGroup()
+        input_message_type = (
+            CompressedImage
+            if self.input_transport == "compressed"
+            else Image
+        )
         self.rgb_subscription = self.create_subscription(
-            Image,
+            input_message_type,
             self.input_topic,
             self.image_callback,
             qos_profile=qos_profile_sensor_data,
@@ -275,7 +289,8 @@ class HandDetectorNode(Node):
         )
 
         self.get_logger().info(
-            f"Subscribing to RGB images on {self.input_topic}"
+            f"Subscribing to {self.input_transport} RGB images on "
+            f"{self.input_topic}"
         )
         self.get_logger().info(
             f"Publishing JSON detections to {detections_topic} and ROI "
@@ -294,7 +309,7 @@ class HandDetectorNode(Node):
             f"Hand inference is disabled until {table_arrived_topic} is true"
         )
 
-    def image_callback(self, message: Image) -> None:
+    def image_callback(self, message: Image | CompressedImage) -> None:
         with self.frame_lock:
             self.latest_message = message
             self.frame_sequence += 1
@@ -348,9 +363,7 @@ class HandDetectorNode(Node):
         self.last_processed_sequence = frame_sequence
 
         try:
-            frame = self.bridge.imgmsg_to_cv2(
-                message, desired_encoding="bgr8"
-            )
+            frame = self.message_to_bgr(message)
             if not self.input_size_logged:
                 height, width = frame.shape[:2]
                 self.get_logger().info(
@@ -580,6 +593,16 @@ class HandDetectorNode(Node):
         if last_time is None or now - last_time >= period:
             self.warning_times[key] = now
             self.get_logger().warning(message)
+
+    def message_to_bgr(
+        self, message: Image | CompressedImage
+    ) -> Any:
+        """Convert the configured ROS image transport into a BGR frame."""
+        if self.input_transport == "compressed":
+            return decode_jpeg(message.data)
+        return self.bridge.imgmsg_to_cv2(
+            message, desired_encoding="bgr8"
+        )
 
     @staticmethod
     def bgr_frame_to_image_message(frame: Any, header: Any) -> Image:

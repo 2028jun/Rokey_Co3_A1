@@ -31,6 +31,7 @@ setup(
     entry_points={
         "console_scripts": [
             "hand_detector_node = hand_safety.hand_detector_node:main",
+            "jpeg_compressor_node = hand_safety.jpeg_compressor_node:main",
         ],
     },
 )

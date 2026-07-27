@@ -4,7 +4,7 @@
 <package format="3">
   <name>hand_safety</name>
   <version>0.2.0</version>
-  <description>ROS 2 YOLO hand detection from an RGB image topic.</description>
+  <description>ROS 2 YOLO hand detection with raw and JPEG RGB transport.</description>
   <maintainer email="user@example.com">workspace user</maintainer>
   <license>Apache-2.0</license>
 

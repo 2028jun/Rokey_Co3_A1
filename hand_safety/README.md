@@ -1,6 +1,6 @@
 # hand_safety
 
-ROS 2 Humble에서 `sensor_msgs/msg/Image` RGB 토픽을 구독해 HaGRIDv2
+ROS 2 Humble에서 raw 또는 JPEG 압축 RGB 토픽을 구독해 HaGRIDv2
 YOLOv10n 손 탐지를 수행합니다. 원본 모델의 제스처 클래스는 모두
 `hand` 단일 클래스로 통합하고 class-agnostic NMS를 적용합니다.
 
@@ -8,6 +8,8 @@ YOLOv10n 손 탐지를 수행합니다. 원본 모델의 제스처 클래스는 
 
 - 입력: `/camera/color/image_raw`
   (`sensor_msgs/msg/Image`)
+- 원격 입력: `/camera/color/image_raw/compressed`
+  (`sensor_msgs/msg/CompressedImage`, `input_transport:=compressed`)
 - 박스가 표시된 영상: `/hand_detection/image` (`sensor_msgs/msg/Image`,
   디버그 옵션을 켰을 때만 발행)
 - 탐지 결과: `/hand_detection/detections` (`std_msgs/msg/String`, JSON)
@@ -61,6 +63,15 @@ ros2 run hand_safety hand_detector_node
 ros2 run hand_safety hand_detector_node \
   --ros-args \
   -p input_topic:=/camera/color/image_raw
+```
+
+다른 컴퓨터에서 JPEG 입력만 받는 예:
+
+```bash
+ros2 run hand_safety hand_detector_node \
+  --ros-args \
+  -p input_topic:=/camera/color/image_raw/compressed \
+  -p input_transport:=compressed
 ```
 
 CUDA가 사용 가능한 환경에서 GPU를 지정하는 예:
@@ -124,9 +135,10 @@ ros2 topic echo /hand_detection/detections
 ros2 run rqt_image_view rqt_image_view /hand_detection/image
 ```
 
-입력 토픽은 `sensor_msgs/msg/Image`여야 합니다.
-`sensor_msgs/msg/CompressedImage` 토픽은 이 노드에서 직접 구독하지
-않습니다.
+`input_transport:=raw`는 `sensor_msgs/msg/Image`, `compressed`는 JPEG
+`sensor_msgs/msg/CompressedImage` 토픽을 구독합니다. 압축 입력에서는 원본
+해상도와 헤더를 유지한 채 OpenCV로 JPEG를 해제한 뒤 같은 추론 경로를
+사용합니다.
 
 ## 알려진 캘리브레이션 이슈
 

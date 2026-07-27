@@ -1,6 +1,9 @@
 hand_detector_node:
   ros__parameters:
     input_topic: /camera/color/image_raw
+    # Use "compressed" with a sensor_msgs/CompressedImage JPEG topic when the
+    # detector runs on another computer.
+    input_transport: raw
     output_image_topic: /hand_detection/image
     detections_topic: /hand_detection/detections
     roi_intrusion_topic: /hand_safety/intrusion
