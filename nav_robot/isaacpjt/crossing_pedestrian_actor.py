@@ -96,6 +96,12 @@ TYPING_PERSON_USD = os.environ.get(
     "F_Business_02.usd",
 )
 
+# Keep only a plain string, not a pxr SdfPath/Prim wrapper, across
+# SimulationApp updates. Holding command-owned wrappers while USD
+# ObjectsChanged notices are delivered has caused native Python GC crashes in
+# Isaac Sim 5.1.
+_SHARED_ANIMATION_GRAPH_PATH = None
+
 
 def enable_extensions() -> None:
     """Enable character extensions before the restaurant stage is opened."""
@@ -119,17 +125,29 @@ def _load_character(
     name: str,
     character_asset_path: str | None = None,
 ):
+    global _SHARED_ANIMATION_GRAPH_PATH
+
     from isaacsim.replicator.agent.core.settings import AssetPaths
     from isaacsim.replicator.agent.core.stage_util import CharacterUtil
 
     app = omni.kit.app.get_app()
-    biped_prim = CharacterUtil.load_default_biped_to_stage()
-    for _ in range(10):
-        app.update()
+    stage = omni.usd.get_context().get_stage()
+    animation_graph = None
+    if _SHARED_ANIMATION_GRAPH_PATH is not None:
+        cached_graph = stage.GetPrimAtPath(_SHARED_ANIMATION_GRAPH_PATH)
+        if cached_graph.IsValid():
+            animation_graph = cached_graph
 
-    animation_graph = CharacterUtil.get_anim_graph_from_character(biped_prim)
-    if animation_graph is None or not animation_graph.IsValid():
-        raise RuntimeError("default biped animation graph is unavailable")
+    if animation_graph is None:
+        biped_prim = CharacterUtil.load_default_biped_to_stage()
+        for _ in range(10):
+            app.update()
+        animation_graph = CharacterUtil.get_anim_graph_from_character(
+            biped_prim
+        )
+        if animation_graph is None or not animation_graph.IsValid():
+            raise RuntimeError("default biped animation graph is unavailable")
+        _SHARED_ANIMATION_GRAPH_PATH = str(animation_graph.GetPath())
 
     person_prim = CharacterUtil.load_character_usd_to_stage(
         character_asset_path or AssetPaths.default_biped_asset_path(),
@@ -145,9 +163,33 @@ def _load_character(
         raise RuntimeError(
             f"no SkelRoot found under {person_prim.GetPath()}"
         )
-    CharacterUtil.setup_animation_graph_to_character(
-        [skelroot], animation_graph
-    )
+    # CharacterUtil.setup_animation_graph_to_character() always executes
+    # RemoveAnimationGraphAPICommand followed by ApplyAnimationGraphAPICommand.
+    # With ROS camera writer graphs and PhysX already active, those command
+    # objects can outlive the USD notice that contains their SdfPath values;
+    # Python GC then crashes inside the PXR Boost.Python conversion.  Author
+    # the schema relationship directly and exactly once instead.  The caller
+    # also guarantees this runs before the simulation timeline and sensors.
+    import AnimGraphSchema
+
+    graph_path = Sdf.Path(_SHARED_ANIMATION_GRAPH_PATH)
+    with Sdf.ChangeBlock():
+        if skelroot.HasAPI(AnimGraphSchema.AnimationGraphAPI):
+            animation_graph_api = AnimGraphSchema.AnimationGraphAPI(
+                skelroot
+            )
+        else:
+            animation_graph_api = AnimGraphSchema.AnimationGraphAPI.Apply(
+                skelroot
+            )
+        graph_relationship = animation_graph_api.GetAnimationGraphRel()
+        if graph_relationship.GetTargets() != [graph_path]:
+            graph_relationship.SetTargets([graph_path])
+
+    # Do not keep transient PXR wrappers alive while app.update() delivers the
+    # change block's ObjectsChanged notice.
+    del graph_relationship, animation_graph_api, graph_path, skelroot
+    del animation_graph
     for _ in range(10):
         app.update()
     return person_prim

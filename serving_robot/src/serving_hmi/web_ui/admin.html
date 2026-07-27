@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PIZZA BOT HMI - Admin Monitoring</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="/css/admin.css?v=1">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Top Navbar -->
+        <header class="navbar">
+            <div class="brand">
+                <div class="logo-icon"><i class="fa-solid fa-robot"></i></div>
+                <div class="brand-text">
+                    <h1>PIZZA BOT <span>HMI</span></h1>
+                    <p class="subtitle">Admin Monitoring Dashboard</p>
+                </div>
+            </div>
+
+            <div class="system-status-bar">
+                <button class="mode-toggle-btn mock" id="mode-toggle-btn" onclick="toggleDriveMode()">
+                    <i class="fa-solid fa-gamepad"></i> <span class="label">구동 모드:</span>
+                    <strong id="mode-text">가상 모의 주행 (Mock)</strong>
+                </button>
+
+                <div class="status-badge" id="isaac-status-badge">
+                    <span class="status-dot offline" id="isaac-dot"></span>
+                    <span class="label">Isaac Sim:</span>
+                    <strong id="isaac-state-text">OFFLINE</strong>
+                    <span class="hz-tag" id="isaac-hz">0.0 Hz</span>
+                </div>
+
+                <div class="status-badge" id="robot-status-badge">
+                    <span class="status-dot offline" id="robot-dot"></span>
+                    <span class="label">Robot (M0609):</span>
+                    <strong id="robot-state-text">OFFLINE</strong>
+                    <span class="domain-tag" id="domain-id-tag">Domain -</span>
+                </div>
+
+                <div class="status-badge">
+                    <i class="fa-solid fa-parking-brake text-warning" id="brake-icon"></i>
+                    <span class="label">Brake:</span>
+                    <strong id="brake-state-text">LOCKED</strong>
+                </div>
+
+                <button class="estop-btn" id="estop-btn" onclick="toggleEmergencyStop()">
+                    <i class="fa-solid fa-triangle-exclamation"></i> EMERGENCY STOP
+                </button>
+                <button class="mode-toggle-btn" id="reset-fault-btn" onclick="resetManagerFault()">
+                    <i class="fa-solid fa-rotate-right"></i> RESET FAULT
+                </button>
+            </div>
+        </header>
+
+        <div class="admin-grid">
+            <!-- Map Panel: enlarged -->
+            <section class="panel glass-panel map-panel-big">
+                <div class="panel-header">
+                    <h2><i class="fa-solid fa-map-location-dot"></i> 실시간 2D 식당 맵 & 로봇 트래킹</h2>
+                    <span class="badge-live"><i class="fa-solid fa-circle"></i> LIVE</span>
+                </div>
+
+                <div class="canvas-wrapper canvas-wrapper-big">
+                    <canvas id="restaurant-map-canvas" width="900" height="640"></canvas>
+                </div>
+            </section>
+
+            <!-- Side Column: Cameras + Telemetry + Orders + Test Controls -->
+            <aside class="admin-side-col">
+                <section class="panel glass-panel camera-dual-panel">
+                    <div class="panel-header">
+                        <h2><i class="fa-solid fa-video"></i> 로봇 카메라</h2>
+                    </div>
+                    <div class="dual-camera-grid">
+                        <div class="camera-viewport-box">
+                            <div class="camera-header">
+                                <span><i class="fa-solid fa-video text-danger"></i> Robot 1 테이블 카메라</span>
+                                <span class="camera-status" id="camera-status-text">Live ROS 2 Topic</span>
+                            </div>
+                            <div class="camera-frame-container">
+                                <img id="camera-stream-img" src="" alt="Camera Feed Waiting..." onerror="this.style.display='none'; document.getElementById('camera-placeholder').style.display='flex';">
+                                <div class="camera-placeholder" id="camera-placeholder">
+                                    <i class="fa-solid fa-camera-retro"></i>
+                                    <p>/camera/color/image_raw 대기 중</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="camera-viewport-box">
+                            <div class="camera-header">
+                                <span><i class="fa-solid fa-video text-danger"></i> Robot 2 테이블 카메라</span>
+                                <span class="camera-status" id="camera-status-text-2">Live ROS 2 Topic</span>
+                            </div>
+                            <div class="camera-frame-container">
+                                <img id="camera-stream-img-2" src="" alt="Camera Feed Waiting..." onerror="this.style.display='none'; document.getElementById('camera-placeholder-2').style.display='flex';">
+                                <div class="camera-placeholder" id="camera-placeholder-2">
+                                    <i class="fa-solid fa-camera-retro"></i>
+                                    <p>/robot2/camera/color/image_raw 대기 중</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel glass-panel telemetry-panel">
+                    <div class="panel-header">
+                        <h2><i class="fa-solid fa-robot"></i> 로봇 상태</h2>
+                    </div>
+
+                    <p class="robot-select-hint">로봇을 눌러 상태, 미션 진행 상황, 처리 주문을 확인하세요.</p>
+                    <div class="robot-select-grid">
+                        <button class="robot-select-btn" id="robot-select-robot1" onclick="openRobotModal('robot1')">
+                            <span class="robot-select-dot offline" id="robot-select-dot-robot1"></span>
+                            <div class="robot-select-icon"><i class="fa-solid fa-robot"></i></div>
+                            <div class="robot-select-info">
+                                <span class="robot-select-name">Robot 1</span>
+                                <span class="robot-select-state" id="robot-select-state-robot1">OFFLINE</span>
+                            </div>
+                            <span class="robot-select-battery" id="robot-select-battery-robot1">--%</span>
+                        </button>
+                        <button class="robot-select-btn" id="robot-select-robot2" onclick="openRobotModal('robot2')">
+                            <span class="robot-select-dot offline" id="robot-select-dot-robot2"></span>
+                            <div class="robot-select-icon"><i class="fa-solid fa-robot"></i></div>
+                            <div class="robot-select-info">
+                                <span class="robot-select-name">Robot 2</span>
+                                <span class="robot-select-state" id="robot-select-state-robot2">OFFLINE</span>
+                            </div>
+                            <span class="robot-select-battery" id="robot-select-battery-robot2">--%</span>
+                        </button>
+                    </div>
+
+                    <div class="test-controls-wrapper">
+                        <h3><i class="fa-solid fa-vial-virus" style="color: var(--accent-neon);"></i> 시뮬레이션 테스트 제어</h3>
+                        <div class="test-btn-group">
+                            <button class="test-btn spawn" onclick="triggerTypingAnimation()">
+                                <i class="fa-solid fa-keyboard"></i> 타이핑 시작
+                            </button>
+                        </div>
+                        <div class="test-btn-group" style="margin-top: 6px;">
+                            <button class="test-btn spawn" onclick="setObstacleTestVisible(true)">
+                                <i class="fa-solid fa-user"></i> 사람 스폰 (Spawn)
+                            </button>
+                            <button class="test-btn remove" onclick="setObstacleTestVisible(false)">
+                                <i class="fa-solid fa-user-slash"></i> 사람 제거 (Remove)
+                            </button>
+                        </div>
+                        <div class="test-status-info">
+                            <span>테스트 서비스 상태: <strong id="test-service-status">대기 중</strong></span>
+                        </div>
+                    </div>
+                </section>
+            </aside>
+        </div>
+    </div>
+
+    <!-- Per-Robot Detail Modal: status, mission progress, handled orders -->
+    <div class="robot-modal-overlay" id="robot-modal-overlay" onclick="if (event.target === this) closeRobotModal()">
+        <div class="robot-modal">
+            <div class="robot-modal-header">
+                <h2 id="robot-modal-title"><i class="fa-solid fa-robot"></i> Robot 1</h2>
+                <button class="robot-modal-close" onclick="closeRobotModal()"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+            <div class="robot-modal-body">
+                <div class="metrics-grid" id="robot-modal-metrics"></div>
+
+                <div class="mission-tracker-box" id="robot-modal-mission-box">
+                    <h3>현재 미션 상태: <span id="robot-modal-mission-label">없음 (대기 중)</span></h3>
+                    <div class="stepper-wrapper" id="robot-modal-stepper"></div>
+                </div>
+
+                <div class="orders-list-wrapper">
+                    <h3>처리 주문 내역</h3>
+                    <div class="table-responsive">
+                        <table class="order-table">
+                            <thead>
+                                <tr>
+                                    <th>ID</th>
+                                    <th>테이블</th>
+                                    <th>메뉴</th>
+                                    <th>상태</th>
+                                    <th>관리</th>
+                                </tr>
+                            </thead>
+                            <tbody id="robot-modal-orders-body">
+                                <tr>
+                                    <td colspan="5" class="empty-msg">처리한 주문이 없습니다.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/js/robot_map.js?v=2"></script>
+    <script src="/js/admin.js?v=3"></script>
+</body>
+</html>

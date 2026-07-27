@@ -65,6 +65,14 @@ class HMIBridgeNode(Node):
         self.last_robot_status_recv_time = 0.0
         self.robot_connected = False
         self._robot_status_codes = {"robot1": None, "robot2": None}
+        self._robot_status_times = {"robot1": 0.0, "robot2": 0.0}
+        self._robot_poses = {
+            "robot1": {"x": -1.82, "y": -2.20, "yaw": 0.0},
+            "robot2": {"x": 1.82, "y": -2.20, "yaw": 0.0},
+        }
+        self._robot_camera_base64 = {"robot1": "", "robot2": ""}
+        self._robot_camera_times = {"robot1": 0.0, "robot2": 0.0}
+        self._robot_camera_error_times = {"robot1": 0.0, "robot2": 0.0}
         # Orders may arrive while the sequential multi-robot startup is still
         # bringing up robot2 and the fleet manager.  Keep them pending instead
         # of turning a temporary service outage / busy fleet into CANCELLED.
@@ -90,7 +98,18 @@ class HMIBridgeNode(Node):
         self.parking_brake = True
         self.battery_level = 98.0
         self.arm_state = "HOME"
-        self.obstacle_info = {"active": False, "x": 0.0, "y": 2.8, "stop": False}
+        self.obstacle_info = {
+            "active": False,
+            "x": 0.0,
+            "y": 2.8,
+            "stop": False,
+            "robot": None,
+            "source": None,
+        }
+        # Each Isaac bridge publishes obstacle state below its own namespace.
+        # Keep the sources separate so a clear event from one robot cannot
+        # hide a person that is still being detected by the other robot.
+        self._obstacle_sources = {}
         
         # Publishers
         self.order_pub = self.create_publisher(String, '/serving_robot/order', 10)
@@ -132,31 +151,45 @@ class HMIBridgeNode(Node):
             10
         )
 
-        # Obstacle Event Subscriber (/serving_robot/obstacle_event)
+        # Obstacle event subscribers. Retain the unnamespaced topic for the
+        # single-robot launch, and subscribe to both production multi-robot
+        # topics used by NavBridge(namespace=/robot1|/robot2).
         self.obstacle_event_sub = self.create_subscription(
             String,
             '/serving_robot/obstacle_event',
-            self.obstacle_event_callback,
-            10
+            lambda msg: self.obstacle_event_callback(msg, "legacy"),
+            status_qos,
         )
+        self._robot_obstacle_subs = []
+        for robot_name in ("robot1", "robot2"):
+            self._robot_obstacle_subs.append(self.create_subscription(
+                String,
+                f'/{robot_name}/serving_robot/obstacle_event',
+                lambda msg, name=robot_name: self.obstacle_event_callback(
+                    msg, name),
+                status_qos,
+            ))
 
-        # Table Camera Subscription
+        # Per-robot camera and odometry subscriptions. The multi-robot launch
+        # publishes both streams below their robot namespaces.
         from sensor_msgs.msg import Image
         self.last_camera_base64 = ""
         self.last_camera_recv_time = 0.0
         self.last_camera_error_time = 0.0
-        self.camera_sub = self.create_subscription(
-            Image,
-            self.camera_topic,
-            self.table_camera_callback,
-            qos_profile_sensor_data
-        )
-        self.odom_sub = self.create_subscription(
-            Odometry,
-            self.odom_topic,
-            self.odom_callback,
-            qos_profile_sensor_data,
-        )
+        self._robot_telemetry_subs = []
+        for robot_name in ("robot1", "robot2"):
+            self._robot_telemetry_subs.append(self.create_subscription(
+                Image,
+                f'/{robot_name}/camera/color/image_raw',
+                self._make_camera_callback(robot_name),
+                qos_profile_sensor_data,
+            ))
+            self._robot_telemetry_subs.append(self.create_subscription(
+                Odometry,
+                f'/{robot_name}/nav_robot/odom',
+                self._make_odom_callback(robot_name),
+                qos_profile_sensor_data,
+            ))
 
         # Serving Robot Manager Integration Clients & Subscribers
         self.system_status_sub = self.create_subscription(
@@ -226,7 +259,90 @@ class HMIBridgeNode(Node):
         self.typing_trigger_pub.publish(Empty())
         return True, "typing animation trigger published"
 
+    @staticmethod
+    def _encode_camera_frame(msg):
+        import base64
+        import cv2
+        import numpy as np
+
+        height = msg.height
+        width = msg.width
+        encoding = msg.encoding.lower()
+        channels = {
+            'mono8': 1,
+            'rgb8': 3,
+            'bgr8': 3,
+            'rgba8': 4,
+            'bgra8': 4,
+        }.get(encoding)
+        if channels is None:
+            raise ValueError(f"unsupported image encoding: {msg.encoding}")
+
+        row_bytes = int(msg.step) if msg.step else width * channels
+        rows = np.frombuffer(msg.data, dtype=np.uint8).reshape(height, row_bytes)
+        pixels = rows[:, :width * channels]
+        img = (
+            pixels.reshape(height, width)
+            if channels == 1
+            else pixels.reshape(height, width, channels)
+        )
+        if encoding == 'rgb8':
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        elif encoding == 'rgba8':
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        elif encoding == 'bgra8':
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+        ok, buffer = cv2.imencode(
+            '.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        if not ok:
+            raise RuntimeError("JPEG encoding failed")
+        return "data:image/jpeg;base64," + base64.b64encode(buffer).decode('utf-8')
+
+    def _make_camera_callback(self, robot_name):
+        def callback(msg):
+            try:
+                encoded = self._encode_camera_frame(msg)
+                self._robot_camera_base64[robot_name] = encoded
+                self._robot_camera_times[robot_name] = time.time()
+                if robot_name == "robot1":
+                    self.last_camera_base64 = encoded
+                    self.last_camera_recv_time = self._robot_camera_times[robot_name]
+            except Exception as exc:
+                now = time.time()
+                if now - self._robot_camera_error_times[robot_name] >= 5.0:
+                    self._robot_camera_error_times[robot_name] = now
+                    self.get_logger().warning(
+                        f"[{robot_name}] Camera frame conversion failed: {exc}")
+        return callback
+
     def table_camera_callback(self, msg):
+        """Compatibility callback for older single-robot launch files."""
+        return self._make_camera_callback("robot1")(msg)
+
+    def _make_odom_callback(self, robot_name):
+        def callback(msg: Odometry):
+            orientation = msg.pose.pose.orientation
+            siny_cosp = 2.0 * (
+                orientation.w * orientation.z
+                + orientation.x * orientation.y)
+            cosy_cosp = 1.0 - 2.0 * (
+                orientation.y * orientation.y
+                + orientation.z * orientation.z)
+            import math
+            pose = {
+                "x": float(msg.pose.pose.position.x),
+                "y": float(msg.pose.pose.position.y),
+                "yaw": math.atan2(siny_cosp, cosy_cosp),
+            }
+            self._robot_poses[robot_name] = pose
+            if robot_name == "robot1":
+                self.robot_pose = dict(pose)
+            self.robot_connected = True
+            self.last_robot_status_recv_time = time.time()
+        return callback
+
+    def _legacy_table_camera_callback(self, msg):
         try:
             import cv2
             import numpy as np
@@ -286,35 +402,57 @@ class HMIBridgeNode(Node):
         self.isaac_sim_connected = True
 
     def odom_callback(self, msg: Odometry):
-        orientation = msg.pose.pose.orientation
-        siny_cosp = 2.0 * (
-            orientation.w * orientation.z + orientation.x * orientation.y)
-        cosy_cosp = 1.0 - 2.0 * (
-            orientation.y * orientation.y + orientation.z * orientation.z)
-        import math
-        self.robot_pose = {
-            "x": float(msg.pose.pose.position.x),
-            "y": float(msg.pose.pose.position.y),
-            "yaw": math.atan2(siny_cosp, cosy_cosp),
-        }
-        self.last_robot_status_recv_time = time.time()
-        self.robot_connected = True
-    def obstacle_event_callback(self, msg: String):
+        return self._make_odom_callback("robot1")(msg)
+    def obstacle_event_callback(self, msg: String, robot_name: str = "legacy"):
         try:
             data = json.loads(msg.data)
             active = bool(data.get("active", data.get("detected", False)))
             x_val = data.get("x")
             y_val = data.get("y")
-            self.obstacle_info = {
+            source_state = {
                 "active": active,
                 "x": float(x_val) if (x_val is not None and active) else 0.0,
                 "y": float(y_val) if (y_val is not None and active) else 2.8,
-                "stop": active,
+                "stop": bool(data.get("stop", active)),
+                "robot": None if robot_name == "legacy" else robot_name,
+                "source": str(data.get("source", "unknown")),
+                "distance": data.get("distance"),
+                "updated_at": time.time(),
             }
-            if active:
+            self._obstacle_sources[robot_name] = source_state
+
+            active_sources = [
+                state for state in self._obstacle_sources.values()
+                if state.get("active")
+            ]
+            if active_sources:
+                # Prefer the nearest active detection when both robots see
+                # the same pedestrian. Fall back to the newest event when a
+                # source did not provide a distance.
+                def detection_rank(state):
+                    try:
+                        distance = float(state.get("distance"))
+                    except (TypeError, ValueError):
+                        distance = float("inf")
+                    return (distance, -float(state.get("updated_at", 0.0)))
+
+                self.obstacle_info = dict(
+                    min(active_sources, key=detection_rank)
+                )
                 self.robot_state = "🛑 OBSTACLE DETECTED (STOPPED)"
-        except Exception:
-            pass
+            else:
+                self.obstacle_info = {
+                    "active": False,
+                    "x": 0.0,
+                    "y": 2.8,
+                    "stop": False,
+                    "robot": None,
+                    "source": None,
+                }
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.get_logger().warning(
+                f"Invalid obstacle event from {robot_name}: {exc}"
+            )
 
     def robot_status_callback(self, msg: String):
         self.last_robot_status_recv_time = time.time()
@@ -373,6 +511,7 @@ class HMIBridgeNode(Node):
     def _on_robot_fleet_status(self, robot_name: str, msg: Int32):
         code = int(msg.data)
         self._robot_status_codes[robot_name] = code
+        self._robot_status_times[robot_name] = time.time()
         self.robot_connected = True
         self.last_robot_status_recv_time = time.time()
         if self.drive_mode != "LIVE":
@@ -409,20 +548,34 @@ class HMIBridgeNode(Node):
 
     def fleet_robot_snapshot(self) -> dict:
         snapshot = {}
+        now = time.time()
         for name in ("robot1", "robot2"):
             code = self._robot_status_codes.get(name)
+            camera_connected = (
+                self._robot_camera_times.get(name, 0.0) > 0.0
+                and now - self._robot_camera_times[name] <= 2.0
+            )
+            order = order_manager.active_order_for_robot(name)
             if code is None:
-                snapshot[name] = {
-                    "state": "UNKNOWN",
-                    "state_code": None,
-                    "available": False,
-                }
-                continue
-            available = code in (0, 6)  # IDLE, COMPLETED
+                state = "UNKNOWN"
+                available = False
+            else:
+                state = self._robot_status_labels.get(code, f"STATE_{code}")
+                available = code in (0, 6)  # IDLE, COMPLETED
             snapshot[name] = {
-                "state": self._robot_status_labels.get(code, f"STATE_{code}"),
+                "connected": code is not None,
+                "state": state,
                 "state_code": code,
                 "available": available,
+                "pose": dict(self._robot_poses[name]),
+                "parking_brake": code not in (1, 3),
+                "battery": 98.0,
+                "camera_connected": camera_connected,
+                "camera_image": (
+                    self._robot_camera_base64[name]
+                    if camera_connected else ""
+                ),
+                "active_order_id": order.order_id if order else None,
             }
         return snapshot
 
@@ -726,6 +879,7 @@ def get_system_status_payload():
         "type": "SYSTEM_STATUS",
         "timestamp": time.time(),
         "drive_mode": ros_node.drive_mode if ros_node else "MOCK",
+        "domain_id": os.environ.get("ROS_DOMAIN_ID", "0"),
         "isaac_sim": {
             "connected": ros_node.isaac_sim_connected if ros_node else False,
             "hz": ros_node.clock_hz if ros_node else 0.0,
@@ -745,7 +899,11 @@ def get_system_status_payload():
         "camera_image": (
             ros_node.last_camera_base64 if camera_connected else ""),
         "orders": order_manager.get_all_orders_dict(),
-        "active_order_id": order_manager.active_order_id
+        "active_order_id": order_manager.active_order_id,
+        "active_order_ids": {
+            name: info.get("active_order_id")
+            for name, info in robots.items()
+        },
     }
 
 @app.on_event("startup")
@@ -932,6 +1090,9 @@ if os.path.exists(web_ui_dir):
 @app.get("/")
 async def get_index():
     if web_ui_dir:
+        # Keep the fix_ui customer kiosk markup and appearance unchanged.
+        # Multi-robot ROS wiring is supplied by the backend payload and the
+        # original page JavaScript; it must not select a replacement layout.
         index_file = os.path.join(web_ui_dir, "index.html")
         if os.path.exists(index_file):
             return FileResponse(
@@ -939,6 +1100,17 @@ async def get_index():
                 headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
             )
     return {"error": "HMI Frontend index.html not found", "searched_paths": candidate_paths}
+
+@app.get("/admin")
+async def get_admin():
+    if web_ui_dir:
+        admin_file = os.path.join(web_ui_dir, "admin.html")
+        if os.path.exists(admin_file):
+            return FileResponse(
+                admin_file,
+                headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+            )
+    return {"error": "HMI Admin admin.html not found", "searched_paths": candidate_paths}
 
 @app.get("/css/{file_name}")
 async def get_css(file_name: str):

@@ -99,13 +99,30 @@ BOARD_BAIL_HEIGHT = 0.165
 BOARD_BAIL_MIN_ANGLE_DEG = 10.0
 BOARD_BAIL_ROD_RADIUS = 0.006
 BOARD_BAIL_MASS = 0.25
-BOARD_BAIL_GRIP_SIZE = np.array([0.026, 0.090, 0.040])
+# A square sleeve could stop at an arbitrary roll angle during transport.  At
+# 45 degrees its corner-to-corner width no longer matched the fixed RG2 grasp.
+# Use a regular Y-axis octagonal prism instead: 26 mm across opposite flats,
+# 28.1 mm across corners, and the same 90 mm usable grip length.
+BOARD_BAIL_GRIP_ACROSS_FLATS = 0.026
+BOARD_BAIL_GRIP_LENGTH = 0.090
+BOARD_BAIL_GRIP_CIRCUMRADIUS = (
+    0.5 * BOARD_BAIL_GRIP_ACROSS_FLATS / np.cos(np.pi / 8.0)
+)
+# Velocity-only angular drive: no preferred roll angle, only enough damping
+# to stop the free sleeve from spinning throughout mobile transport.
+BOARD_BAIL_GRIP_BEARING_DAMPING = float(
+    os.environ.get("MOBILE_PIZZA_GRIP_BEARING_DAMPING", "0.002")
+)
+BOARD_BAIL_GRIP_BEARING_MAX_FORCE = float(
+    os.environ.get("MOBILE_PIZZA_GRIP_BEARING_MAX_FORCE", "0.02")
+)
 BOARD_BAIL_COLLAR_SIZE = np.array([0.034, 0.012, 0.048])
 BOARD_BAIL_STOP_SIZE = np.array([0.028, 0.028, 0.027])
 BOARD_BAIL_STOP_Y = 0.105
 # The declared TCP is near the fingertips.  Descend past the crossbar centre
-# so the round sleeve reaches the deeper, parallel section of the RG2 pads.
-BOARD_BAIL_GRASP_INSERT_DEPTH = 0.020
+# so the octagonal sleeve reaches the deeper, parallel section of the RG2
+# pads, while keeping the TCP inside its 28.1 mm corner envelope.
+BOARD_BAIL_GRASP_INSERT_DEPTH = 0.010
 BOARD_HANDLE_CROSS_INSERT_X = BOARD_BAIL_X
 # Pizza + wooden board combined mass.
 BOARD_TEST_MASS = 2.0
@@ -420,6 +437,62 @@ def author_wooden_pizza_board(
         sphere.CreateDisplayColorAttr([Gf.Vec3f(0.12, 0.14, 0.16)])
         configure_bail_collider(sphere.GetPrim())
 
+    def author_grip_octagonal_prism(path):
+        """Author one convex Y-axis octagonal sleeve for roll-tolerant grip."""
+        half_length = 0.5 * BOARD_BAIL_GRIP_LENGTH
+        radius = BOARD_BAIL_GRIP_CIRCUMRADIUS
+        # Starting at 22.5 degrees leaves flats normal to local X and Z while
+        # retaining eight equivalent settling orientations after transport.
+        angles = np.pi / 8.0 + np.arange(8, dtype=float) * np.pi / 4.0
+        points = []
+        for y_value in (-half_length, half_length):
+            points.extend(
+                Gf.Vec3f(
+                    float(radius * np.cos(angle)),
+                    float(y_value),
+                    float(radius * np.sin(angle)),
+                )
+                for angle in angles
+            )
+
+        face_counts = [8, 8]
+        # End-cap winding is outward at local -Y and +Y respectively.
+        face_indices = list(range(8)) + list(reversed(range(8, 16)))
+        for index in range(8):
+            following = (index + 1) % 8
+            face_counts.append(4)
+            face_indices.extend(
+                [index, 8 + index, 8 + following, following]
+            )
+
+        mesh = UsdGeom.Mesh.Define(stage, path)
+        mesh.CreatePointsAttr(points)
+        mesh.CreateFaceVertexCountsAttr(face_counts)
+        mesh.CreateFaceVertexIndicesAttr(face_indices)
+        mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+        mesh.CreateDoubleSidedAttr(False)
+        mesh.CreateDisplayColorAttr([Gf.Vec3f(0.55, 0.30, 0.12)])
+        grip_binding = UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim())
+        grip_binding.Bind(
+            material,
+            bindingStrength=UsdShade.Tokens.strongerThanDescendants,
+        )
+        grip_binding.Bind(
+            physics_material.material,
+            bindingStrength=UsdShade.Tokens.strongerThanDescendants,
+            materialPurpose="physics",
+        )
+        UsdPhysics.CollisionAPI.Apply(
+            mesh.GetPrim()
+        ).CreateCollisionEnabledAttr(True)
+        UsdPhysics.MeshCollisionAPI.Apply(
+            mesh.GetPrim()
+        ).CreateApproximationAttr().Set("convexHull")
+        grip_physx = PhysxSchema.PhysxCollisionAPI.Apply(mesh.GetPrim())
+        grip_physx.CreateContactOffsetAttr(0.001)
+        grip_physx.CreateRestOffsetAttr(0.0)
+        return mesh
+
     # Folded pose is explicitly 10 degrees above robot-local -X.
     # Overlapping spheres form each slender arm without an orientation transform.
     folded_angle = np.deg2rad(BOARD_BAIL_MIN_ANGLE_DEG)
@@ -448,7 +521,7 @@ def author_wooden_pizza_board(
     # block authored below is a separate rigid body and cannot slide in Y
     # because its bearing joint removes all translation.
     collar_offset = 0.5 * (
-        BOARD_BAIL_GRIP_SIZE[1] + BOARD_BAIL_COLLAR_SIZE[1]
+        BOARD_BAIL_GRIP_LENGTH + BOARD_BAIL_COLLAR_SIZE[1]
     )
     for side, sign in (("MinusY", -1.0), ("PlusY", 1.0)):
         author_bail_box(
@@ -482,26 +555,7 @@ def author_wooden_pizza_board(
     )
     grip_block_physx.CreateSolverPositionIterationCountAttr(64)
     grip_block_physx.CreateSolverVelocityIterationCountAttr(16)
-    grip_block = UsdGeom.Cube.Define(stage, f"{grip_block_path}/Geometry")
-    grip_block.CreateSizeAttr(1.0)
-    grip_block.AddScaleOp().Set(Gf.Vec3f(*map(float, BOARD_BAIL_GRIP_SIZE)))
-    grip_block.CreateDisplayColorAttr([Gf.Vec3f(0.55, 0.30, 0.12)])
-    grip_binding = UsdShade.MaterialBindingAPI.Apply(grip_block.GetPrim())
-    grip_binding.Bind(
-        material,
-        bindingStrength=UsdShade.Tokens.strongerThanDescendants,
-    )
-    grip_binding.Bind(
-        physics_material.material,
-        bindingStrength=UsdShade.Tokens.strongerThanDescendants,
-        materialPurpose="physics",
-    )
-    UsdPhysics.CollisionAPI.Apply(
-        grip_block.GetPrim()
-    ).CreateCollisionEnabledAttr(True)
-    grip_physx = PhysxSchema.PhysxCollisionAPI.Apply(grip_block.GetPrim())
-    grip_physx.CreateContactOffsetAttr(0.001)
-    grip_physx.CreateRestOffsetAttr(0.0)
+    author_grip_octagonal_prism(f"{grip_block_path}/Geometry")
 
     # Bearing between the wooden grip and world-Y crossbar.  RG2 holds the
     # block while the wire bail is free to rotate inside it about the bar axis.
@@ -516,6 +570,18 @@ def author_wooden_pizza_board(
     grip_bearing.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
     grip_bearing.CreateAxisAttr(UsdGeom.Tokens.y)
     grip_bearing.CreateCollisionEnabledAttr(False)
+    grip_bearing_drive = UsdPhysics.DriveAPI.Apply(
+        grip_bearing.GetPrim(), "angular"
+    )
+    grip_bearing_drive.CreateTypeAttr("force")
+    grip_bearing_drive.CreateTargetVelocityAttr(0.0)
+    grip_bearing_drive.CreateStiffnessAttr(0.0)
+    grip_bearing_drive.CreateDampingAttr(
+        BOARD_BAIL_GRIP_BEARING_DAMPING
+    )
+    grip_bearing_drive.CreateMaxForceAttr(
+        BOARD_BAIL_GRIP_BEARING_MAX_FORCE
+    )
 
     hinge = UsdPhysics.RevoluteJoint.Define(stage, bail_hinge_path)
     hinge.CreateBody0Rel().SetTargets([Sdf.Path(dish_path)])
@@ -541,7 +607,12 @@ def author_wooden_pizza_board(
         f"[serving] authored wooden pizza board radius={BOARD_RADIUS:.3f}m "
         f"hinged_bail_span={2.0 * BOARD_BAIL_HALF_SPAN:.3f}m "
         f"bail_height={BOARD_BAIL_HEIGHT:.3f}m "
-        f"free_grip_block={np.round(BOARD_BAIL_GRIP_SIZE, 3)}m "
+        "grip=octagonal "
+        f"across_flats={BOARD_BAIL_GRIP_ACROSS_FLATS:.3f}m "
+        f"across_corners={2.0 * BOARD_BAIL_GRIP_CIRCUMRADIUS:.3f}m "
+        f"length={BOARD_BAIL_GRIP_LENGTH:.3f}m "
+        f"bearing_damping={BOARD_BAIL_GRIP_BEARING_DAMPING:.4f} "
+        f"bearing_max_force={BOARD_BAIL_GRIP_BEARING_MAX_FORCE:.3f} "
         f"mesh_collision=convexDecomposition contact_offset=1mm",
         flush=True,
     )

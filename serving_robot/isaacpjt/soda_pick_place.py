@@ -164,6 +164,10 @@ class SodaCanPickPlace:
         self._use_bail_detour = place_left
         self._side_label = "left" if place_left else "right"
         self._gripper_close = GRIPPER_CAN_CLOSE
+        # Payload-specific approach opening.  Soda/cutlery use the fully open
+        # RG2 pose, while the plate rack overrides this with a partially closed
+        # pose so the fingers fit between the adjacent plates.
+        self._gripper_pregrasp = GRIPPER_OPEN
         self._gripper_max_force = GRIPPER_CAN_MAX_FORCE
         self._object_label = "can"
         self._minimum_verified_lift = 0.08
@@ -181,6 +185,14 @@ class SodaCanPickPlace:
         self._grasp_object_max_lateral = None
         self._gripper_close_ramp_steps = 60
         self._gripper_close_wait_steps = 60
+        # Subclasses can tune motion timing and the final placement contact
+        # tolerance without changing soda/cutlery behavior globally.
+        self._vertical_steps = VERTICAL_STEPS
+        self._initial_steps = INITIAL_STEPS
+        self._motion_position_tolerance = 0.025
+        self._placement_settle_error = self._motion_position_tolerance
+        self._placement_requires_support = False
+        self._motion_timeout_steps = 450
         self._phase = 0
         self._phase_steps = 0
         self._settled_steps = 0
@@ -195,6 +207,7 @@ class SodaCanPickPlace:
         self._grasp_hold_wrist = None
         self._grasp_hold_orientation = None
         self._grasp_hold_joints = None
+        self._gripper_close_start = self._gripper_pregrasp
         self.done = False
         self.failed = False
 
@@ -212,6 +225,16 @@ class SodaCanPickPlace:
                 joint_indices=np.asarray([self._gripper_index], dtype=np.int32),
             )
         )
+
+    def _placement_supported(self):
+        """Return whether phase-6 payload contact can finish the descent.
+
+        Most payloads finish from wrist position error alone. Broad, rigid
+        payloads such as the plate rack override this because table contact can
+        correctly stop the object before the commanded wrist reaches a target
+        authored slightly below the tabletop.
+        """
+        return False
 
     def _enable_soda_grip_force(self):
         self._gripper_drive.GetMaxForceAttr().Set(self._gripper_max_force)
@@ -257,7 +280,12 @@ class SodaCanPickPlace:
             set_joint_positions_func=articulation.set_joint_positions,
             dof_names=dof_names,
         )
-        gripper.set_joint_positions(np.array([GRIPPER_OPEN]))
+        # Waiting tasks must not move the shared physical gripper during
+        # CommandServingSequence.initialize().  For the active first task,
+        # start at its payload-specific approach opening instead of forcing
+        # every payload through the fully-open pose.
+        if self._active:
+            gripper.set_joint_positions(np.array([self._gripper_pregrasp]))
         arm_position, arm_orientation, _ = prim_world_pose(self._arm_base)
         self._vertical_orientation = _world_orientation_for_robot(
             self._canonical_vertical_orientation, arm_orientation
@@ -351,6 +379,7 @@ class SodaCanPickPlace:
         # Pizza needs the original 40 N form-lock grip. Lower the force only
         # now, after the pizza task has released its handle.
         self._enable_soda_grip_force()
+        self._command_gripper(self._articulation, self._gripper_pregrasp)
         # Refresh robot base world pose and axes after mobile navigation
         self.refresh_robot_frame()
         # Phase 0 interpolates from the pose left by pizza delivery, not from
@@ -480,6 +509,24 @@ class SodaCanPickPlace:
                     self._grasp_hold_orientation,
                     _,
                 ) = prim_world_pose(self._end_effector)
+        if phase == 2:
+            # Close monotonically from the measured approach position.  The
+            # previous ramp was hard-coded as 0 -> close, which reopened the
+            # plate-rack gripper to its maximum immediately before grasping.
+            measured = float(
+                self._articulation.get_joint_positions()[self._gripper_index]
+            )
+            if not np.isfinite(measured):
+                measured = float(self._gripper_pregrasp)
+            self._gripper_close_start = max(
+                measured, float(self._gripper_pregrasp)
+            )
+            print(
+                f"[{self._task_name}-gripper] close ramp "
+                f"start={self._gripper_close_start:.3f} "
+                f"target={self._gripper_close:.3f}",
+                flush=True,
+            )
         if phase == 9:
             self.done = True
 
@@ -542,7 +589,9 @@ class SodaCanPickPlace:
                     self._phase_steps / float(self._gripper_close_ramp_steps),
                 )
                 amount = raw * raw * (3.0 - 2.0 * raw)
-                target = self._gripper_close * amount
+                target = self._gripper_close_start + amount * (
+                    self._gripper_close - self._gripper_close_start
+                )
             else:
                 target = GRIPPER_OPEN
             self._command_gripper(articulation, target)
@@ -619,7 +668,8 @@ class SodaCanPickPlace:
         tcp_target = self._targets[self._phase].copy()
         transition_complete = True
         if self._phase in self._vertical_starts:
-            raw = min(1.0, self._phase_steps / VERTICAL_STEPS)
+            vertical_steps = max(1, int(self._vertical_steps))
+            raw = min(1.0, self._phase_steps / float(vertical_steps))
             amount = raw * raw * (3.0 - 2.0 * raw)
             start = self._vertical_starts[self._phase]
             tcp_target[:2] = start[:2]
@@ -658,7 +708,8 @@ class SodaCanPickPlace:
             # only and cannot whip J3 across the robot.
             orientation = self._carried_orientation
         if self._phase == 0:
-            raw = min(1.0, self._phase_steps / INITIAL_STEPS)
+            initial_steps = max(1, int(self._initial_steps))
+            raw = min(1.0, self._phase_steps / float(initial_steps))
             amount = raw * raw * (3.0 - 2.0 * raw)
             wrist_target = self._initial_wrist + amount * (
                 wrist_target - self._initial_wrist
@@ -778,16 +829,41 @@ class SodaCanPickPlace:
             articulation.apply_action(action)
         actual, _, _ = prim_world_pose(self._end_effector)
         error = float(np.linalg.norm(wrist_target - actual))
+        position_tolerance = (
+            float(self._placement_settle_error)
+            if self._phase == 6
+            else float(self._motion_position_tolerance)
+        )
+        placement_supported = bool(
+            transition_complete
+            and self._phase == 6
+            and self._placement_supported()
+        )
+        placement_complete = (
+            placement_supported
+            if self._phase == 6 and self._placement_requires_support
+            else error < position_tolerance or placement_supported
+        )
         self._settled_steps = (
             self._settled_steps + 1
-            if transition_complete and error < 0.025
+            if transition_complete and placement_complete
             else 0
         )
         if self._phase_steps % 60 == 0:
             arm = articulation.get_joint_positions()[self._arm_indices]
+            support_detail = ""
+            if self._phase == 6 and hasattr(
+                self, "_placement_support_gap"
+            ):
+                support_detail = (
+                    f" support_gap={self._placement_support_gap:.4f}m"
+                    f" support_lateral="
+                    f"{self._placement_support_lateral_error:.4f}m"
+                )
             print(
                 f"[{self._task_name}-motion] phase={self._phase} "
                 f"tcp={np.round(tcp_target, 4)} error={error:.4f}m "
+                f"supported={int(placement_supported)}{support_detail} "
                 f"J2={np.degrees(arm[1]):.1f}deg "
                 f"J3={np.degrees(arm[2]):.1f}deg",
                 flush=True,
@@ -825,7 +901,7 @@ class SodaCanPickPlace:
                         flush=True,
                     )
             self._enter_phase(self._phase + 1)
-        elif self._phase_steps >= 450:
+        elif self._phase_steps >= int(self._motion_timeout_steps):
             self.failed = True
             print(
                 f"[{self._task_name}] STOPPED: phase={self._phase} "

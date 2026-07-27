@@ -19,6 +19,18 @@ import time
 import gc
 from pathlib import Path
 
+
+# Arm serving targets are expressed in the docked robot frame.  The former
+# 40 mm / 2 degree completion window was adequate for navigation, but can move
+# the plate-rack handle by several centimetres relative to the proven
+# standalone pose.  Keep the tighter defaults overridable for field tuning.
+DOCK_XY_TOLERANCE_M = float(
+    os.environ.get("NAV_DOCK_XY_TOLERANCE_M", "0.025")
+)
+DOCK_YAW_TOLERANCE_RAD = math.radians(
+    float(os.environ.get("NAV_DOCK_YAW_TOLERANCE_DEG", "1.0"))
+)
+
 WORKSPACE = Path(
     os.environ.get("NAV_ROBOT_WS", Path(__file__).resolve().parents[1])
 ).resolve()
@@ -1494,7 +1506,14 @@ class NavBridge(Node):
         )
         self.odom_pub = self.create_publisher(Odometry, "nav_robot/odom", qos)
         self.two_wheel_odom_pub = self.create_publisher(Odometry, "two_wheel/odom_raw", qos)
-        self.obstacle_pub = self.create_publisher(String, "serving_robot/obstacle_event", qos)
+        # This is state consumed by the HMI, not a fire-and-forget command.
+        # Latch the latest detection so an HMI started/restarted after the
+        # person was detected still receives the active map marker.
+        self.obstacle_pub = self.create_publisher(
+            String,
+            "serving_robot/obstacle_event",
+            transient_local_qos,
+        )
         self.tf_pub = self.create_publisher(TFMessage, "tf", 100)
         static_tf_qos = QoSProfile(
             depth=100,
@@ -3254,8 +3273,8 @@ class NavBridge(Node):
             yaw_error = self._angle_error(goal_yaw, yaw)
             forward_error = math.cos(goal_yaw) * dx + math.sin(goal_yaw) * dy
             lateral_error = -math.sin(goal_yaw) * dx + math.cos(goal_yaw) * dy
-            position_ok = distance <= 0.040
-            yaw_ok = abs(yaw_error) <= math.radians(2.0)
+            position_ok = distance <= DOCK_XY_TOLERANCE_M
+            yaw_ok = abs(yaw_error) <= DOCK_YAW_TOLERANCE_RAD
             if (
                 abs(lateral_error) > 0.05
                 and abs(forward_error) < 0.10
@@ -3541,6 +3560,12 @@ class NavBridge(Node):
 
         if arm_command is not None:
             try:
+                # Match the successful standalone serving tests exactly:
+                # lock the chassis before constructing any task. Constructors
+                # cache the arm-base transform and derive table targets from
+                # it, so locking only before task.initialize() was still too
+                # late for a plate-rack-only delivery after mobile docking.
+                add_parking_brake(self.stage, self.articulation.prim_path)
                 cutlery_requested = arm_command >= 20
                 plate_rack_requested = arm_command >= 40
                 remainder = arm_command - (40 if plate_rack_requested else 0)
@@ -3643,7 +3668,6 @@ class NavBridge(Node):
                 if not named_tasks:
                     raise ValueError(f"arm command contains no delivery: {arm_command}")
                 task = CommandServingSequence(named_tasks)
-                add_parking_brake(self.stage, self.articulation.prim_path)
                 task.initialize(self.articulation, self.dof_names)
                 self._active_serving_task = task
                 self._serving_paused = False
@@ -4047,6 +4071,61 @@ def main():
     # The drive authoring pass may safely cover both complete robot
     # articulations after they have been composed into the stage.
     configure_joint_drives(stage)
+
+    # Finish every character reference and AnimationGraph USD edit while the
+    # timeline is still stopped.  Previously these were authored after both
+    # PhysX and the ROS camera SDG writers had started.  Isaac Sim 5.1 then
+    # delivered their pending ObjectsChanged notices during a physics update,
+    # which repeatedly crashed in PXR SdfPath conversion/Python GC.
+    timeline = omni.timeline.get_timeline_interface()
+    if timeline.is_playing():
+        timeline.pause()
+
+    typing_person = None
+    crossing_person = None
+    crossing_pedestrian_controller = None
+    if (
+        crossing_pedestrian_module is not None
+        and crossing_pedestrian_module.TYPING_ENABLED
+    ):
+        try:
+            typing_person = (
+                crossing_pedestrian_module.spawn_typing_customer(stage)
+            )
+        except Exception as exc:
+            print(
+                f"[typing_topic] actor setup warning: {exc}",
+                flush=True,
+            )
+
+    if (
+        crossing_pedestrian_module is not None
+        and crossing_pedestrian_module.ENABLED
+    ):
+        try:
+            crossing_person = crossing_pedestrian_module.spawn(stage)
+            crossing_pedestrian_controller = (
+                crossing_pedestrian_module.CrossingPedestrianController(
+                    crossing_person
+                )
+            )
+        except Exception as exc:
+            print(
+                f"[crossing_pedestrian] actor setup warning: {exc}",
+                flush=True,
+            )
+
+    # Drain composition and scripting notices before initialize_robot() starts
+    # the timeline.  No AnimationGraph API is added or removed after here.
+    for _ in range(30):
+        simulation_app.update()
+    print(
+        "[characters] initialization settled before physics/sensors "
+        f"typing={typing_person is not None} "
+        f"crossing={crossing_person is not None}",
+        flush=True,
+    )
+
     initialized_records = []
     for index, (config, articulation_path) in enumerate(robot_records):
         set_robot_context(config["root"], config["spawn"])
@@ -4080,7 +4159,6 @@ def main():
         executor.add_node(bridge)
     bridge = bridges[0]
 
-    timeline = omni.timeline.get_timeline_interface()
     if not timeline.is_playing():
         timeline.play()
 
@@ -4098,14 +4176,8 @@ def main():
     )
 
     typing_customer_controller = None
-    if (
-        crossing_pedestrian_module is not None
-        and crossing_pedestrian_module.TYPING_ENABLED
-    ):
+    if typing_person is not None:
         try:
-            typing_person = (
-                crossing_pedestrian_module.spawn_typing_customer(stage)
-            )
             typing_customer_controller = (
                 crossing_pedestrian_module.TypingTopicController(
                     typing_person
@@ -4117,32 +4189,15 @@ def main():
                 flush=True,
             )
 
-    crossing_pedestrian_controller = None
-    if (
-        crossing_pedestrian_module is not None
-        and crossing_pedestrian_module.ENABLED
-    ):
-        try:
-            crossing_person = crossing_pedestrian_module.spawn(stage)
-            crossing_pedestrian_controller = (
-                crossing_pedestrian_module.CrossingPedestrianController(
-                    crossing_person
-                )
-            )
-            # HMI's legacy "person spawn/remove" test controls now drive the
-            # walking CrossingPedestrian instead of the retired corridor
-            # test actor.
-            bridge.set_obstacle_test_controller(crossing_pedestrian_controller)
-            print(
-                "[crossing_pedestrian] enabled service-controlled visibility: "
-                "/obstacle_test/set_visible",
-                flush=True,
-            )
-        except Exception as exc:
-            print(
-                f"[crossing_pedestrian] actor setup warning: {exc}",
-                flush=True,
-            )
+    if crossing_pedestrian_controller is not None:
+        # HMI's legacy "person spawn/remove" test controls now drive the
+        # walking CrossingPedestrian instead of the retired corridor actor.
+        bridge.set_obstacle_test_controller(crossing_pedestrian_controller)
+        print(
+            "[crossing_pedestrian] enabled service-controlled visibility: "
+            "/obstacle_test/set_visible",
+            flush=True,
+        )
 
     # The simple hand-only intrusion actor and the corridor obstacle test
     # actor are retired from the default run path.  HMI's "hand" test button

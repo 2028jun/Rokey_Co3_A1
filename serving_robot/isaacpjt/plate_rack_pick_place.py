@@ -39,9 +39,12 @@ PLATE_RACK_GRIPPER_MAX_FORCE = 40.0
 # preventing any closing motion.  The formerly tested 0.55 rad pose clears the
 # rack while remaining wider than the 26 mm centre grip block.
 PLATE_RACK_GRIPPER_PREGRASP = 0.55
-# Move the rack 30 mm farther onto the table and 30 mm to robot-right so the
-# 300 x 200 mm base no longer sits on the near/right tabletop boundary.
-PLATE_RACK_PLACE_LOCAL_X = 0.49
+# Keep the 300 x 200 mm rack in the table-left area, but pull it 90 mm toward
+# the robot relative to the old X=0.49 target.  The old base reached X=0.64,
+# only 30 mm from soda1 at (0.67, +0.28); its 33 mm collider therefore touched
+# the rack during descent.  X=0.40 leaves 87 mm between the rack base and can,
+# while retaining 45 mm clearance from the pizza board at (0.55, 0.0).
+PLATE_RACK_PLACE_LOCAL_X = 0.40
 PLATE_RACK_PLACE_LOCAL_Y = 0.34
 # Command the base slightly into the theoretical tabletop plane.  Contact
 # supports the rack before release instead of allowing the shared controller
@@ -144,6 +147,15 @@ class PlateRackPickPlace(SodaCanPickPlace):
         # here.  This remains tighter than the shared 25 mm threshold, while
         # the -2 mm surface bias ensures release happens with the base supported.
         self._placement_settle_error = 0.022
+        # Phase 6 may stop on the table with a small residual wrist error.
+        # Verify the rack base itself is at the authored support surface before
+        # releasing, rather than timing out or accepting an airborne wrist.
+        self._placement_requires_support = True
+        self._placement_support_vertical_min = -0.003
+        self._placement_support_vertical_max = 0.012
+        self._placement_support_lateral = 0.025
+        self._placement_support_gap = float("inf")
+        self._placement_support_lateral_error = float("inf")
         self._gripper_contact_margin = 0.03
         self._gripper_close_ramp_steps = 120
         self._gripper_close_wait_steps = 165
@@ -155,6 +167,9 @@ class PlateRackPickPlace(SodaCanPickPlace):
         )
         self._initial_steps = int(
             os.environ.get("MOBILE_PLATE_INITIAL_STEPS", "120")
+        )
+        self._motion_timeout_steps = int(
+            os.environ.get("MOBILE_PLATE_MOTION_TIMEOUT_STEPS", "600")
         )
         self._continuous_rmp_lift = True
         self._preserve_grasp_orientation = False
@@ -195,6 +210,36 @@ class PlateRackPickPlace(SodaCanPickPlace):
             )
             return False
         return True
+
+    def _placement_supported(self):
+        """Confirm that the rack base, not just the wrist, reached the table."""
+        if self._phase != 6 or self._can_prim is None:
+            return False
+        rack_position, _, _ = prim_world_pose(self._can_prim)
+        rack_position = np.asarray(rack_position, dtype=float)
+        if not np.all(np.isfinite(rack_position)):
+            return False
+
+        # Phase-6 target is the handle centre. Recover the corresponding rack
+        # root target and measure along the robot's live up axis. The target is
+        # intentionally 2 mm below the ideal contact plane, so a supported base
+        # normally reports a small positive gap here.
+        rack_target = (
+            np.asarray(self._targets[6], dtype=float)
+            - self._up * HANDLE_GRIP_CENTRE_Z
+        )
+        delta = rack_position - rack_target
+        vertical_gap = float(np.dot(delta, self._up))
+        lateral_delta = delta - self._up * vertical_gap
+        lateral_error = float(np.linalg.norm(lateral_delta))
+        self._placement_support_gap = vertical_gap
+        self._placement_support_lateral_error = lateral_error
+        return bool(
+            self._placement_support_vertical_min
+            <= vertical_gap
+            <= self._placement_support_vertical_max
+            and lateral_error <= self._placement_support_lateral
+        )
 
     def _release_transport(self):
         """Turn the independently cooked rack from kinematic to dynamic."""
@@ -553,10 +598,14 @@ class PlateRackPickPlace(SodaCanPickPlace):
             self._command_gripper(articulation, self._gripper_pregrasp)
             if self._transport_release_steps == PLATE_RACK_RELEASE_SETTLE_STEPS:
                 # Always sample the released, settled body again before
-                # planning any arm motion.
+                # planning any arm motion. Refresh the fixed robot frame as
+                # well: unlike a later sequence task, a plate-only first task
+                # does not pass through start_with_deployed_trays().
+                self.refresh_robot_frame()
                 self._prepare_targets()
                 print(
-                    "[plate-rack] transport release settled; live pickup pose refreshed",
+                    "[plate-rack] transport release settled; robot frame and "
+                    "live pickup pose refreshed",
                     flush=True,
                 )
             return

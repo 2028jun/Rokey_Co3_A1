@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -eo pipefail
-WS="${ROKEY_CO3_MULTI_WS:-$HOME/git/Rokey_Co3_multi}"
+WS="${ROKEY_CO3_MULTI_WS:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$WS"
 # ROS setup.bash references unbound vars; do not use set -u around source.
 set +u

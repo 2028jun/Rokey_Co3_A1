@@ -18,6 +18,10 @@ export NAV_CAMERA_WIDTH="${NAV_CAMERA_WIDTH:-1280}"
 export NAV_CAMERA_HEIGHT="${NAV_CAMERA_HEIGHT:-960}"
 export NAV_CAMERA_FRAME_SKIP="${NAV_CAMERA_FRAME_SKIP:-3}"
 export NAV_CAMERA_DEPTH_ENABLED="${NAV_CAMERA_DEPTH_ENABLED:-0}"
+# Keep the current serving-stable docking window as the no-argument default.
+# Environment overrides remain available for controlled tuning.
+export NAV_DOCK_XY_TOLERANCE_M="${NAV_DOCK_XY_TOLERANCE_M:-0.025}"
+export NAV_DOCK_YAW_TOLERANCE_DEG="${NAV_DOCK_YAW_TOLERANCE_DEG:-1.0}"
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$bridge_lib"
 cd "$workspace_root"
 exec "$isaac_python" nav_robot/isaacpjt/nav_restaurant_demo.py "$@"

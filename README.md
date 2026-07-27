@@ -11,9 +11,9 @@ WSL Ubuntu 22.04에서 ROS 2 Humble 빌드와 단위 테스트 17개는 통과�
 - `/clock`, odom, LiDAR, TF, AMCL과 Nav2 costmap이 두 네임스페이스에서 정상인지
 - HMI에서 `robot1` 카메라 영상과 위치가 표시되는지
 
-이번 검증 범위는 주행 전용 모드입니다. 음식 스폰, 로봇팔 서빙, 손 안전 동작은
-실행하지 않습니다. 로봇 간 정지/감속 및 교착 방지 로직도 이번 변경 범위에
-포함하지 않았습니다.
+현재 기본 실행은 로봇별 payload prim을 사용하는 2대 전체 서빙 모드입니다.
+YOLO 손 감지는 Isaac/Manager 컴퓨터에서 실행하지 않고 별도 GPU 컴퓨터에서
+실행합니다. 주행 전용 또는 로컬 YOLO는 진단할 때만 launch 인자로 켭니다.
 
 ### 1. 최신 코드 및 빌드
 
@@ -65,6 +65,16 @@ source install/setup.bash
 ros2 launch serving_robot_manager multi_robot.launch.py
 ```
 
+인자를 생략한 위 명령의 기본값은 다음과 같습니다.
+
+```text
+enable_serving_workers:=true
+navigation_only:=false
+serialize_shared_payloads:=false
+enable_local_hand_detection:=false
+use_sim_time:=true
+```
+
 다음 로그가 `robot1`, `robot2`에서 각각 한 번씩 출력될 때까지 주문을 넣지
 마십시오.
 
@@ -83,6 +93,21 @@ ros2 launch serving_hmi hmi.launch.py
 
 브라우저에서 `http://localhost:8000`을 엽니다. HMI 카메라 기본 연결은
 `/robot1/camera/color/image_raw`, 위치 연결은 `/robot1/nav_robot/odom`입니다.
+
+**터미널 4: 별도 YOLO 컴퓨터**
+
+두 컴퓨터를 같은 유선 LAN에 연결하고 메인 컴퓨터와 같은 `ROS_DOMAIN_ID`를
+설정합니다. `ROS_LOCALHOST_ONLY`는 반드시 `0`이어야 합니다.
+
+```bash
+cd /home/rokey/cobot3_ws
+export ROS_DOMAIN_ID=101       # 메인 컴퓨터와 같은 값
+export ROS_LOCALHOST_ONLY=0
+./tools/run_remote_yolo.sh
+```
+
+이 스크립트는 robot1/robot2 감지기를 모두 실행합니다. 메인 컴퓨터에서
+`enable_local_hand_detection:=false`를 다시 지정할 필요는 없습니다.
 
 ### 3. 주문 전 연결 확인
 
@@ -133,13 +158,15 @@ ros2 topic echo /robot1/system/status
 ros2 topic echo /robot2/system/status
 ```
 
-각 로봇의 정상 상태 순서는 다음과 같습니다.
+전체 서빙에서 각 로봇의 정상 상태 순서는 다음과 같습니다.
 
 ```text
-3 -> 1 -> 6
+2 -> 3 -> 4 -> 1 -> 6
 ```
 
+- `2`: payload 스폰
 - `3`: 테이블로 이동
+- `4`: 로봇팔 서빙
 - `1`: 주방으로 복귀
 - `6`: 주문 완료
 - `7`: 실패
@@ -153,7 +180,7 @@ ros2 topic echo /robot2/system/status
 - 첫 주문은 `robot1`, 복귀 전 두 번째 주문은 `robot2`가 수행함
 - 두 로봇 모두 선택한 테이블에 실제로 도착함
 - 두 로봇 모두 서로 다른 자기 주방 슬롯으로 복귀함
-- 두 로봇의 상태가 `3 -> 1 -> 6`으로 진행하고 `7`이 발생하지 않음
+- 두 로봇의 상태가 `2 -> 3 -> 4 -> 1 -> 6`으로 진행하고 `7`이 발생하지 않음
 - `/robot1/navigation/detail`, `/robot2/navigation/detail`의 각 주행 완료가
   `state=SUCCEEDED`, `phase=completed`로 확인됨
 - HMI에서 `robot1` 카메라와 위치가 갱신됨
@@ -224,13 +251,13 @@ export NAV_ROBOT5_ROS_DOMAIN_ID="$ROS_DOMAIN_ID"
 
 `~/.bashrc`를 변경한 뒤 새 터미널을 여십시오.
 
-## 멀티로봇 빠른 실행(터미널 3개)
+## 멀티로봇 빠른 실행(메인 3개 + 원격 YOLO 1개)
 
 통합 멀티로봇 모드는 Isaac Sim에 완전한 서빙 로봇 두 대를 생성하고,
-각 로봇마다 네임스페이스가 분리된 Nav2, 안전, Manager 스택을 실행합니다.
-RViz 창 하나에서 두 로봇을 함께 확인할 수 있습니다. Isaac 명령과 ROS
-명령은 서로 다른 터미널에서 실행하고, Isaac 터미널에서는 ROS 환경을
-`source`하지 마십시오.
+각 로봇마다 네임스페이스가 분리된 Nav2, Manager, 음식 스폰 및 팔 서빙
+스택을 실행합니다. RViz 창 하나에서 두 로봇을 함께 확인할 수 있습니다.
+YOLO는 별도 GPU 컴퓨터에서 실행합니다. Isaac 명령과 ROS 명령은 서로 다른
+터미널에서 실행하고, Isaac 터미널에서는 ROS 환경을 `source`하지 마십시오.
 
 최초 실행 전이나 ROS 패키지를 변경한 뒤 한 번 빌드합니다.
 
@@ -254,6 +281,10 @@ cd /home/rokey/cobot3_ws
 경로를 구성한 뒤 `nav_robot/isaacpjt/nav_restaurant_demo.py`를 실행합니다.
 식당과 `/World/NavRobot1`, `/World/NavRobot2` 인스턴스가 모두 로드될 때까지
 기다리십시오.
+
+스크립트에 반영된 현재 기본값은 카메라 `1280x960`, 로봇당 약 `15 Hz`,
+depth 비활성화, 도킹 허용오차 `0.025 m / 1.0 deg`입니다. 필요할 때만
+`NAV_CAMERA_*`, `NAV_DOCK_*` 환경변수로 덮어씁니다.
 
 **터미널 2: Nav2 스택 두 개, Fleet Manager, 안전 노드 및 RViz**
 
@@ -290,19 +321,19 @@ ros2 launch serving_hmi hmi.launch.py
 배정하고, `robot1`이 주행 중일 때 들어온 다음 주문은 유휴 상태인
 `robot2`에 배정합니다.
 
-멀티로봇 launch의 기본값은 주행 전용 검증 모드입니다. 각 주문은 음식
-스폰이나 로봇팔 서빙 없이 선택한 테이블까지 이동한 뒤 주방으로 복귀합니다.
+멀티로봇 launch는 옵션 없이 실행해도 아래 운영 설정을 사용합니다.
 
-나중에 두 로봇의 전체 서빙을 동시에 활성화하려면 먼저 전역 payload USD
-prim을 로봇별 경로로 분리해야 합니다. 분리 완료 전의
-`serialize_shared_payloads:=true`는 한 번에 한 로봇만 시험하기 위한 임시
-보호책이며 최종 멀티로봇 구조가 아닙니다. 분리와 개별 검증이 끝난 뒤에는
-직렬화를 끄고 두 로봇 동시 서빙을 검증합니다.
-
-```bash
-ros2 launch serving_robot_manager multi_robot.launch.py \
-  navigation_only:=false serialize_shared_payloads:=false
+```text
+enable_serving_workers:=true
+navigation_only:=false
+serialize_shared_payloads:=false
+enable_local_hand_detection:=false
+use_sim_time:=true
 ```
+
+따라서 음식 스폰, 로봇팔 서빙과 로봇별 payload 병렬 사용은 켜지고 로컬
+YOLO만 꺼집니다. 주행만 점검하려면 명시적으로 `navigation_only:=true`를
+지정하십시오.
 
 ### 다른 컴퓨터에서 YOLO 실행
 
@@ -311,8 +342,8 @@ Isaac/Manager 컴퓨터와 YOLO 컴퓨터는 같은 유선 LAN에 연결하고 �
 두 터미널에서 같은 값을 직접 설정하십시오. 두 컴퓨터 모두
 `ROS_LOCALHOST_ONLY=0`이어야 합니다.
 
-Isaac/Manager 컴퓨터에서는 로컬 YOLO 두 개만 비활성화하고 나머지 통합
-노드는 그대로 실행합니다.
+Isaac/Manager 컴퓨터의 기본 launch 설정은 이미 로컬 YOLO 두 개를
+비활성화합니다. 따라서 별도 옵션 없이 실행합니다.
 
 ```bash
 cd /home/rokey/cobot3_ws
@@ -320,11 +351,7 @@ source /opt/ros/humble/setup.bash
 source install/setup.bash
 export ROS_DOMAIN_ID=0                 # 두 컴퓨터에서 같은 값 사용
 export ROS_LOCALHOST_ONLY=0
-ros2 launch serving_robot_manager multi_robot.launch.py \
-  navigation_only:=false \
-  serialize_shared_payloads:=false \
-  enable_serving_workers:=true \
-  enable_local_hand_detection:=false
+ros2 launch serving_robot_manager multi_robot.launch.py
 ```
 
 YOLO 컴퓨터에도 이 저장소와 ROS 2 Humble, CUDA 지원 PyTorch가 필요합니다.
@@ -369,6 +396,15 @@ ros2 topic echo /robot1/hand_safety/intrusion
 무압축 RGB 두 스트림은 이론상 약 111 MB/s이므로 Wi-Fi보다 1 GbE 이상의
 유선 네트워크를 권장합니다. 패킷 손실이 있으면 해상도를 낮추지 말고 먼저
 ROS image transport 압축 또는 2.5 GbE를 적용하십시오.
+
+원격 YOLO를 사용할 수 없는 진단 상황에서만 메인 컴퓨터에서 다음과 같이
+로컬 감지기를 임시 활성화합니다. 동시에 원격 감지기를 실행하면 같은 출력
+토픽에 publisher가 중복되므로 둘 중 하나만 사용해야 합니다.
+
+```bash
+ros2 launch serving_robot_manager multi_robot.launch.py \
+  enable_local_hand_detection:=true
+```
 
 HMI 없이 주행 전용 스모크 테스트를 실행하려면 다음 서비스를 호출합니다.
 
@@ -446,15 +482,14 @@ cd /home/rokey/cobot3_ws
 전체 절차와 생성된 지도를 `nav_robot5/src/two_wheel_rails/maps/`에 적용하는
 방법은 [src/map_gen/README.md](src/map_gen/README.md)를 참고하십시오.
 
-## 2대 주행 성공 후 전체 서빙 모드 전환
+## 전체 서빙 검증
 
-이 절은 멀티로봇 주행 전용 검증이 성공한 뒤 음식 스폰, 로봇팔 서빙,
-손 침입 안전 기능을 다시 활성화할 때 사용하는 월요일 작업 체크리스트입니다.
-전체 서빙 모드는 launch를 다시 시작해야 적용됩니다. 다만 현재 전역 payload
-prim을 로봇별로 분리하기 전에는 두 로봇 전체 서빙을 동시에 실행하면 안 됩니다.
+현재 기본 launch는 음식 스폰, 로봇팔 서빙과 로봇별 payload 경로를 사용하는
+전체 서빙 모드입니다. 아래는 이 구조가 실제로 격리되어 동작하는지 확인하는
+체크리스트입니다.
 
-먼저 피자, 음료, 식기, 접시 랙과 배달 완료 보관 경로를 로봇별
-`payload_root` 아래로 분리합니다. 권장 구조는 다음과 같습니다.
+피자, 음료, 식기, 접시 랙과 배달 완료 보관 경로는 로봇별
+`payload_root` 아래에 생성되어야 합니다.
 
 ```text
 /World/RobotPayloads/robot1/ServingDish
@@ -469,11 +504,10 @@ prim을 로봇별로 분리하기 전에는 두 로봇 전체 서빙을 동시�
 /World/Delivered/robot2/...
 ```
 
-`nav_restaurant_demo.py`에서 각 `NavBridge`의 로봇 이름으로 `payload_root`를
-결정하고, 이 값을 피자, 음료, 식기, 접시 랙의 생성, 검색, 유효성 검사,
-로봇팔 pick/place 및 archive 코드 전체에 전달해야 합니다. 경로 문자열 일부만
-바꾸면 남은 전역 경로가 다른 로봇의 payload를 삭제하거나 집을 수 있으므로
-아래 경로를 사용하는 모든 코드를 함께 변경합니다.
+`nav_restaurant_demo.py`는 각 `NavBridge`의 로봇 이름으로 `payload_root`를
+결정하고 이 값을 피자, 음료, 식기, 접시 랙의 생성, 검색, 유효성 검사,
+로봇팔 pick/place 및 archive 코드에 전달합니다. 검증 중 아래 전역 경로가
+새로 생기거나 다른 로봇 작업에 의해 삭제되지 않는지 확인하십시오.
 
 ```text
 /World/ServingDish
@@ -487,43 +521,35 @@ prim을 로봇별로 분리하기 전에는 두 로봇 전체 서빙을 동시�
 /World/Delivered
 ```
 
-분리 완료 후 실행 중인 주행 전용 launch를 `Ctrl+C`로 종료하고 다음과 같이
-전체 멀티로봇 서빙을 실행합니다.
+전체 멀티로봇 서빙은 기본 인자만으로 실행합니다.
 
 ```bash
 cd /home/rokey/cobot3_ws
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-ros2 launch serving_robot_manager multi_robot.launch.py \
-  navigation_only:=false \
-  serialize_shared_payloads:=false \
-  enable_serving_workers:=true
+ros2 launch serving_robot_manager multi_robot.launch.py
 ```
 
-`navigation_only:=false`는 음식 스폰, 로봇팔, 손 안전 단계를 활성화합니다.
-`serialize_shared_payloads:=false`는 로봇별 prim 분리와 개별 서빙 검증을 모두
-통과한 뒤에만 사용합니다. 분리 작업 전에는 아래 명령으로 한 번에 한 로봇만
-통합 시험할 수 있습니다. 이 모드는 구조적 해결이 아니라 충돌 방지용 임시
-시험 모드입니다.
+기본값은 `navigation_only:=false`, `serialize_shared_payloads:=false`,
+`enable_serving_workers:=true`, `enable_local_hand_detection:=false`입니다.
+`serialize_shared_payloads:=true`는 동시 서빙을 끄고 한 로봇씩 진단해야 할 때만
+사용하는 레거시 진단 옵션입니다.
 
 ```bash
 ros2 launch serving_robot_manager multi_robot.launch.py \
-  navigation_only:=false \
-  serialize_shared_payloads:=true \
-  enable_serving_workers:=true
+  serialize_shared_payloads:=true
 ```
 
-### 전환 전에 알아둘 동작 차이
+### 기본 전체 서빙 동작
 
 - 주행 전용 상태 순서 `3 -> 1 -> 6` 대신 일반적으로
   `2 -> 3 -> 4 -> 1 -> 6` 순서로 진행합니다.
 - `2`는 음식 스폰, `3`은 테이블 이동, `4`는 로봇팔 서빙, `5`는 손 침입
   일시정지, `1`은 주방 복귀, `6`은 완료, `7`은 실패입니다.
 - 초기 주방 위치가 불확실하면 `2` 앞에 `1`이 한 번 나타날 수 있습니다.
-- prim 분리 전 임시 직렬화 시험에서는 첫 로봇이 완료되기 전 두 번째 HMI
-  주문이 대기열에 저장되지 않고 거부되어 HMI에서 취소로 표시될 수 있습니다.
-  이 단계에서는 반드시 주문을 한 건씩 완료한 뒤 다음 주문을 넣습니다.
-- prim 분리 후에는 `serialize_shared_payloads:=false`에서 robot1과 robot2가
+- 진단용 직렬화에서는 첫 로봇이 완료되기 전 두 번째 HMI 주문이 대기열에
+  저장되지 않고 거부될 수 있습니다. 이 옵션에서는 주문을 한 건씩 넣습니다.
+- 기본 `serialize_shared_payloads:=false`에서 robot1과 robot2가
   서로 다른 payload만 생성, 조작, 삭제, archive하는지 먼저 확인한 뒤 연속
   주문으로 동시 서빙을 시험합니다.
 - Fleet Manager는 유휴 후보 중 항상 `robot1`을 먼저 고릅니다. `robot1`이
@@ -611,8 +637,7 @@ ros2 topic echo /robot1/navigation/detail
 
 공용 Fleet 서비스 대신 robot2 Manager를 직접 호출하여 robot2의 카메라,
 로봇팔 좌표계, payload 접근과 주방 복귀를 독립적으로 확인합니다. robot1의
-주문이 완전히 끝나고 상태가 `0` 또는 `6`인 상태에서 실행하십시오. prim 분리
-전에는 반드시 `serialize_shared_payloads:=true`로 실행해야 합니다.
+주문이 완전히 끝나고 상태가 `0` 또는 `6`인 상태에서 실행하십시오.
 
 ```bash
 ros2 service call /robot2/manager/order \
@@ -621,7 +646,7 @@ ros2 service call /robot2/manager/order \
 ```
 
 robot2에서도 `2 -> 3 -> 4 -> 1 -> 6` 상태, 실제 음식 배치, 팔 stow,
-트레이 수납, `(0.90, 5.25)` 주방 슬롯 복귀를 확인합니다. 분리 후에는 모든
+트레이 수납, `(0.90, 5.25)` 주방 슬롯 복귀를 확인합니다. 모든
 생성 prim이 `/World/RobotPayloads/robot2` 아래에만 생기고 robot1 경로에
 변경이 없는지 확인합니다. 물체가 robot1 트레이 위치에 생성되거나 robot2 팔의
 도달 좌표가 어긋나면 동시 서빙 시험으로 넘어가지 않습니다.
@@ -696,18 +721,12 @@ tensor handle, 트레이 또는 로봇팔 상태가 꼬였으면 같은 프로�
 재시도하지 말고 ROS launch와 Isaac Sim을 모두 종료한 뒤 깨끗한 stage에서
 재실행하십시오.
 
-### 7. 실제 운영 전 남은 설계 작업
+### 7. 실제 운영 전 확인 작업
 
-- 최우선 작업은 전역 `/World/Serving*`, 피자 보드 부속 prim과
-  `/World/Delivered`를 로봇별 `payload_root`로 분리하는 것입니다. 생성과
-  로봇팔 pick/place뿐 아니라 삭제, 재사용, 유효성 검사, 실패 정리와 archive
-  경로까지 같은 root를 사용해야 합니다.
-- prim 분리 완료 후 `serialize_shared_payloads:=false`로 두 로봇의 연속 주문을
-  실행하여 payload 경로와 로봇팔 조작 대상이 완전히 독립적인지 검증합니다.
-  검증이 끝나면 `serialize_shared_payloads` 임시 보호책을 제거할 수 있습니다.
-- prim 분리 전 임시 직렬화 중 들어온 주문을 현재는 거부하므로, 그 단계에서는
-  주문을 한 건씩 시험합니다. 운영용 대기열이 필요한지는 prim 분리 후 실제
-  Fleet 처리량과 HMI 동작을 기준으로 별도 결정합니다.
+- `serialize_shared_payloads:=false`로 두 로봇의 연속 주문을 실행하여 payload
+  경로와 로봇팔 조작 대상이 완전히 독립적인지 계속 회귀 검증합니다.
+- 레거시 `serialize_shared_payloads` 진단 옵션을 최종 제거할지는 실제 Fleet
+  장애 복구 시험 후 결정합니다.
 - HMI의 `active_order_id`와 `/system/status`는 전역 단일 값이므로 로봇별 주문
   상태, 카메라 선택, 장애 복구 상태를 정확히 표시하도록 확장해야 합니다.
 - HMI 카메라와 지도는 기본적으로 robot1만 표시합니다. robot2 선택 또는

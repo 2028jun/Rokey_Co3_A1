@@ -1,10 +1,9 @@
-"""Two namespaced navigation workers and one combined RViz.
+"""Two namespaced full-serving workers and one combined RViz.
 
 The Isaac simulator provides two complete robot instances and namespaced
-navigation, camera, arm and food endpoints. Navigation-only mode is the
-default for fleet driving checks: robot1 receives the first order and robot2
-can receive a later order while robot1 is still active. Full serving can be
-enabled explicitly; each robot uses its own isolated payload root.
+navigation, camera, arm and food endpoints. Full serving with isolated payload
+roots and remote YOLO is the production default. Navigation-only and local
+hand detection remain explicit diagnostic overrides.
 """
 
 import os
@@ -96,6 +95,7 @@ def _worker(
                 "confidence": 0.70,
                 "image_size": 1280,
                 "half": False,
+                "process_rate": 15.0,
                 "confirmation_frames": 5,
                 "self_mask_enabled": True,
                 "publish_annotated_image": False,
@@ -188,21 +188,28 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "navigation_only",
-            default_value="true",
-            description="Skip food spawning and arm serving; drive to the table and return",
+            default_value="false",
+            description=(
+                "Diagnostic override: skip food spawning and arm serving; "
+                "drive to the table and return"
+            ),
         ),
         DeclareLaunchArgument(
             "enable_local_hand_detection",
-            default_value="true",
+            default_value="false",
             description=(
-                "Run both YOLO hand detectors on this computer. Set false "
-                "when remote_hand_detection.launch.py runs on a GPU worker."
+                "Run both YOLO hand detectors on this computer. The default "
+                "is false because remote_hand_detection.launch.py runs on "
+                "the separate GPU worker."
             ),
         ),
         DeclareLaunchArgument(
             "serialize_shared_payloads",
             default_value="false",
-            description="Allow another idle robot to accept an order while one robot is active",
+            description=(
+                "Legacy diagnostic serialization switch. Isolated robot "
+                "payload roots allow the default false setting."
+            ),
         ),
         robot1_worker,
         robot1_gate,
