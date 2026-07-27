@@ -41,7 +41,7 @@ def Xform "World"
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
-            color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
+            color3f[] primvars:displayColor = [(0.78, 0.65, 0.48)]
             double size = 1
             float3 xformOp:scale = (0.16, 30, 2.8)
             double3 xformOp:translate = (-18, -10, 1.4)
@@ -52,7 +52,7 @@ def Xform "World"
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
-            color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
+            color3f[] primvars:displayColor = [(0.78, 0.65, 0.48)]
             double size = 1
             float3 xformOp:scale = (0.16, 30, 2.8)
             double3 xformOp:translate = (18, -10, 1.4)
@@ -63,7 +63,7 @@ def Xform "World"
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
-            color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
+            color3f[] primvars:displayColor = [(0.78, 0.65, 0.48)]
             double size = 1
             float3 xformOp:scale = (36, 0.16, 2.8)
             double3 xformOp:translate = (0, -25, 1.4)
@@ -74,10 +74,10 @@ def Xform "World"
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
-            color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
+            color3f[] primvars:displayColor = [(0.78, 0.65, 0.48)]
             double size = 1
-            float3 xformOp:scale = (15, 0.16, 2.8)
-            double3 xformOp:translate = (-10.5, 5, 1.4)
+            float3 xformOp:scale = (15.28, 0.16, 2.8)
+            double3 xformOp:translate = (-10.36, 5, 1.4)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 
@@ -85,10 +85,10 @@ def Xform "World"
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
-            color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
+            color3f[] primvars:displayColor = [(0.78, 0.65, 0.48)]
             double size = 1
-            float3 xformOp:scale = (15, 0.16, 2.8)
-            double3 xformOp:translate = (10.5, 5, 1.4)
+            float3 xformOp:scale = (15.28, 0.16, 2.8)
+            double3 xformOp:translate = (10.36, 5, 1.4)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 
@@ -96,10 +96,10 @@ def Xform "World"
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
-            color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
+            color3f[] primvars:displayColor = [(0.78, 0.65, 0.48)]
             double size = 1
-            float3 xformOp:scale = (0.16, 5.5, 2.8)
-            double3 xformOp:translate = (-3, 7.75, 1.4)
+            float3 xformOp:scale = (0.16, 5.07, 2.8)
+            double3 xformOp:translate = (-2.72, 7.535, 1.4)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 
@@ -107,10 +107,10 @@ def Xform "World"
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
-            color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
+            color3f[] primvars:displayColor = [(0.78, 0.65, 0.48)]
             double size = 1
-            float3 xformOp:scale = (0.16, 5.5, 2.8)
-            double3 xformOp:translate = (3, 7.75, 1.4)
+            float3 xformOp:scale = (0.16, 5.07, 2.8)
+            double3 xformOp:translate = (2.72, 7.535, 1.4)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 
@@ -118,10 +118,10 @@ def Xform "World"
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
-            color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
+            color3f[] primvars:displayColor = [(0.78, 0.65, 0.48)]
             double size = 1
-            float3 xformOp:scale = (6, 0.16, 2.8)
-            double3 xformOp:translate = (0, 10.5, 1.4)
+            float3 xformOp:scale = (5.44, 0.16, 2.8)
+            double3 xformOp:translate = (0, 10.07, 1.4)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
     }

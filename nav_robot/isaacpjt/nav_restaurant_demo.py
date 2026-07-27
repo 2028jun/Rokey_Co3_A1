@@ -762,6 +762,44 @@ def add_three_by_three_restaurant_tiles(stage):
     )
 
 
+def add_outer_wall_finish(stage):
+    """Add wood wainscot and brass trim to the eight outer wall segments."""
+    finish_root = UsdGeom.Xform.Define(
+        stage, "/World/Architecture/OuterWallFinish"
+    )
+    segments = {
+        "West": ((-18.0, -10.0), (0.18, 30.0)),
+        "East": ((18.0, -10.0), (0.18, 30.0)),
+        "South": ((0.0, -25.0), (36.0, 0.18)),
+        "NorthWest": ((-10.36, 5.0), (15.28, 0.18)),
+        "NorthEast": ((10.36, 5.0), (15.28, 0.18)),
+        "KitchenWest": ((-2.72, 7.535), (0.18, 5.07)),
+        "KitchenEast": ((2.72, 7.535), (0.18, 5.07)),
+        "KitchenNorth": ((0.0, 10.07), (5.44, 0.18)),
+    }
+    for name, (center, footprint) in segments.items():
+        wainscot = UsdGeom.Cube.Define(
+            stage, f"{finish_root.GetPath()}/{name}_Wainscot"
+        )
+        wainscot.CreateSizeAttr(1.0)
+        wainscot.CreateDisplayColorAttr([(0.27, 0.12, 0.055)])
+        wainscot.AddTranslateOp().Set(Gf.Vec3d(center[0], center[1], 0.5))
+        wainscot.AddScaleOp().Set(
+            Gf.Vec3f(footprint[0], footprint[1], 1.0)
+        )
+
+        trim = UsdGeom.Cube.Define(
+            stage, f"{finish_root.GetPath()}/{name}_BrassTrim"
+        )
+        trim.CreateSizeAttr(1.0)
+        trim.CreateDisplayColorAttr([(0.72, 0.50, 0.16)])
+        trim.AddTranslateOp().Set(Gf.Vec3d(center[0], center[1], 1.04))
+        trim.AddScaleOp().Set(
+            Gf.Vec3f(footprint[0], footprint[1], 0.08)
+        )
+    print("[restaurant] outer_wall_finish=wood+brass segments=8", flush=True)
+
+
 def configure_joint_drives(stage):
     for prim in stage.Traverse():
         name = prim.GetName()
@@ -4252,6 +4290,7 @@ def main():
         stage = open_restaurant_and_robot(open_stage=index == 0)
         if index == 0:
             add_three_by_three_restaurant_tiles(stage)
+            add_outer_wall_finish(stage)
         configure_wheel_contact_material(stage)
         configure_gripper_contact_material(stage)
         articulation_path = find_articulation_path(stage)
