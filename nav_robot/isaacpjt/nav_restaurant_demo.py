@@ -175,6 +175,10 @@ URDF_PATH = (
 RESTAURANT_USD = (
     WORKSPACE / "assets/lightweight_restaurant/lightweight_pizza_restaurant.usda"
 )
+RESTAURANT_WALL_PANORAMA = (
+    WORKSPACE
+    / "assets/lightweight_restaurant/textures/low_poly_restaurant_three_wall.png"
+)
 ROBOT_USD = (
     WORKSPACE / "assets/diagnostics/two_wheel_serving_robot_v2.usd"
 )
@@ -948,6 +952,182 @@ def add_outer_wall_finish(stage):
         trim.AddTranslateOp().Set(Gf.Vec3d(center[0], center[1], 1.04))
         trim.AddScaleOp().Set(Gf.Vec3f(footprint[0], footprint[1], 0.08))
     print("[restaurant] outer_wall_finish=wood+brass segments=8", flush=True)
+
+
+def add_three_wall_restaurant_panorama(stage):
+    """Wrap one continuous restaurant panorama across the three dining walls.
+
+    The kitchen/north wall remains unchanged.  These are visual-only meshes
+    placed just inside the existing collision walls, so navigation geometry,
+    lidar boundaries, and the occupancy map do not change.
+    """
+    if os.environ.get("NAV_RESTAURANT_WALL_PANORAMA", "1") != "1":
+        print("[restaurant] three-wall panorama disabled", flush=True)
+        return
+    if not RESTAURANT_WALL_PANORAMA.is_file():
+        raise FileNotFoundError(RESTAURANT_WALL_PANORAMA)
+
+    emissive_strength = float(
+        os.environ.get("NAV_RESTAURANT_PANORAMA_BRIGHTNESS", "1.60")
+    )
+    if not 0.0 <= emissive_strength <= 3.0:
+        raise ValueError(
+            "NAV_RESTAURANT_PANORAMA_BRIGHTNESS must be between 0.0 and 3.0"
+        )
+
+    material_path = "/World/Looks/RestaurantWallPanorama"
+    material = UsdShade.Material.Define(stage, material_path)
+    surface = UsdShade.Shader.Define(stage, f"{material_path}/Surface")
+    surface.CreateIdAttr("UsdPreviewSurface")
+    surface.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.82)
+    surface.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+
+    texture = UsdShade.Shader.Define(stage, f"{material_path}/Texture")
+    texture.CreateIdAttr("UsdUVTexture")
+    texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(
+        Sdf.AssetPath(str(RESTAURANT_WALL_PANORAMA))
+    )
+    texture.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set(
+        "sRGB"
+    )
+    texture.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("clamp")
+    texture.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("clamp")
+
+    reader = UsdShade.Shader.Define(stage, f"{material_path}/Primvar")
+    reader.CreateIdAttr("UsdPrimvarReader_float2")
+    reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+    texture.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
+        reader.ConnectableAPI(), "result"
+    )
+    # Treat the panorama as an unlit set extension. If the texture is also
+    # used as diffuse color, the vertical panels receive much less dome light
+    # than the horizontal dining props and the backdrop turns nearly black.
+    surface.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+        Gf.Vec3f(0.0, 0.0, 0.0)
+    )
+
+    # Emit the authored texture directly so its flat low-poly colors stay
+    # consistent with the foreground regardless of wall orientation.
+    emissive_texture = UsdShade.Shader.Define(
+        stage, f"{material_path}/EmissiveTexture"
+    )
+    emissive_texture.CreateIdAttr("UsdUVTexture")
+    emissive_texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(
+        Sdf.AssetPath(str(RESTAURANT_WALL_PANORAMA))
+    )
+    emissive_texture.CreateInput(
+        "sourceColorSpace", Sdf.ValueTypeNames.Token
+    ).Set("sRGB")
+    emissive_texture.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set(
+        "clamp"
+    )
+    emissive_texture.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set(
+        "clamp"
+    )
+    emissive_texture.CreateInput("scale", Sdf.ValueTypeNames.Float4).Set(
+        Gf.Vec4f(
+            emissive_strength,
+            emissive_strength,
+            emissive_strength,
+            1.0,
+        )
+    )
+    emissive_texture.CreateInput(
+        "st", Sdf.ValueTypeNames.Float2
+    ).ConnectToSource(reader.ConnectableAPI(), "result")
+    surface.CreateInput(
+        "emissiveColor", Sdf.ValueTypeNames.Color3f
+    ).ConnectToSource(emissive_texture.ConnectableAPI(), "rgb")
+    material.CreateSurfaceOutput().ConnectToSource(
+        surface.ConnectableAPI(), "surface"
+    )
+
+    root = UsdGeom.Xform.Define(
+        stage, "/World/Architecture/RestaurantWallPanorama"
+    )
+
+    def add_panel(name, points, u_start, u_end):
+        mesh = UsdGeom.Mesh.Define(stage, f"{root.GetPath()}/{name}")
+        mesh.CreatePointsAttr([Gf.Vec3f(*map(float, p)) for p in points])
+        # All three point lists are authored clockwise when viewed from the
+        # dining room. Reverse the winding so the front-face normals point
+        # inward: left +X, front +Y, right -X.
+        mesh.CreateFaceVertexCountsAttr([4])
+        mesh.CreateFaceVertexIndicesAttr([0, 3, 2, 1])
+        mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+        mesh.CreateDoubleSidedAttr(False)
+        primvars = UsdGeom.PrimvarsAPI(mesh.GetPrim())
+        primvars.CreatePrimvar(
+            "st",
+            Sdf.ValueTypeNames.TexCoord2fArray,
+            UsdGeom.Tokens.faceVarying,
+        ).Set(
+            [
+                # faceVarying values follow the reversed face indices above.
+                Gf.Vec2f(float(u_start), 0.125),
+                Gf.Vec2f(float(u_start), 0.875),
+                Gf.Vec2f(float(u_end), 0.875),
+                Gf.Vec2f(float(u_end), 0.125),
+            ]
+        )
+        UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(material)
+
+    z_bottom = 0.02
+    # The free viewport and HMI cameras can see well above the physical 2.8 m
+    # collision wall. Extend only the visual backdrop high enough that those
+    # rays still hit restaurant imagery instead of the bright dome background.
+    z_top = 8.00
+    x_inside = 5.905
+    y_inside = -4.905
+    north_inside = 4.905
+
+    # Split the source by the actual 10:12:10 wall-length ratio. Adjacent
+    # panels therefore share the exact same source coordinate at both south
+    # corners instead of repeating three unrelated copies of the photograph.
+    # Crop the 3:1 source to its middle 75 percent vertically, producing the
+    # same 4:1 aspect ratio as the 32 m perimeter over this 8 m backdrop.
+    left_end = 10.0 / 32.0
+    front_end = 22.0 / 32.0
+    add_panel(
+        "LeftWall",
+        [
+            (-x_inside, north_inside, z_bottom),
+            (-x_inside, y_inside, z_bottom),
+            (-x_inside, y_inside, z_top),
+            (-x_inside, north_inside, z_top),
+        ],
+        0.0,
+        left_end,
+    )
+    add_panel(
+        "FrontWall",
+        [
+            (-x_inside, y_inside, z_bottom),
+            (x_inside, y_inside, z_bottom),
+            (x_inside, y_inside, z_top),
+            (-x_inside, y_inside, z_top),
+        ],
+        left_end,
+        front_end,
+    )
+    add_panel(
+        "RightWall",
+        [
+            (x_inside, y_inside, z_bottom),
+            (x_inside, north_inside, z_bottom),
+            (x_inside, north_inside, z_top),
+            (x_inside, y_inside, z_top),
+        ],
+        front_end,
+        1.0,
+    )
+
+    print(
+        "[restaurant] panorama walls=left+front+right panels=3 "
+        "kitchen_wall=unchanged collision=unchanged "
+        f"brightness={emissive_strength:.2f}",
+        flush=True,
+    )
 
 
 def configure_joint_drives(stage):
@@ -4345,6 +4525,8 @@ def main():
     for index, config in enumerate(robot_configs):
         set_robot_context(config["root"], config["spawn"])
         stage = open_restaurant_and_robot(open_stage=index == 0)
+        if index == 0:
+            add_three_wall_restaurant_panorama(stage)
         configure_wheel_contact_material(stage)
         configure_gripper_contact_material(stage)
         articulation_path = find_articulation_path(stage)
