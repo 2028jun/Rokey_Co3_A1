@@ -176,59 +176,6 @@ def Xform "World"
         }
     }
 
-    def "KitchenBackdrop"
-    {
-        # Repaints the Lightwheel kitchen room to match the dining hall's
-        # neutral wall/floor palette instead of its stock orange polka-dot
-        # walls. Sized/positioned as a best-effort estimate around the
-        # LightwheelKitchen asset (origin (0, 7.442, 0.0005)) since the
-        # source KitchenRoom.usd isn't available to inspect exactly --
-        # nudge scale/translate here after checking it in Isaac Sim.
-        def Cube "KitchenFloor" (
-            prepend apiSchemas = ["PhysicsCollisionAPI"]
-        )
-        {
-            color3f[] primvars:displayColor = [(0.32, 0.34, 0.38)]
-            double size = 1
-            float3 xformOp:scale = (6, 4.6, 0.12)
-            double3 xformOp:translate = (0, 7.3, -0.05)
-            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
-        }
-
-        def Cube "KitchenBackWall" (
-            prepend apiSchemas = ["PhysicsCollisionAPI"]
-        )
-        {
-            color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
-            double size = 1
-            float3 xformOp:scale = (6, 0.16, 3.2)
-            double3 xformOp:translate = (0, 9.6, 1.6)
-            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
-        }
-
-        def Cube "KitchenLeftWall" (
-            prepend apiSchemas = ["PhysicsCollisionAPI"]
-        )
-        {
-            color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
-            double size = 1
-            float3 xformOp:scale = (0.16, 4.6, 3.2)
-            double3 xformOp:translate = (-3, 7.3, 1.6)
-            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
-        }
-
-        def Cube "KitchenRightWall" (
-            prepend apiSchemas = ["PhysicsCollisionAPI"]
-        )
-        {
-            color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
-            double size = 1
-            float3 xformOp:scale = (0.16, 4.6, 3.2)
-            double3 xformOp:translate = (3, 7.3, 1.6)
-            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
-        }
-    }
-
     def "Dining"
     {
         def Xform "TableSet_00"
