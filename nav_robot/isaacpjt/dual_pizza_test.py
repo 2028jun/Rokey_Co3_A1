@@ -82,6 +82,7 @@ def _spawn_robots():
         demo.configure_gripper_contact_material(stage)
         articulation_path = demo.find_articulation_path(stage)
         demo.configure_physics_stability(stage, articulation_path)
+        demo.prepare_parking_brake(stage, articulation_path)
         records.append((config, articulation_path))
 
     demo.configure_joint_drives(stage)

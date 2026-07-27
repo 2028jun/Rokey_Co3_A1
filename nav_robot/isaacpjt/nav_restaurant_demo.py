@@ -523,46 +523,88 @@ def attach_front_rplidar_ros2(stage):
         print(f"[warn] RPLIDAR S2E setup: {exc}", flush=True)
 
 
-def add_parking_brake(stage, articulation_path):
-    """Fix one robot articulation at its current world pose during serving."""
+def _parking_brake_path(articulation_path):
+    articulation_path = str(articulation_path).rstrip("/")
+    robot_root = (
+        articulation_path.split("/Robot/", 1)[0]
+        if "/Robot/" in articulation_path
+        else articulation_path.rsplit("/", 1)[0]
+    )
+    return robot_root, f"{robot_root}/ParkingBrake"
+
+
+def prepare_parking_brake(stage, articulation_path):
+    """Pre-author a disabled world-to-base fixed joint before simulation.
+
+    Creating or deleting a joint while PhysX is stepping previously corrupted
+    the articulation and produced invalid-transform/broad-phase errors.  The
+    joint topology is therefore authored once during scene composition; the
+    serving path only updates its anchor and toggles ``jointEnabled``.
+    """
     articulation_path = str(articulation_path).rstrip("/")
     articulation_prim = stage.GetPrimAtPath(articulation_path)
     if not articulation_prim.IsValid():
         raise RuntimeError(
             f"parking brake articulation is missing: {articulation_path}"
         )
-
-    # Keep the joint below the owning robot root so two NavBridge instances
-    # cannot overwrite or remove each other's parking brake.
-    robot_root = (
-        articulation_path.split("/Robot/", 1)[0]
-        if "/Robot/" in articulation_path
-        else articulation_path.rsplit("/", 1)[0]
+    robot_root, brake_path = _parking_brake_path(articulation_path)
+    joint = UsdPhysics.FixedJoint.Define(stage, brake_path)
+    joint.CreateBody1Rel().SetTargets([Sdf.Path(articulation_path)])
+    joint.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+    joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+    joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    joint.CreateJointEnabledAttr(False).Set(False)
+    print(
+        f"[parking-brake] prepared robot={robot_root} path={brake_path}",
+        flush=True,
     )
-    brake_path = f"{robot_root}/ParkingBrake"
-    if stage.GetPrimAtPath(brake_path).IsValid():
-        stage.RemovePrim(brake_path)
+    return brake_path
+
+
+def add_parking_brake(stage, articulation_path):
+    """Lock one robot at its current world pose with its pre-authored joint."""
+    articulation_path = str(articulation_path).rstrip("/")
+    robot_root, brake_path = _parking_brake_path(articulation_path)
+    joint = UsdPhysics.FixedJoint.Get(stage, brake_path)
+    if not joint or not joint.GetPrim().IsValid():
+        raise RuntimeError(
+            f"parking brake was not prepared before simulation: {brake_path}"
+        )
+
+    # Never move the anchor of an active constraint. Re-locking after an
+    # interrupted command must first release the old anchor.
+    joint.GetJointEnabledAttr().Set(False)
 
     transform = UsdGeom.XformCache().GetLocalToWorldTransform(
-        articulation_prim
+        stage.GetPrimAtPath(articulation_path)
     )
     position = transform.ExtractTranslation()
     rotation = transform.ExtractRotationQuat()
     imaginary = rotation.GetImaginary()
-
-    joint = UsdPhysics.FixedJoint.Define(stage, brake_path)
-    joint.CreateBody1Rel().SetTargets([Sdf.Path(articulation_path)])
-    joint.CreateLocalPos0Attr().Set(Gf.Vec3f(*map(float, position)))
-    joint.CreateLocalRot0Attr().Set(
+    joint.GetLocalPos0Attr().Set(Gf.Vec3f(*map(float, position)))
+    joint.GetLocalRot0Attr().Set(
         Gf.Quatf(
             float(rotation.GetReal()),
             Gf.Vec3f(*map(float, imaginary)),
         )
     )
-    joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
-    joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    joint.GetLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+    joint.GetLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    joint.GetJointEnabledAttr().Set(True)
+
+    # Keep wheel targets neutral as a second line of defense against stale
+    # velocity commands when the fixed joint is released later.
+    for prim in stage.Traverse():
+        if (
+            prim.GetName() in WHEEL_JOINTS
+            and str(prim.GetPath()).startswith(f"{robot_root}/")
+        ):
+            UsdPhysics.DriveAPI.Apply(prim, "angular").CreateTargetVelocityAttr(
+                0.0
+            ).Set(0.0)
     print(
-        f"[parking-brake] locked robot={robot_root} "
+        f"[parking-brake] locked robot={robot_root} mode=fixed-joint "
         f"pose=({position[0]:.3f},{position[1]:.3f})",
         flush=True,
     )
@@ -570,15 +612,13 @@ def add_parking_brake(stage, articulation_path):
 
 
 def remove_parking_brake(stage, articulation_path=None):
-    """Remove one robot brake, or all legacy brakes when no robot is given."""
+    """Disable pre-authored fixed joints and restore normal wheel drives."""
+    robot_roots = None
     if articulation_path is not None:
         articulation_path = str(articulation_path).rstrip("/")
-        robot_root = (
-            articulation_path.split("/Robot/", 1)[0]
-            if "/Robot/" in articulation_path
-            else articulation_path.rsplit("/", 1)[0]
-        )
-        brake_paths = [f"{robot_root}/ParkingBrake"]
+        robot_root, brake_path = _parking_brake_path(articulation_path)
+        robot_roots = {robot_root}
+        brake_paths = [brake_path]
     else:
         brake_paths = [
             str(prim.GetPath())
@@ -586,9 +626,37 @@ def remove_parking_brake(stage, articulation_path=None):
             if prim.GetName() == "ParkingBrake"
         ]
     for brake_path in brake_paths:
-        if stage.GetPrimAtPath(brake_path).IsValid():
-            stage.RemovePrim(brake_path)
-            print(f"[parking-brake] released path={brake_path}", flush=True)
+        joint = UsdPhysics.FixedJoint.Get(stage, brake_path)
+        if joint and joint.GetPrim().IsValid():
+            joint.GetJointEnabledAttr().Set(False)
+
+    wheel_prims = [
+        prim
+        for prim in stage.Traverse()
+        if prim.GetName() in WHEEL_JOINTS
+        and (
+            robot_roots is None
+            or any(
+                str(prim.GetPath()).startswith(f"{root}/")
+                for root in robot_roots
+            )
+        )
+    ]
+    for prim in wheel_prims:
+        drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
+        drive.CreateStiffnessAttr(0.0).Set(0.0)
+        drive.CreateDampingAttr(WHEEL_DRIVE_DAMPING).Set(WHEEL_DRIVE_DAMPING)
+        drive.CreateMaxForceAttr(WHEEL_DRIVE_MAX_FORCE).Set(WHEEL_DRIVE_MAX_FORCE)
+        drive.CreateTargetVelocityAttr(0.0).Set(0.0)
+    if wheel_prims:
+        print(
+            f"[parking-brake] released robot="
+            f"{next(iter(robot_roots)) if robot_roots else 'all'} "
+            "mode=fixed-joint "
+            f"damping={WHEEL_DRIVE_DAMPING:.0f} "
+            f"max_force={WHEEL_DRIVE_MAX_FORCE:.0f}",
+            flush=True,
+        )
 
 
 def open_restaurant_and_robot(open_stage: bool = True):
@@ -1100,10 +1168,15 @@ def connect_embedded_sensor_ros(
     global _embedded_lidar_render_product, _embedded_lidar_writer
     camera_width = int(os.environ.get("NAV_CAMERA_WIDTH", "1280"))
     camera_height = int(os.environ.get("NAV_CAMERA_HEIGHT", "960"))
+    rgb_frame_skip = int(os.environ.get("NAV_CAMERA_FRAME_SKIP", "3"))
+    depth_enabled = os.environ.get("NAV_CAMERA_DEPTH_ENABLED", "0") == "1"
+    depth_frame_skip = int(os.environ.get("NAV_CAMERA_DEPTH_FRAME_SKIP", "29"))
     if camera_width <= 0 or camera_height <= 0:
         raise ValueError(
             "NAV_CAMERA_WIDTH and NAV_CAMERA_HEIGHT must be positive"
         )
+    if rgb_frame_skip < 0 or depth_frame_skip < 0:
+        raise ValueError("camera frame skip values must be non-negative")
     base_path = f"{robot_root}/Robot/ridgeback_base_link/ridgeback_base_link"
     sensor_mount = f"{base_path}/fixed_table_depth_camera/realsense_d455"
     depth_camera = f"{sensor_mount}/RSD455/Camera_Pseudo_Depth"
@@ -1119,17 +1192,20 @@ def connect_embedded_sensor_ros(
         ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
         ("RenderProduct", "isaacsim.core.nodes.IsaacCreateRenderProduct"),
         ("ColorPub", "isaacsim.ros2.bridge.ROS2CameraHelper"),
-        ("DepthPub", "isaacsim.ros2.bridge.ROS2CameraHelper"),
     ]
     connections = [
         ("OnPlaybackTick.outputs:tick", "RenderProduct.inputs:execIn"),
         ("Context.outputs:context", "ColorPub.inputs:context"),
-        ("Context.outputs:context", "DepthPub.inputs:context"),
         ("RenderProduct.outputs:execOut", "ColorPub.inputs:execIn"),
         ("RenderProduct.outputs:renderProductPath", "ColorPub.inputs:renderProductPath"),
-        ("RenderProduct.outputs:execOut", "DepthPub.inputs:execIn"),
-        ("RenderProduct.outputs:renderProductPath", "DepthPub.inputs:renderProductPath"),
     ]
+    if depth_enabled:
+        nodes.append(("DepthPub", "isaacsim.ros2.bridge.ROS2CameraHelper"))
+        connections.extend([
+            ("Context.outputs:context", "DepthPub.inputs:context"),
+            ("RenderProduct.outputs:execOut", "DepthPub.inputs:execIn"),
+            ("RenderProduct.outputs:renderProductPath", "DepthPub.inputs:renderProductPath"),
+        ])
     if publish_clock:
         nodes.append(("PublishClock", "isaacsim.ros2.bridge.ROS2PublishClock"))
         connections.extend([
@@ -1138,36 +1214,39 @@ def connect_embedded_sensor_ros(
             ("ReadSimTime.outputs:simulationTime", "PublishClock.inputs:timeStamp"),
         ])
     camera_prefix = f"{robot_name}/" if robot_name else ""
+    sensor_values = [
+        ("RenderProduct.inputs:cameraPrim", [usdrt.Sdf.Path(depth_camera)]),
+        ("RenderProduct.inputs:width", camera_width),
+        ("RenderProduct.inputs:height", camera_height),
+        ("ColorPub.inputs:nodeNamespace", f"{camera_prefix}camera/color"),
+        ("ColorPub.inputs:topicName", "image_raw"),
+        ("ColorPub.inputs:frameId", "d455_color_optical_frame"),
+        ("ColorPub.inputs:type", "rgb"),
+        # At 60 Hz, skip=3 publishes the original 1280x960 image at 15 Hz.
+        # Resolution and YOLO input quality are unchanged.
+        ("ColorPub.inputs:frameSkipCount", rgb_frame_skip),
+    ]
+    if depth_enabled:
+        sensor_values.extend([
+            ("DepthPub.inputs:nodeNamespace", f"{camera_prefix}camera/depth"),
+            ("DepthPub.inputs:topicName", "image_raw"),
+            ("DepthPub.inputs:frameId", "d455_depth_optical_frame"),
+            ("DepthPub.inputs:type", "depth"),
+            ("DepthPub.inputs:frameSkipCount", depth_frame_skip),
+        ])
     og.Controller.edit(
         {"graph_path": f"{robot_root}/EmbeddedSensorsROS2", "evaluator_name": "execution"},
         {
             keys.CREATE_NODES: nodes,
-            keys.SET_VALUES: [
-                ("RenderProduct.inputs:cameraPrim", [usdrt.Sdf.Path(depth_camera)]),
-                ("RenderProduct.inputs:width", camera_width),
-                ("RenderProduct.inputs:height", camera_height),
-                ("ColorPub.inputs:nodeNamespace", f"{camera_prefix}camera/color"),
-                ("ColorPub.inputs:topicName", "image_raw"),
-                ("ColorPub.inputs:frameId", "d455_color_optical_frame"),
-                ("ColorPub.inputs:type", "rgb"),
-                # Publish every rendered frame.  The previous value of 3
-                # capped the RGB stream to one image per four sim frames.
-                ("ColorPub.inputs:frameSkipCount", 0),
-                ("DepthPub.inputs:nodeNamespace", f"{camera_prefix}camera/depth"),
-                ("DepthPub.inputs:topicName", "image_raw"),
-                ("DepthPub.inputs:frameId", "d455_depth_optical_frame"),
-                ("DepthPub.inputs:type", "depth"),
-                # Depth is not consumed by hand_safety. Keep it at a low rate
-                # so RGB inference gets the shared GPU budget.
-                ("DepthPub.inputs:frameSkipCount", 29),
-            ],
+            keys.SET_VALUES: sensor_values,
             keys.CONNECT: connections,
         },
     )
 
     print(
         f"[ros] {robot_name or 'default'} embedded D455 RGB/depth "
-        f"{camera_width}x{camera_height} clock={int(publish_clock)} connected",
+        f"{camera_width}x{camera_height} rgb_skip={rgb_frame_skip} "
+        f"depth={int(depth_enabled)} clock={int(publish_clock)} connected",
         flush=True,
     )
 
@@ -3854,7 +3933,17 @@ class NavBridge(Node):
         yaw = quaternion_to_yaw(orientation)
 
         stamp = self._sim_stamp
-        self._publish_physx_scan(stamp, x, y, yaw)
+        # The parked robot cannot navigate while its arm/trays are active.
+        # Avoid 180 PhysX raycasts per robot at 10 Hz during the most
+        # contact-sensitive manipulation interval. Odom/TF and arm control
+        # continue at the full 60 Hz physics rate.
+        manipulation_active = (
+            self._active_serving_task is not None
+            or self._arm_returning_to_stow
+            or self._tray_returning_home
+        )
+        if not manipulation_active:
+            self._publish_physx_scan(stamp, x, y, yaw)
         if stamp is None:
             return
 
@@ -3952,6 +4041,7 @@ def main():
         configure_gripper_contact_material(stage)
         articulation_path = find_articulation_path(stage)
         configure_physics_stability(stage, articulation_path)
+        prepare_parking_brake(stage, articulation_path)
         robot_records.append((config, articulation_path))
 
     # The drive authoring pass may safely cover both complete robot

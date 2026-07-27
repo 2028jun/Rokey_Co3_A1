@@ -12,6 +12,12 @@ if [[ ! -x "$isaac_python" ]]; then
 fi
 
 export NAV_MULTI_ROBOT=1
+# Keep the full 1280x960 camera image, but publish it at 15 Hz. Depth is not
+# consumed by the current hand-safety stack and costs another camera helper.
+export NAV_CAMERA_WIDTH="${NAV_CAMERA_WIDTH:-1280}"
+export NAV_CAMERA_HEIGHT="${NAV_CAMERA_HEIGHT:-960}"
+export NAV_CAMERA_FRAME_SKIP="${NAV_CAMERA_FRAME_SKIP:-3}"
+export NAV_CAMERA_DEPTH_ENABLED="${NAV_CAMERA_DEPTH_ENABLED:-0}"
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$bridge_lib"
 cd "$workspace_root"
 exec "$isaac_python" nav_robot/isaacpjt/nav_restaurant_demo.py "$@"

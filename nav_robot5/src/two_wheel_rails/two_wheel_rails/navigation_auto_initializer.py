@@ -15,7 +15,6 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rosgraph_msgs.msg import Clock
-from lifecycle_msgs.srv import GetState
 from std_msgs.msg import Int32, String
 from std_srvs.srv import Trigger
 
@@ -29,8 +28,6 @@ class NavigationAutoInitializerNode(Node):
 
         self._has_clock = False
         self._initialized = False
-        self._nav2_active = False
-        self._nav2_state_request = None
         self._attempt_in_progress = False
         self._attempt_deadline = None
         self._max_retries = 10
@@ -51,13 +48,6 @@ class NavigationAutoInitializerNode(Node):
         self.create_subscription(String, "navigation/detail", self._on_nav_detail, status_qos)
 
         self._init_client = self.create_client(Trigger, "navigation/initialize")
-        # Starting an initialization worker before Nav2 lifecycle bringup has
-        # completed makes BasicNavigator.waitUntilNav2Active() block forever
-        # when a lifecycle transition stalls.  Gate initialization on the
-        # final navigation lifecycle node instead.
-        self._bt_state_client = self.create_client(
-            GetState, "bt_navigator/get_state"
-        )
 
         # Evaluate readiness every 1.5 seconds
         self._timer = self.create_timer(1.5, self._evaluate_readiness)
@@ -113,10 +103,6 @@ class NavigationAutoInitializerNode(Node):
             self.get_logger().info("Waiting for /clock...", throttle_duration_sec=5.0)
             return
 
-        if not self._nav2_active:
-            self._request_nav2_state()
-            return
-
         if not self._init_client.service_is_ready():
             self.get_logger().info("Waiting for /navigation/initialize service...", throttle_duration_sec=5.0)
             return
@@ -134,41 +120,6 @@ class NavigationAutoInitializerNode(Node):
         req = Trigger.Request()
         future = self._init_client.call_async(req)
         future.add_done_callback(self._on_init_response)
-
-    def _request_nav2_state(self) -> None:
-        if not self._bt_state_client.service_is_ready():
-            self.get_logger().info(
-                "Waiting for bt_navigator lifecycle service...",
-                throttle_duration_sec=5.0,
-            )
-            return
-        if (
-            self._nav2_state_request is not None
-            and not self._nav2_state_request.done()
-        ):
-            return
-        self._nav2_state_request = self._bt_state_client.call_async(
-            GetState.Request()
-        )
-        self._nav2_state_request.add_done_callback(self._on_nav2_state)
-
-    def _on_nav2_state(self, future) -> None:
-        try:
-            state = future.result().current_state
-            self._nav2_active = (
-                int(state.id) == 3 or str(state.label).lower() == "active"
-            )
-            if self._nav2_active:
-                self.get_logger().info(
-                    "Nav2 lifecycle is active; initialization may start."
-                )
-        except Exception as exc:
-            self.get_logger().warning(
-                f"Unable to read bt_navigator lifecycle state: {exc}",
-                throttle_duration_sec=5.0,
-            )
-        finally:
-            self._nav2_state_request = None
 
     def _on_init_response(self, future) -> None:
         try:

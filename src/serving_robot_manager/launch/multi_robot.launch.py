@@ -1,10 +1,10 @@
 """Two namespaced navigation workers and one combined RViz.
 
 The Isaac simulator provides two complete robot instances and namespaced
-navigation, camera, arm and food endpoints.  Navigation-only mode is the
+navigation, camera, arm and food endpoints. Navigation-only mode is the
 default for fleet driving checks: robot1 receives the first order and robot2
-can receive a later order while robot1 is still active.  Full serving can be
-enabled explicitly, with shared payload serialization restored.
+can receive a later order while robot1 is still active. Full serving can be
+enabled explicitly; each robot uses its own isolated payload root.
 """
 
 import os
@@ -35,12 +35,18 @@ def _worker(
     use_sim_time,
     enable_serving,
     navigation_only,
+    enable_local_hand_detection,
 ):
     nav_share = get_package_share_directory("two_wheel_rails")
     nav_launch = os.path.join(nav_share, "launch", "nav2.launch.py")
     full_serving_enabled = IfCondition(PythonExpression([
         "'", enable_serving, "'.lower() == 'true' and '",
         navigation_only, "'.lower() == 'false'",
+    ]))
+    local_hand_detection_enabled = IfCondition(PythonExpression([
+        "'", enable_serving, "'.lower() == 'true' and '",
+        navigation_only, "'.lower() == 'false' and '",
+        enable_local_hand_detection, "'.lower() == 'true'",
     ]))
     return GroupAction([
         IncludeLaunchDescription(
@@ -95,7 +101,7 @@ def _worker(
                 "publish_annotated_image": False,
                 "show_window": False,
             }],
-            condition=full_serving_enabled,
+            condition=local_hand_detection_enabled,
         ),
     ])
 
@@ -104,6 +110,9 @@ def generate_launch_description():
     use_sim_time = LaunchConfiguration("use_sim_time")
     enable_serving = LaunchConfiguration("enable_serving_workers")
     navigation_only = LaunchConfiguration("navigation_only")
+    enable_local_hand_detection = LaunchConfiguration(
+        "enable_local_hand_detection"
+    )
     serialize_shared_payloads = LaunchConfiguration("serialize_shared_payloads")
     nav_share = get_package_share_directory("two_wheel_rails")
     config = os.path.join(nav_share, "config")
@@ -111,10 +120,12 @@ def generate_launch_description():
     robot1_worker = _worker(
         "robot1", "-0.90", os.path.join(config, "routes_robot1.yaml"),
         use_sim_time, enable_serving, navigation_only,
+        enable_local_hand_detection,
     )
     robot2_worker = _worker(
         "robot2", "0.90", os.path.join(config, "routes_robot2.yaml"),
         use_sim_time, enable_serving, navigation_only,
+        enable_local_hand_detection,
     )
     robot1_gate = Node(
         package="two_wheel_rails",
@@ -179,6 +190,14 @@ def generate_launch_description():
             "navigation_only",
             default_value="true",
             description="Skip food spawning and arm serving; drive to the table and return",
+        ),
+        DeclareLaunchArgument(
+            "enable_local_hand_detection",
+            default_value="true",
+            description=(
+                "Run both YOLO hand detectors on this computer. Set false "
+                "when remote_hand_detection.launch.py runs on a GPU worker."
+            ),
         ),
         DeclareLaunchArgument(
             "serialize_shared_payloads",

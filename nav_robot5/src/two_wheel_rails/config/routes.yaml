@@ -1,5 +1,5 @@
 # Fixed rails (map frame). Nav2 follows these poses; rail_mission checks cross-track error.
-# Dock x=±1.72 follows the reference restaurant rail layout.
+# Dock x=±1.82 places the serving deck 10 cm closer to each table.
 frame_id: map
 
 kitchen: {x: 0.21, y: 4.90, yaw: -1.5707963267948966}
@@ -14,7 +14,7 @@ routes:
       - {x: 0.00, y: 0.50, yaw: -1.5708}
       - {x: 0.00, y: -2.20, yaw: -1.5708}
     pre_dock: {x: 0.00, y: -2.20, yaw: 3.1416}
-    dock: {x: -1.72, y: -2.20, yaw: 3.1416}
+    dock: {x: -1.82, y: -2.20, yaw: 3.1416}
 
   to_1:
     spine:
@@ -24,7 +24,7 @@ routes:
       - {x: 0.00, y: 0.50, yaw: -1.5708}
       - {x: 0.00, y: -2.20, yaw: -1.5708}
     pre_dock: {x: 0.00, y: -2.20, yaw: 0.0}
-    dock: {x: 1.72, y: -2.20, yaw: 0.0}
+    dock: {x: 1.82, y: -2.20, yaw: 0.0}
 
   to_2:
     spine:
@@ -33,7 +33,7 @@ routes:
       - {x: 0.00, y: 2.50, yaw: -1.5708}
       - {x: 0.00, y: 0.70, yaw: -1.5708}
     pre_dock: {x: 0.00, y: 0.70, yaw: 3.1416}
-    dock: {x: -1.72, y: 0.70, yaw: 3.1416}
+    dock: {x: -1.82, y: 0.70, yaw: 3.1416}
 
   to_3:
     spine:
@@ -42,7 +42,7 @@ routes:
       - {x: 0.00, y: 2.50, yaw: -1.5708}
       - {x: 0.00, y: 0.70, yaw: -1.5708}
     pre_dock: {x: 0.00, y: 0.70, yaw: 0.0}
-    dock: {x: 1.72, y: 0.70, yaw: 0.0}
+    dock: {x: 1.82, y: 0.70, yaw: 0.0}
 
   to_kitchen:
     spine:

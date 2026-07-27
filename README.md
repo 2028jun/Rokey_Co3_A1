@@ -304,6 +304,72 @@ ros2 launch serving_robot_manager multi_robot.launch.py \
   navigation_only:=false serialize_shared_payloads:=false
 ```
 
+### 다른 컴퓨터에서 YOLO 실행
+
+Isaac/Manager 컴퓨터와 YOLO 컴퓨터는 같은 유선 LAN에 연결하고 동일한
+`ROS_DOMAIN_ID`를 사용합니다. 저장소 코드에 domain ID를 고정하지 않으므로
+두 터미널에서 같은 값을 직접 설정하십시오. 두 컴퓨터 모두
+`ROS_LOCALHOST_ONLY=0`이어야 합니다.
+
+Isaac/Manager 컴퓨터에서는 로컬 YOLO 두 개만 비활성화하고 나머지 통합
+노드는 그대로 실행합니다.
+
+```bash
+cd /home/rokey/cobot3_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=0                 # 두 컴퓨터에서 같은 값 사용
+export ROS_LOCALHOST_ONLY=0
+ros2 launch serving_robot_manager multi_robot.launch.py \
+  navigation_only:=false \
+  serialize_shared_payloads:=false \
+  enable_serving_workers:=true \
+  enable_local_hand_detection:=false
+```
+
+YOLO 컴퓨터에도 이 저장소와 ROS 2 Humble, CUDA 지원 PyTorch가 필요합니다.
+최초 한 번 다음 패키지를 빌드합니다.
+
+```bash
+cd /home/rokey/cobot3_ws
+source /opt/ros/humble/setup.bash
+PYTHONNOUSERSITE=1 ./tools/colcon_safe.py build \
+  --packages-up-to hand_safety serving_robot_manager \
+  --executor sequential \
+  --event-handlers console_start_end+ desktop_notification- status- terminal_title-
+```
+
+그다음 YOLO 컴퓨터에서 두 로봇 감지기를 실행합니다.
+
+```bash
+cd /home/rokey/cobot3_ws
+export ROS_DOMAIN_ID=0                 # Isaac/Manager 컴퓨터와 같은 값
+export ROS_LOCALHOST_ONLY=0
+./tools/run_remote_yolo.sh
+```
+
+외부 감지기는 기존 토픽 계약을 변경하지 않습니다.
+
+- 입력: `/robot1/camera/color/image_raw`, `/robot2/camera/color/image_raw`
+- 서빙 상태 입력: `/robot1/serving_robot/table_arrived`,
+  `/robot2/serving_robot/table_arrived`
+- 안전 출력: `/robot1/hand_safety/intrusion`,
+  `/robot2/hand_safety/intrusion`
+
+연결 확인은 양쪽 컴퓨터에서 다음과 같이 합니다.
+
+```bash
+ros2 topic hz /robot1/camera/color/image_raw
+ros2 topic hz /robot2/camera/color/image_raw
+ros2 node list | grep hand_detector
+ros2 topic echo /robot1/hand_safety/intrusion
+```
+
+카메라 해상도는 `1280x960`으로 유지되고 기본 발행률은 로봇당 15 Hz입니다.
+무압축 RGB 두 스트림은 이론상 약 111 MB/s이므로 Wi-Fi보다 1 GbE 이상의
+유선 네트워크를 권장합니다. 패킷 손실이 있으면 해상도를 낮추지 말고 먼저
+ROS image transport 압축 또는 2.5 GbE를 적용하십시오.
+
 HMI 없이 주행 전용 스모크 테스트를 실행하려면 다음 서비스를 호출합니다.
 
 ```bash
