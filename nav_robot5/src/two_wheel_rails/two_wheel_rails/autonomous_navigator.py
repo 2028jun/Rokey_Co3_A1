@@ -403,6 +403,14 @@ class SimplifiedPathNavigator:
         raw_table = payload.get("table_id")
         if phase in ("", "clear"):
             self._table_occupancy.pop(robot, None)
+            # Manager already released the dock. Drop stale fleet intent so a
+            # hung kitchen wait cannot keep peers frozen at the kitchen in
+            # MOVING_TO_TABLE with no motion.
+            intent = self._peer_intents.get(robot)
+            if intent is not None:
+                intent["active"] = False
+                intent["phase"] = "idle"
+                intent["table_id"] = None
             return
         if raw_table is None:
             return
@@ -438,7 +446,12 @@ class SimplifiedPathNavigator:
         return None
 
     def _peer_blocks_table(self, table_id: int | None) -> str | None:
-        """Occupancy claim or live fleet intent near the same table."""
+        """Occupancy claim is the release contract; intent is only a race fill-in.
+
+        Hung kitchen waits used to keep publishing phase=returning after the
+        manager already cleared occupancy. Peers then sat in MOVING_TO_TABLE
+        at the kitchen and never left.
+        """
         owner = self._table_owner(table_id)
         if owner:
             return owner
@@ -453,13 +466,15 @@ class SimplifiedPathNavigator:
                 continue
             if int(intent["table_id"]) != int(table_id):
                 continue
+            # If manager already cleared this peer, ignore leftover intent.
+            if robot not in self._table_occupancy:
+                continue
             phase = str(intent.get("phase", "")).lower()
             if phase in (
                 "serving",
                 "parking_out",
                 "occupying",
                 "approaching",
-                "returning",
             ):
                 return robot
         return None
@@ -812,6 +827,22 @@ class SimplifiedPathNavigator:
             # Keep fleet intent fresh so the yield coordinator can use live pose.
             now = time.monotonic()
             if self._intent_mission_id == mission_id and now - last_intent >= 0.4:
+                # Manager soft kitchen-arrival clears occupancy while this wait
+                # may still be spinning. Stop claiming the table and finish so
+                # the peer is not held at the kitchen forever.
+                if label == "kitchen" and self._intent_table_id is not None:
+                    mine = self._table_occupancy.get(self._robot_id)
+                    if mine is None or str(mine.get("phase", "")).lower() in (
+                        "",
+                        "clear",
+                    ):
+                        self._publish_fleet_intent(active=False)
+                        print(
+                            f"[mission] kitchen released by occupancy clear; "
+                            f"finishing wait mission={mission_id}",
+                            flush=True,
+                        )
+                        return True, "completed"
                 self._publish_fleet_intent(
                     active=True,
                     mission_id=mission_id,
@@ -844,6 +875,25 @@ class SimplifiedPathNavigator:
                         flush=True,
                     )
                     return False, state
+            # Late / retried completed frames sometimes drop the exact
+            # mission_id match after Isaac clears the active id. Still accept
+            # a fresh completed kitchen/table status for this label.
+            elif status and str(status.get("state", "")).lower() == "completed":
+                sid = str(status.get("mission_id", ""))
+                if label == "kitchen" and sid.startswith("kitchen_"):
+                    print(
+                        f"[mission] completed (id-relaxed): mission={sid} "
+                        f"waiting={mission_id} label={label}",
+                        flush=True,
+                    )
+                    return True, "completed"
+                if label.startswith("table_") and sid.startswith(f"{label}_"):
+                    print(
+                        f"[mission] completed (id-relaxed): mission={sid} "
+                        f"waiting={mission_id} label={label}",
+                        flush=True,
+                    )
+                    return True, "completed"
 
             now = time.monotonic()
             if now - last_log >= 2.0:

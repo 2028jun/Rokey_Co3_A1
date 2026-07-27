@@ -1265,6 +1265,7 @@ class NavBridge(Node):
         self._active_two_wheel_mission_id = ""
         self._active_two_wheel_target = None
         self._active_two_wheel_goal = None
+        self._completed_mission_latch = None
         self._navigation_paused = False
         self._navigation_pause_started = None
         self._navigation_location = 4
@@ -1723,8 +1724,14 @@ class NavBridge(Node):
                 if not busy:
                     self._active_two_wheel_mission_id = mission_id
                     self._active_two_wheel_target = None
+                    self._completed_mission_latch = None
                     self._navigation_paused = False
                     self._navigation_pause_started = None
+                    self._obstacle_stop = False
+                    self._obstacle_stop_started = None
+                    self._obstacle_stop_from_peer = False
+                    self._clearance_start = None
+                    self._obstacle_scale = 1.0
                     self._direct_nav = dict(
                         mode="park_out",
                         target=None,
@@ -1789,6 +1796,7 @@ class NavBridge(Node):
 
         self._active_two_wheel_mission_id = mission_id
         self._active_two_wheel_target = target
+        self._completed_mission_latch = None
         # A fresh mission must not inherit a stale path-yield pause.
         self._navigation_paused = False
         self._navigation_pause_started = None
@@ -2231,6 +2239,10 @@ class NavBridge(Node):
                 self._clear_obstacle_state()
                 return
 
+            if mission["mode"] == "park_out":
+                # Reverse off a table must not freeze on dock furniture hits.
+                self._clear_obstacle_state()
+                return
             if mission["mode"] == "legacy_table":
                 stage = mission.get("stage")
                 if stage not in ("move_to_pre_dock", "final_approach"):
@@ -2589,6 +2601,14 @@ class NavBridge(Node):
             self.navigation_location_pub.publish(Int32(data=target))
             if self._active_two_wheel_mission_id:
                 mission_id = self._active_two_wheel_mission_id
+                # Keep completed status warm — ROS wait loops can miss the
+                # first burst and otherwise sit forever on state=accepted.
+                self._completed_mission_latch = {
+                    "mission_id": mission_id,
+                    "target": target,
+                    "until": time.monotonic() + 12.0,
+                    "last_pub": 0.0,
+                }
                 for _ in range(5):
                     self._publish_two_wheel_mission_status(
                         "completed", "completed", target=target,
@@ -2632,35 +2652,19 @@ class NavBridge(Node):
             # Legacy peer-stop must never freeze motion — clear and continue.
             if self._obstacle_stop and self._obstacle_stop_from_peer:
                 self._finish_obstacle_stop(float("inf"))
+            # Table park-out must reverse even if the dock furniture / peer /
+            # person polygon trips a stop. Freezing here left phase=
+            # park_out_backoff until ROS timed out → manager sticky FAILED →
+            # HMI cancelled the other robot's order.
+            if mission.get("mode") == "park_out":
+                if self._obstacle_stop:
+                    self._finish_obstacle_stop(float("inf"))
+                if self._navigation_paused:
+                    self._navigation_paused = False
+                    self._navigation_pause_started = None
             elif self._navigation_paused or self._obstacle_stop:
-                # Paused/blocked park-out used to wedge forever because the
-                # timeout check lived below this early return. Fail fast so the
-                # peer is not held by a sticky parking_out fleet intent.
-                if mission.get("mode") == "park_out":
-                    now = time.monotonic()
-                    wall = float(mission.get("wall_start", mission.get("stage_start", now)))
-                    if now - wall > 40.0:
-                        self._finish_park_out(
-                            False,
-                            "park_out blocked timeout "
-                            f"(paused={self._navigation_paused} "
-                            f"obstacle={self._obstacle_stop})",
-                        )
-                        return 0.0, 0.0
-                    if (
-                        mission.get("phase") == "align_opposite"
-                        and not self._obstacle_stop
-                    ):
-                        yaw_error = self._angle_error(mission["target_yaw"], yaw)
-                        if abs(yaw_error) < math.radians(2.5):
-                            self._finish_park_out(True)
-                            return 0.0, 0.0
-                        wz = float(np.clip(1.8 * yaw_error, -0.65, 0.65))
-                        if abs(wz) < 0.18:
-                            wz = math.copysign(0.18, yaw_error)
-                        return 0.0, wz
                 if (
-                    mission.get("mode") not in ("park_out", "legacy_table")
+                    mission.get("mode") not in ("legacy_table",)
                     and not self._obstacle_stop
                 ):
                     stages = mission.get("stages") or []
@@ -2713,9 +2717,15 @@ class NavBridge(Node):
                 remaining = mission["distance"] - progress
                 yaw_error = self._angle_error(start_yaw, yaw)
                 done = remaining <= 0.025
+                # Soft-complete: leave the dock even if reverse stalls short.
+                if not done:
+                    if progress >= 0.22 and (now - mission["stage_start"]) > 5.0:
+                        done = True
+                    elif progress >= 0.12 and (now - mission["stage_start"]) > 10.0:
+                        done = True
                 vx = 0.0 if done else -min(
                     mission["speed"],
-                    max(0.045, remaining * 0.8),
+                    max(0.06, remaining * 0.8),
                 )
                 wz = 0.0 if done else float(
                     np.clip(1.6 * yaw_error, -0.25, 0.25)
@@ -2725,7 +2735,7 @@ class NavBridge(Node):
                     f"yaw_error={math.degrees(yaw_error):.1f}deg"
                 )
                 timeout = max(
-                    12.0,
+                    14.0,
                     mission["distance"] / max(mission["speed"], 0.05) + 8.0,
                 )
                 if done:
@@ -2739,24 +2749,23 @@ class NavBridge(Node):
 
             else:
                 yaw_error = self._angle_error(mission["target_yaw"], yaw)
-                done = abs(yaw_error) < math.radians(2.5)
-                if (
-                    not done
-                    and now - mission["stage_start"] > 8.0
-                    and abs(yaw_error) < math.radians(10.0)
-                ):
-                    done = True
+                done = abs(yaw_error) < math.radians(8.0)
+                if not done:
+                    if now - mission["stage_start"] > 3.0 and abs(yaw_error) < math.radians(20.0):
+                        done = True
+                    elif now - mission["stage_start"] > 8.0 and abs(yaw_error) < math.radians(35.0):
+                        done = True
                 vx = 0.0
                 wz = 0.0
                 if not done:
-                    wz = float(np.clip(2.2 * yaw_error, -0.80, 0.80))
-                    if abs(wz) < 0.22:
-                        wz = math.copysign(0.22, yaw_error)
+                    wz = float(np.clip(2.4 * yaw_error, -0.90, 0.90))
+                    if abs(wz) < 0.30:
+                        wz = math.copysign(0.30, yaw_error)
                 detail = (
                     f"target_yaw={math.degrees(mission['target_yaw']):.1f}deg "
                     f"yaw_error={math.degrees(yaw_error):.1f}deg"
                 )
-                timeout = 35.0
+                timeout = 20.0
                 if done:
                     self._finish_park_out(True)
                     return 0.0, 0.0
@@ -2770,6 +2779,27 @@ class NavBridge(Node):
                 )
 
             if now - mission["stage_start"] > timeout:
+                # Prefer completing park-out over sticky FAILED when nearly done.
+                if phase == "backoff":
+                    start_yaw = mission["start_yaw"]
+                    dx = x - mission["start_x"]
+                    dy = y - mission["start_y"]
+                    progress = -(
+                        dx * math.cos(start_yaw)
+                        + dy * math.sin(start_yaw)
+                    )
+                    if progress >= 0.15:
+                        mission["phase"] = "align_opposite"
+                        mission["stage_start"] = now
+                        mission["last_log"] = 0.0
+                        self.get_logger().warning(
+                            "park-out reverse soft-complete after timeout; "
+                            f"{detail}"
+                        )
+                        return 0.0, 0.0
+                if phase == "align_opposite":
+                    self._finish_park_out(True, f"align soft-complete; {detail}")
+                    return 0.0, 0.0
                 self._finish_park_out(
                     False, f"{mission['phase']} timeout; {detail}"
                 )
@@ -3606,6 +3636,24 @@ class NavBridge(Node):
         now = time.monotonic()
         dt = min(max(now - self._last_cmd_time, 1.0 / 240.0), 0.05)
         self._last_cmd_time = now
+
+        latch = getattr(self, "_completed_mission_latch", None)
+        if latch is not None:
+            if now <= float(latch.get("until", 0.0)):
+                if now - float(latch.get("last_pub", 0.0)) >= 0.5:
+                    latch["last_pub"] = now
+                    self._publish_two_wheel_mission_status(
+                        "completed",
+                        "completed",
+                        target=latch.get("target"),
+                        mission_id=latch.get("mission_id"),
+                    )
+                    if latch.get("target") is not None:
+                        self.navigation_location_pub.publish(
+                            Int32(data=int(latch["target"]))
+                        )
+            else:
+                self._completed_mission_latch = None
 
         direct_command = self._update_direct_navigation(x, y, yaw)
         with self._lock:

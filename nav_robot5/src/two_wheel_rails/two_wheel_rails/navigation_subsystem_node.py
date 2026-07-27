@@ -298,7 +298,12 @@ class NavigationSubsystemNode(Node):
         if not self._controller.drive_distance(
             0.50, -0.20, label="park_out"
         ):
-            raise RuntimeError("0.50m park-out failed")
+            # Do not raise — sticky manager FAILED cancels the HMI order and
+            # blocks the peer until reset_fault. Leave the dock-ish pose and
+            # continue the kitchen return from wherever we are.
+            self.get_logger().warning(
+                "0.50m park-out failed; continuing kitchen return anyway"
+            )
 
     def _goal_for_command(self, command: int) -> tuple[float, float, float]:
         if command == KITCHEN_COMMAND:
