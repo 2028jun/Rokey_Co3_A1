@@ -81,6 +81,10 @@ def _worker(
                 "use_sim_time": use_sim_time,
                 "navigation_only": ParameterValue(navigation_only, value_type=bool),
                 "require_navigation_ready": True,
+                # Both 1280 px detector workers share the Isaac Sim GPU.
+                # Preserve the manager's fail-closed watchdog without
+                # mistaking one long inference pass for a dead detector.
+                "hand_safety_heartbeat_sec": 15.0,
             }],
             condition=IfCondition(enable_serving),
         ),

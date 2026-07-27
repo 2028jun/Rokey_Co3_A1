@@ -90,6 +90,40 @@ def test_paused_arm_without_hand_heartbeat_fails():
     manager._fail.assert_called_once_with()
 
 
+def test_hand_safety_gpu_inference_gap_does_not_fail_delivery():
+    """허용 범위의 긴 GPU 추론 중에는 정상 서빙을 실패시키지 않는다."""
+    manager = _bare_manager(_State.ARM_SERVING)
+    manager._state_deadline = None
+    manager._safety_cmd_deadline = None
+    manager._last_hand_intrusion_stamp = Time(seconds=10)
+    manager._hand_safety_heartbeat_sec = 15.0
+    manager._fail = Mock()
+    clock = Mock()
+    clock.now.return_value = Time(seconds=22)
+    manager.get_clock = Mock(return_value=clock)
+
+    manager._check_timeouts()
+
+    manager._fail.assert_not_called()
+
+
+def test_hand_safety_gap_beyond_gpu_grace_still_fails_closed():
+    """추론 허용 시간을 넘긴 실제 토픽 단절은 계속 실패 처리한다."""
+    manager = _bare_manager(_State.ARM_SERVING)
+    manager._state_deadline = None
+    manager._safety_cmd_deadline = None
+    manager._last_hand_intrusion_stamp = Time(seconds=10)
+    manager._hand_safety_heartbeat_sec = 15.0
+    manager._fail = Mock()
+    clock = Mock()
+    clock.now.return_value = Time(seconds=26)
+    manager.get_clock = Mock(return_value=clock)
+
+    manager._check_timeouts()
+
+    manager._fail.assert_called_once_with()
+
+
 def test_stale_safety_response_cannot_clear_current_pending_command():
     """이전 안전 응답이 현재 pending 명령을 지우지 않는지 확인한다."""
     manager = _bare_manager(_State.ARM_SERVING)

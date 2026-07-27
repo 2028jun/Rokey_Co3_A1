@@ -16,6 +16,9 @@ from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
 PERSON_NAME = "CrossingPedestrian"
 ENABLED = os.environ.get("NAV_CROSSING_PEDESTRIAN", "1") == "1"
 TYPING_ENABLED = os.environ.get("NAV_TYPING_CUSTOMER", "1") == "1"
+DEFAULT_VISIBLE = (
+    os.environ.get("NAV_CROSSING_DEFAULT_VISIBLE", "0") == "1"
+)
 
 # Restaurant walls are centered at x=+/-6.0.  These endpoints leave 0.60 m
 # of body clearance.  y=3.0 is the open aisle directly in front of the
@@ -423,14 +426,26 @@ class CrossingPedestrianController:
         self._last_correction_log = 0.0
         self._last_progress_log = 0.0
 
-        self._visible = True
+        # This actor is an HMI obstacle-test fixture.  Spawning it visibly by
+        # default made every normal delivery cross a moving person at the
+        # kitchen exit before anyone requested the test.
+        self._visible = DEFAULT_VISIBLE
         self._requested_visibility = None
         self._request_lock = threading.Lock()
 
         self._collider_prim, self._collider_translate_op = (
             _create_person_lidar_collider(person_prim.GetStage())
         )
-        self._set_collider_enabled(True)
+        self._set_collider_enabled(self._visible)
+        if self._visible:
+            UsdGeom.Imageable(self._person_prim).MakeVisible()
+        else:
+            UsdGeom.Imageable(self._person_prim).MakeInvisible()
+        print(
+            "[crossing_pedestrian] initial visibility -> "
+            f"{'visible' if self._visible else 'hidden'}",
+            flush=True,
+        )
 
     def request_visible(self, visible: bool) -> None:
         with self._request_lock:

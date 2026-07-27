@@ -284,6 +284,7 @@ TRAY_RETRACT_STEPS = 360
 
 ROBOT_ROOT = "/World/NavRobot"
 ARTICULATION_CANDIDATES = [
+    f"{ROBOT_ROOT}/Robot/ridgeback_base_link/ridgeback_base_link",
     f"{ROBOT_ROOT}/Robot/ridgeback_base_link",
     f"{ROBOT_ROOT}/Robot",
 ]
@@ -335,6 +336,7 @@ def set_robot_context(root: str, spawn_position: Gf.Vec3d) -> None:
     ROBOT_ROOT = root
     SPAWN_POSITION = spawn_position
     ARTICULATION_CANDIDATES = [
+        f"{root}/Robot/ridgeback_base_link/ridgeback_base_link",
         f"{root}/Robot/ridgeback_base_link",
         f"{root}/Robot",
     ]
@@ -380,6 +382,12 @@ def attach_m0609_visuals(stage):
             continue
         visual_path = matches[0].GetPath().AppendChild("visuals")
         visual_prim = stage.OverridePrim(visual_path)
+        # Each robot needs an independent mutable visual subtree. Otherwise
+        # two instances can share the source prototype and render arm meshes
+        # at the source asset's local origin near the restaurant center.
+        if visual_prim.IsInstanceable():
+            visual_prim.SetInstanceable(False)
+        visual_prim.GetReferences().ClearReferences()
         visual_prim.GetReferences().SetReferences(
             [
                 Sdf.Reference(
@@ -444,6 +452,48 @@ def attach_m0609_visuals(stage):
         f"{darkened}",
         flush=True,
     )
+
+
+def sanitize_embedded_rsd455(stage, robot_root: str) -> None:
+    """Remove nested rigid-body state from the embedded D455 sensor."""
+    rsd_path = (
+        f"{robot_root}/Robot/ridgeback_base_link/ridgeback_base_link/"
+        "fixed_table_depth_camera/realsense_d455/RSD455"
+    )
+    rsd_prim = stage.GetPrimAtPath(rsd_path)
+    if not rsd_prim.IsValid():
+        return
+
+    stripped = 0
+    touched = []
+    for prim in Usd.PrimRange(rsd_prim):
+        changed = False
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            prim.RemoveAPI(UsdPhysics.RigidBodyAPI)
+            changed = True
+        if prim.HasAPI(PhysxSchema.PhysxRigidBodyAPI):
+            prim.RemoveAPI(PhysxSchema.PhysxRigidBodyAPI)
+            changed = True
+        if prim.HasAPI(UsdPhysics.MassAPI):
+            prim.RemoveAPI(UsdPhysics.MassAPI)
+            changed = True
+        if prim.HasAPI(UsdPhysics.CollisionAPI):
+            prim.RemoveAPI(UsdPhysics.CollisionAPI)
+            changed = True
+        enabled = prim.GetAttribute("physics:rigidBodyEnabled")
+        if enabled and enabled.IsValid():
+            enabled.Set(False)
+            changed = True
+        if changed:
+            stripped += 1
+            touched.append(str(prim.GetPath()))
+
+    if stripped:
+        print(
+            f"[nav_robot] stripped rigid-body/collision under {rsd_path} "
+            f"n={stripped} roots_touched={touched[:8]}",
+            flush=True,
+        )
 
 
 def attach_fixed_table_depth_camera(stage):
@@ -545,51 +595,29 @@ def _parking_brake_path(articulation_path):
     return robot_root, f"{robot_root}/ParkingBrake"
 
 
-def prepare_parking_brake(stage, articulation_path):
-    """Pre-author a disabled world-to-base fixed joint before simulation.
-
-    Creating or deleting a joint while PhysX is stepping previously corrupted
-    the articulation and produced invalid-transform/broad-phase errors.  The
-    joint topology is therefore authored once during scene composition; the
-    serving path only updates its anchor and toggles ``jointEnabled``.
-    """
+def _require_articulation_rigid_body(stage, articulation_path):
+    """Return the articulation base prim only when PhysX can constrain it."""
     articulation_path = str(articulation_path).rstrip("/")
-    articulation_prim = stage.GetPrimAtPath(articulation_path)
-    if not articulation_prim.IsValid():
+    prim = stage.GetPrimAtPath(articulation_path)
+    if not prim.IsValid():
+        raise RuntimeError(f"articulation prim is missing: {articulation_path}")
+    if not prim.HasAPI(UsdPhysics.ArticulationRootAPI):
         raise RuntimeError(
-            f"parking brake articulation is missing: {articulation_path}"
+            "articulation prim lacks ArticulationRootAPI: "
+            f"{articulation_path}"
         )
-    robot_root, brake_path = _parking_brake_path(articulation_path)
-    joint = UsdPhysics.FixedJoint.Define(stage, brake_path)
-    joint.CreateBody1Rel().SetTargets([Sdf.Path(articulation_path)])
-    joint.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
-    joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
-    joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
-    joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
-    joint.CreateJointEnabledAttr(False).Set(False)
-    print(
-        f"[parking-brake] prepared robot={robot_root} path={brake_path}",
-        flush=True,
-    )
-    return brake_path
-
-
-def add_parking_brake(stage, articulation_path):
-    """Lock one robot at its current world pose with its pre-authored joint."""
-    articulation_path = str(articulation_path).rstrip("/")
-    robot_root, brake_path = _parking_brake_path(articulation_path)
-    joint = UsdPhysics.FixedJoint.Get(stage, brake_path)
-    if not joint or not joint.GetPrim().IsValid():
+    if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
         raise RuntimeError(
-            f"parking brake was not prepared before simulation: {brake_path}"
+            "parking brake target lacks RigidBodyAPI: "
+            f"{articulation_path}"
         )
+    return prim
 
-    # Never move the anchor of an active constraint. Re-locking after an
-    # interrupted command must first release the old anchor.
-    joint.GetJointEnabledAttr().Set(False)
 
+def _set_parking_brake_anchor(joint, articulation_prim):
+    """Make the world anchor coincide with the articulation base frame."""
     transform = UsdGeom.XformCache().GetLocalToWorldTransform(
-        stage.GetPrimAtPath(articulation_path)
+        articulation_prim
     )
     position = transform.ExtractTranslation()
     rotation = transform.ExtractRotationQuat()
@@ -603,6 +631,61 @@ def add_parking_brake(stage, articulation_path):
     )
     joint.GetLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
     joint.GetLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    return position
+
+
+def prepare_parking_brake(stage, articulation_path):
+    """Pre-author a disabled world-to-base fixed joint before simulation.
+
+    Creating or deleting a joint while PhysX is stepping previously corrupted
+    the articulation and produced invalid-transform/broad-phase errors.  The
+    joint topology is therefore authored once during scene composition; the
+    serving path only updates its anchor and toggles ``jointEnabled``.
+    """
+    articulation_path = str(articulation_path).rstrip("/")
+    articulation_prim = _require_articulation_rigid_body(
+        stage, articulation_path
+    )
+    robot_root, brake_path = _parking_brake_path(articulation_path)
+    joint = UsdPhysics.FixedJoint.Define(stage, brake_path)
+    joint.CreateBody1Rel().SetTargets([Sdf.Path(articulation_path)])
+    _set_parking_brake_anchor(joint, articulation_prim)
+    joint.CreateJointEnabledAttr(False).Set(False)
+    print(
+        f"[parking-brake] prepared robot={robot_root} path={brake_path}",
+        flush=True,
+    )
+    return brake_path
+
+
+def add_parking_brake(stage, articulation_path):
+    """Lock one robot at its current world pose with its pre-authored joint."""
+    articulation_path = str(articulation_path).rstrip("/")
+    articulation_prim = _require_articulation_rigid_body(
+        stage, articulation_path
+    )
+    robot_root, brake_path = _parking_brake_path(articulation_path)
+    joint = UsdPhysics.FixedJoint.Get(stage, brake_path)
+    if not joint or not joint.GetPrim().IsValid():
+        raise RuntimeError(
+            f"parking brake was not prepared before simulation: {brake_path}"
+        )
+
+    # Never move the anchor of an active constraint. Re-locking after an
+    # interrupted command must first release the old anchor.
+    joint.GetJointEnabledAttr().Set(False)
+
+    # Never repair relationship topology while PhysX is stepping.  It must
+    # already target the rigid articulation body authored during scene setup.
+    body1_targets = joint.GetBody1Rel().GetTargets()
+    expected_body1 = [Sdf.Path(articulation_path)]
+    if body1_targets != expected_body1:
+        raise RuntimeError(
+            f"parking brake body1 mismatch: expected={expected_body1} "
+            f"actual={body1_targets}"
+        )
+
+    position = _set_parking_brake_anchor(joint, articulation_prim)
     joint.GetJointEnabledAttr().Set(True)
 
     # Keep wheel targets neutral as a second line of defense against stale
@@ -671,6 +754,30 @@ def remove_parking_brake(stage, articulation_path=None):
         )
 
 
+def wait_for_stage_loading(label: str) -> None:
+    """Drain asynchronous USD payload/reference loading before PhysX setup."""
+    context = omni.usd.get_context()
+    timeout_sec = max(
+        1.0, float(os.environ.get("NAV_STAGE_LOAD_TIMEOUT_SEC", "120.0"))
+    )
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        loading_status = context.get_stage_loading_status()
+        pending = int(loading_status[2])
+        if pending <= 0:
+            break
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"USD stage loading timed out after {timeout_sec:.1f}s "
+                f"during {label}: status={loading_status}"
+            )
+        simulation_app.update()
+    # Process the final ObjectsChanged notices emitted when pending reaches 0.
+    for _ in range(2):
+        simulation_app.update()
+    print(f"[nav_robot] USD loading complete: {label}", flush=True)
+
+
 def open_restaurant_and_robot(open_stage: bool = True):
     if not RESTAURANT_USD.is_file():
         raise FileNotFoundError(RESTAURANT_USD)
@@ -682,19 +789,21 @@ def open_restaurant_and_robot(open_stage: bool = True):
     if open_stage:
         if not context.open_stage(str(RESTAURANT_USD)):
             raise RuntimeError(f"failed to open {RESTAURANT_USD}")
-        for _ in range(30):
-            simulation_app.update()
+        wait_for_stage_loading("restaurant")
 
     stage = context.get_stage()
     spawn = UsdGeom.Xform.Define(stage, ROBOT_ROOT)
     spawn.AddTranslateOp().Set(SPAWN_POSITION)
     spawn.AddOrientOp().Set(yaw_to_quat(SPAWN_YAW))
     robot = UsdGeom.Xform.Define(stage, f"{ROBOT_ROOT}/Robot")
-    robot.GetPrim().GetReferences().AddReference(
+    robot_prim = robot.GetPrim()
+    # Keep each robot's physics and visual overrides out of a shared mutable
+    # USD prototype when the same ROBOT_USD is composed more than once.
+    robot_prim.SetInstanceable(False)
+    robot_prim.GetReferences().AddReference(
         str(ROBOT_USD), Sdf.Path(ROBOT_ASSET_ROOT)
     )
-    for _ in range(5):
-        simulation_app.update()
+    wait_for_stage_loading(f"{ROBOT_ROOT} robot reference")
     robot_scope = f"{ROBOT_ROOT}/Robot/"
     composed_names = {
         prim.GetName()
@@ -717,8 +826,128 @@ def open_restaurant_and_robot(open_stage: bool = True):
     # asset.  Without this composition fix link_2's visual pieces can resolve
     # at the layer origin even though the physical link/joint poses are valid.
     attach_m0609_visuals(stage)
+    sanitize_embedded_rsd455(stage, ROBOT_ROOT)
     print("[nav_robot] using embedded D455 and RPLIDAR sensor layer", flush=True)
     return stage
+
+
+def add_three_by_three_restaurant_tiles(stage):
+    """Tile the original dining/decor content over a wall-free 3x3 floor."""
+    tiles_root = UsdGeom.Xform.Define(stage, "/World/RestaurantTiles")
+    created = 0
+    external_tables = 0
+    external_plants = 0
+    disabled_colliders = 0
+    disabled_rigid_bodies = 0
+    plant_patterns = {
+        (0, 0): (0,),
+        (0, 2): (1, 3),
+        (1, 0): (2,),
+        (1, 1): (0, 3),
+        (1, 2): (),
+        (2, 0): (1, 2),
+        (2, 1): (),
+        (2, 2): (3,),
+    }
+    # Keep the kitchen on the north (+Y) side untouched. The original dining
+    # room is the north row; expansion proceeds only sideways and southward.
+    for row, offset_y in enumerate((0.0, -10.0, -20.0)):
+        for column, offset_x in enumerate((-12.0, 0.0, 12.0)):
+            if offset_x == 0.0 and offset_y == 0.0:
+                continue
+            tile_path = f"{tiles_root.GetPath()}/Tile_{row}_{column}"
+            tile = UsdGeom.Xform.Define(stage, tile_path)
+            tile.AddTranslateOp().Set(Gf.Vec3d(offset_x, offset_y, 0.0))
+            dining_copy = UsdGeom.Xform.Define(stage, f"{tile_path}/Dining")
+            dining_copy.GetPrim().GetReferences().AddInternalReference(
+                Sdf.Path("/World/Dining")
+            )
+            for prim in Usd.PrimRange(dining_copy.GetPrim()):
+                if prim.GetName().startswith("TableSet_"):
+                    external_tables += 1
+                if prim.HasAPI(UsdPhysics.CollisionAPI):
+                    UsdPhysics.CollisionAPI(prim).CreateCollisionEnabledAttr(False)
+                    disabled_colliders += 1
+                if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                    UsdPhysics.RigidBodyAPI(prim).CreateRigidBodyEnabledAttr(False)
+                    disabled_rigid_bodies += 1
+
+            decor_copy = UsdGeom.Xform.Define(stage, f"{tile_path}/Decor")
+            for plant_index in plant_patterns[(row, column)]:
+                for source_name in (
+                    f"Plant_{plant_index:02d}",
+                    f"PlantCollider_{plant_index:02d}",
+                ):
+                    plant_copy = stage.DefinePrim(
+                        f"{decor_copy.GetPath()}/{source_name}"
+                    )
+                    plant_copy.GetReferences().AddInternalReference(
+                        Sdf.Path(f"/World/Decor/{source_name}")
+                    )
+                external_plants += 1
+            created += 1
+
+    active_colliders = []
+    active_rigid_bodies = []
+    for prim in Usd.PrimRange(tiles_root.GetPrim()):
+        if "/Dining/" not in str(prim.GetPath()):
+            continue
+        if prim.HasAPI(UsdPhysics.CollisionAPI):
+            enabled = UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get()
+            if enabled is not False:
+                active_colliders.append(str(prim.GetPath()))
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            enabled = UsdPhysics.RigidBodyAPI(prim).GetRigidBodyEnabledAttr().Get()
+            if enabled is not False:
+                active_rigid_bodies.append(str(prim.GetPath()))
+    if external_tables != 32 or active_colliders or active_rigid_bodies:
+        raise RuntimeError(
+            "external table physics verification failed: "
+            f"tables={external_tables} active_colliders={active_colliders} "
+            f"active_rigid_bodies={active_rigid_bodies}"
+        )
+    print(
+        f"[restaurant] tiles=3x3 added={created} floor=36x30m "
+        f"outer_walls=8 kitchen_bump=1 external_tables={external_tables} "
+        f"external_plants={external_plants} "
+        f"disabled_colliders={disabled_colliders} "
+        f"disabled_rigid_bodies={disabled_rigid_bodies}",
+        flush=True,
+    )
+
+
+def add_outer_wall_finish(stage):
+    """Add wood wainscot and brass trim to the eight outer wall segments."""
+    finish_root = UsdGeom.Xform.Define(
+        stage, "/World/Architecture/OuterWallFinish"
+    )
+    segments = {
+        "West": ((-18.0, -10.0), (0.18, 30.0)),
+        "East": ((18.0, -10.0), (0.18, 30.0)),
+        "South": ((0.0, -25.0), (36.0, 0.18)),
+        "NorthWest": ((-10.36, 5.0), (15.28, 0.18)),
+        "NorthEast": ((10.36, 5.0), (15.28, 0.18)),
+        "KitchenWest": ((-2.72, 7.535), (0.18, 5.07)),
+        "KitchenEast": ((2.72, 7.535), (0.18, 5.07)),
+        "KitchenNorth": ((0.0, 10.07), (5.44, 0.18)),
+    }
+    for name, (center, footprint) in segments.items():
+        wainscot = UsdGeom.Cube.Define(
+            stage, f"{finish_root.GetPath()}/{name}_Wainscot"
+        )
+        wainscot.CreateSizeAttr(1.0)
+        wainscot.CreateDisplayColorAttr([(0.27, 0.12, 0.055)])
+        wainscot.AddTranslateOp().Set(Gf.Vec3d(center[0], center[1], 0.5))
+        wainscot.AddScaleOp().Set(Gf.Vec3f(footprint[0], footprint[1], 1.0))
+
+        trim = UsdGeom.Cube.Define(
+            stage, f"{finish_root.GetPath()}/{name}_BrassTrim"
+        )
+        trim.CreateSizeAttr(1.0)
+        trim.CreateDisplayColorAttr([(0.72, 0.50, 0.16)])
+        trim.AddTranslateOp().Set(Gf.Vec3d(center[0], center[1], 1.04))
+        trim.AddScaleOp().Set(Gf.Vec3f(footprint[0], footprint[1], 0.08))
+    print("[restaurant] outer_wall_finish=wood+brass segments=8", flush=True)
 
 
 def configure_joint_drives(stage):
@@ -915,14 +1144,25 @@ def configure_gripper_contact_material(stage):
 
 def find_articulation_path(stage) -> str:
     for path in ARTICULATION_CANDIDATES:
-        if stage.GetPrimAtPath(path).IsValid():
+        prim = stage.GetPrimAtPath(path)
+        if (
+            prim.IsValid()
+            and prim.HasAPI(UsdPhysics.ArticulationRootAPI)
+            and prim.HasAPI(UsdPhysics.RigidBodyAPI)
+        ):
             return path
-    # Fallback: first articulation root under NavRobot
+    # Fallback: first constrainable articulation root under NavRobot.
     for prim in stage.Traverse():
         path = str(prim.GetPath())
-        if path.startswith(ROBOT_ROOT) and prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+        if (
+            path.startswith(f"{ROBOT_ROOT}/")
+            and prim.HasAPI(UsdPhysics.ArticulationRootAPI)
+            and prim.HasAPI(UsdPhysics.RigidBodyAPI)
+        ):
             return path
-    raise RuntimeError("could not find robot articulation prim")
+    raise RuntimeError(
+        f"could not find rigid articulation root under {ROBOT_ROOT}"
+    )
 
 
 def log_arm_chain(stage, label):
@@ -991,15 +1231,45 @@ def log_stray_robot_geometry(stage):
 
 
 def initialize_robot(articulation_path: str, name: str = "nav_ridgeback"):
+    """Bind one fully composed articulation to the running PhysX scene."""
     timeline = omni.timeline.get_timeline_interface()
-    timeline.play()
-    for _ in range(2):
-        simulation_app.update()
+    if not timeline.is_playing():
+        raise RuntimeError(
+            f"cannot initialize articulation before physics starts: "
+            f"{articulation_path}"
+        )
 
     articulation = SingleArticulation(prim_path=articulation_path, name=name)
-    articulation.initialize()
+    retry_frames = max(
+        0, int(os.environ.get("NAV_ARTICULATION_INIT_RETRY_FRAMES", "30"))
+    )
+    last_error = None
+    for attempt in range(retry_frames + 1):
+        try:
+            articulation.initialize()
+            if articulation.handles_initialized:
+                break
+        except Exception as exc:
+            last_error = exc
+        if attempt < retry_frames:
+            simulation_app.update()
+    else:
+        detail = f": {last_error}" if last_error is not None else ""
+        raise RuntimeError(
+            f"PhysX did not create an articulation handle after "
+            f"{retry_frames + 1} attempts: {articulation_path}{detail}"
+        ) from last_error
+
     if not articulation.handles_initialized:
-        raise RuntimeError(f"invalid articulation handle: {articulation_path}")
+        raise RuntimeError(
+            f"PhysX did not create an articulation handle: {articulation_path}"
+        )
+    if last_error is not None:
+        print(
+            f"[nav_robot] articulation recovered after delayed PhysX "
+            f"registration: {articulation_path}",
+            flush=True,
+        )
     articulation.set_enabled_self_collisions(False)
 
     dof_names = list(articulation.dof_names)
@@ -4033,6 +4303,20 @@ def main():
             )
 
     multi_robot = os.environ.get("NAV_MULTI_ROBOT", "0") == "1"
+    robot_count_raw = os.environ.get(
+        "NAV_ROBOT_COUNT", "2" if multi_robot else "1"
+    )
+    try:
+        robot_count = int(robot_count_raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"NAV_ROBOT_COUNT must be 1 or 2, got {robot_count_raw!r}"
+        ) from exc
+    if robot_count not in (1, 2):
+        raise ValueError(
+            f"NAV_ROBOT_COUNT must be 1 or 2, got {robot_count}"
+        )
+    multi_robot = multi_robot or robot_count == 2
     robot_configs = (
         [
             {
@@ -4061,6 +4345,9 @@ def main():
     for index, config in enumerate(robot_configs):
         set_robot_context(config["root"], config["spawn"])
         stage = open_restaurant_and_robot(open_stage=index == 0)
+        if index == 0:
+            add_three_by_three_restaurant_tiles(stage)
+            add_outer_wall_finish(stage)
         configure_wheel_contact_material(stage)
         configure_gripper_contact_material(stage)
         articulation_path = find_articulation_path(stage)
@@ -4115,8 +4402,8 @@ def main():
                 flush=True,
             )
 
-    # Drain composition and scripting notices before initialize_robot() starts
-    # the timeline.  No AnimationGraph API is added or removed after here.
+    # Drain character composition and scripting notices before creating the
+    # sensor graphs. Physics remains stopped throughout stage authoring.
     for _ in range(30):
         simulation_app.update()
     print(
@@ -4126,22 +4413,51 @@ def main():
         flush=True,
     )
 
-    initialized_records = []
-    for index, (config, articulation_path) in enumerate(robot_records):
+    # Author every sensor graph before PhysX starts. Previously robot1 was
+    # initialized, its OmniGraph was added while the timeline was running, and
+    # only then was robot2 initialized. The resulting stage resync could
+    # invalidate or delay robot2's PhysX articulation view intermittently.
+    for index, (config, _articulation_path) in enumerate(robot_records):
         set_robot_context(config["root"], config["spawn"])
-        articulation, dof_names = initialize_robot(
-            articulation_path,
-            name=config["name"] or "nav_ridgeback",
-        )
-        # Preserve each complete robot's embedded D455.  Only the first graph
-        # publishes the shared simulation clock.
         connect_embedded_sensor_ros(
             stage,
             robot_root=config["root"],
             robot_name=config["name"],
             publish_clock=index == 0,
         )
+
+    # Let USD/OmniGraph notices settle while stopped, then create the complete
+    # two-robot PhysX scene in one timeline transition. A few updates are a
+    # deterministic barrier for referenced articulation registration; no USD
+    # topology is edited between this point and both initialize() calls.
+    for _ in range(10):
+        simulation_app.update()
+    timeline.play()
+    physics_settle_frames = max(
+        2, int(os.environ.get("NAV_PHYSICS_INIT_SETTLE_FRAMES", "8"))
+    )
+    for _ in range(physics_settle_frames):
+        simulation_app.update()
+    print(
+        f"[nav_robot] PhysX scene settled frames={physics_settle_frames} "
+        f"articulations={len(robot_records)}",
+        flush=True,
+    )
+
+    initialized_records = []
+    for config, articulation_path in robot_records:
+        set_robot_context(config["root"], config["spawn"])
+        articulation, dof_names = initialize_robot(
+            articulation_path,
+            name=config["name"] or "nav_ridgeback",
+        )
         initialized_records.append((config, articulation, dof_names))
+
+    # PhysX handle creation can re-process schemas under an articulation.
+    # Re-enforce the embedded camera invariant only after both handles exist,
+    # so a stage resync cannot race robot2's articulation initialization.
+    for config, _articulation, _dof_names in initialized_records:
+        sanitize_embedded_rsd455(stage, config["root"])
 
     if not rclpy.ok():
         rclpy.init(args=[])

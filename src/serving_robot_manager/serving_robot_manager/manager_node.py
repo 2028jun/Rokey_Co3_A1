@@ -176,7 +176,11 @@ class ManagerNode(Node):
         self._safety_cmd_timeout_sec = self.declare_parameter(
             'safety_cmd_timeout_sec', 5.0).value
         self._hand_safety_heartbeat_sec = self.declare_parameter(
-            'hand_safety_heartbeat_sec', 2.0).value
+            # A 1280 px YOLO pass shares the GPU with Isaac Sim and can take
+            # several seconds under load.  Two seconds treated a slow but
+            # healthy detector as disconnected and failed an active delivery.
+            # Keep fail-closed behavior, but allow a realistic inference gap.
+            'hand_safety_heartbeat_sec', 15.0).value
         self._navigation_only = bool(
             self.declare_parameter('navigation_only', False).value)
         self._require_navigation_ready = bool(

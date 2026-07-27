@@ -21,17 +21,17 @@ def Xform "World"
         {
             color3f[] primvars:displayColor = [(0.32, 0.34, 0.38)]
             double size = 1
-            float3 xformOp:scale = (12, 10, 0.12)
-            double3 xformOp:translate = (0, 0, -0.06)
+            float3 xformOp:scale = (36, 30, 0.12)
+            double3 xformOp:translate = (0, -10, -0.06)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 
-        def Cube "KitchenFloorPatch" (
-            prepend apiSchemas = ["PhysicsCollisionAPI"]
-        )
+        # Visual-only patch.  The main floor and Kitchen_Ground already
+        # provide support.  Giving this thin overlapping cube collision made
+        # its south side a vertical curb at y=4.70, where the right-hand
+        # robot repeatedly stopped at y~=4.55 while leaving the kitchen.
+        def Cube "KitchenFloorPatch"
         {
-            # Continue the physical floor behind the widened kitchen entrance,
-            # where both integrated robots start at y=5.25.
             color3f[] primvars:displayColor = [(0.32, 0.34, 0.38)]
             double size = 1
             float3 xformOp:scale = (5.0, 1.8, 0.12)
@@ -39,71 +39,91 @@ def Xform "World"
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 
-        def Cube "BackWallLeft" (
+        def Cube "OuterWallWest" (
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
-            color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
+            color3f[] primvars:displayColor = [(0.78, 0.65, 0.48)]
             double size = 1
-            # Inner edge x=-1.8: 3.6 m clear kitchen entrance.
-            float3 xformOp:scale = (4.2, 0.16, 2.8)
-            double3 xformOp:translate = (-3.9, 5, 1.4)
+            float3 xformOp:scale = (0.16, 30, 2.8)
+            double3 xformOp:translate = (-18, -10, 1.4)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 
-        def Cube "BackWallRight" (
+        def Cube "OuterWallEast" (
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
-            color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
+            color3f[] primvars:displayColor = [(0.78, 0.65, 0.48)]
             double size = 1
-            # Inner edge x=+1.8: matches the left wall opening.
-            float3 xformOp:scale = (4.2, 0.16, 2.8)
-            double3 xformOp:translate = (3.9, 5, 1.4)
+            float3 xformOp:scale = (0.16, 30, 2.8)
+            double3 xformOp:translate = (18, -10, 1.4)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 
-        def Cube "LeftWall" (
+        def Cube "OuterWallSouth" (
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
-            color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
+            color3f[] primvars:displayColor = [(0.78, 0.65, 0.48)]
             double size = 1
-            float3 xformOp:scale = (0.16, 10, 2.8)
-            double3 xformOp:translate = (-6, 0, 1.4)
+            float3 xformOp:scale = (36, 0.16, 2.8)
+            double3 xformOp:translate = (0, -25, 1.4)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 
-        def Cube "RightWall" (
+        def Cube "OuterWallNorthWest" (
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
-            color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
+            color3f[] primvars:displayColor = [(0.78, 0.65, 0.48)]
             double size = 1
-            float3 xformOp:scale = (0.16, 10, 2.8)
-            double3 xformOp:translate = (6, 0, 1.4)
+            float3 xformOp:scale = (15.28, 0.16, 2.8)
+            double3 xformOp:translate = (-10.36, 5, 1.4)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 
-        def Cube "FrontWallLeft" (
+        def Cube "OuterWallNorthEast" (
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
-            color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
+            color3f[] primvars:displayColor = [(0.78, 0.65, 0.48)]
             double size = 1
-            float3 xformOp:scale = (5, 0.16, 2.8)
-            double3 xformOp:translate = (-3.5, -5, 1.4)
+            float3 xformOp:scale = (15.28, 0.16, 2.8)
+            double3 xformOp:translate = (10.36, 5, 1.4)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
 
-        def Cube "FrontWallRight" (
+        def Cube "KitchenOuterWallWest" (
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
-            color3f[] primvars:displayColor = [(0.92, 0.89, 0.82)]
+            color3f[] primvars:displayColor = [(0.78, 0.65, 0.48)]
             double size = 1
-            float3 xformOp:scale = (5, 0.16, 2.8)
-            double3 xformOp:translate = (3.5, -5, 1.4)
+            float3 xformOp:scale = (0.16, 5.07, 2.8)
+            double3 xformOp:translate = (-2.72, 7.535, 1.4)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "KitchenOuterWallEast" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.78, 0.65, 0.48)]
+            double size = 1
+            float3 xformOp:scale = (0.16, 5.07, 2.8)
+            double3 xformOp:translate = (2.72, 7.535, 1.4)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
+        def Cube "KitchenOuterWallNorth" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            color3f[] primvars:displayColor = [(0.78, 0.65, 0.48)]
+            double size = 1
+            float3 xformOp:scale = (5.44, 0.16, 2.8)
+            double3 xformOp:translate = (0, 10.07, 1.4)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }
     }
@@ -117,6 +137,34 @@ def Xform "World"
             prepend references = @../../../assets/Lightwheel_Kitchen/Collected_KitchenRoom/KitchenRoom.usd@
         )
         {
+            # Remove the collected shell so the expanded dining room and the
+            # new collision walls remain open and visible.
+            over "Kitchen_Wall001" (
+                active = false
+            )
+            {
+            }
+
+            # Despite its name, this elevated slab is the kitchen ceiling.
+            # Kitchen_Ground is the actual floor and remains active.
+            over "Kitchen_Floor" (
+                active = false
+            )
+            {
+            }
+
+            over "Kitchen_Windows" (
+                active = false
+            )
+            {
+            }
+
+            over "WallCollider" (
+                active = false
+            )
+            {
+            }
+
             over "Kitchen_Light" (
                 active = false
             )

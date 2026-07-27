@@ -87,6 +87,19 @@ def _spawn_robots():
 
     demo.configure_joint_drives(stage)
 
+    # Build one complete two-robot PhysX scene before binding either
+    # articulation.  Starting physics inside each initialize call allowed a
+    # later stage resync to race robot2's articulation-view creation.
+    for _ in range(10):
+        demo.simulation_app.update()
+    timeline = demo.omni.timeline.get_timeline_interface()
+    timeline.play()
+    physics_settle_frames = max(
+        2, int(os.environ.get("NAV_PHYSICS_INIT_SETTLE_FRAMES", "8"))
+    )
+    for _ in range(physics_settle_frames):
+        demo.simulation_app.update()
+
     initialized = []
     for config, articulation_path in records:
         demo.SPAWN_YAW = config["yaw"]
