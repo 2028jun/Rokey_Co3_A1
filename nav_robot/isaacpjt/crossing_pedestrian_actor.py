@@ -17,7 +17,7 @@ PERSON_NAME = "CrossingPedestrian"
 ENABLED = os.environ.get("NAV_CROSSING_PEDESTRIAN", "1") == "1"
 TYPING_ENABLED = os.environ.get("NAV_TYPING_CUSTOMER", "1") == "1"
 DEFAULT_VISIBLE = (
-    os.environ.get("NAV_CROSSING_DEFAULT_VISIBLE", "0") == "1"
+    os.environ.get("NAV_CROSSING_DEFAULT_VISIBLE", "1") == "1"
 )
 
 # Restaurant walls are centered at x=+/-6.0.  These endpoints leave 0.60 m
@@ -426,9 +426,10 @@ class CrossingPedestrianController:
         self._last_correction_log = 0.0
         self._last_progress_log = 0.0
 
-        # This actor is an HMI obstacle-test fixture.  Spawning it visibly by
-        # default made every normal delivery cross a moving person at the
-        # kitchen exit before anyone requested the test.
+        # Keep the corridor pedestrian visible and walking during normal
+        # restaurant runs. HMI can still hide/show it through the existing
+        # service, and mapping/test runs can opt out with the environment
+        # variable.
         self._visible = DEFAULT_VISIBLE
         self._requested_visibility = None
         self._request_lock = threading.Lock()

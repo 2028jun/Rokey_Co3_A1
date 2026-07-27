@@ -179,6 +179,10 @@ RESTAURANT_WALL_PANORAMA = (
     WORKSPACE
     / "assets/lightweight_restaurant/textures/low_poly_restaurant_three_wall.png"
 )
+RESTAURANT_FLOOR_TEXTURE = (
+    WORKSPACE
+    / "assets/lightweight_restaurant/textures/restaurant_floor_from_wall_v2.png"
+)
 ROBOT_USD = (
     WORKSPACE / "assets/diagnostics/two_wheel_serving_robot_v2.usd"
 )
@@ -952,6 +956,148 @@ def add_outer_wall_finish(stage):
         trim.AddTranslateOp().Set(Gf.Vec3d(center[0], center[1], 1.04))
         trim.AddScaleOp().Set(Gf.Vec3f(footprint[0], footprint[1], 0.08))
     print("[restaurant] outer_wall_finish=wood+brass segments=8", flush=True)
+
+
+def configure_restaurant_floor_visual_material(stage):
+    """Match the real floor to the panorama without changing floor physics."""
+    if not RESTAURANT_FLOOR_TEXTURE.is_file():
+        raise FileNotFoundError(RESTAURANT_FLOOR_TEXTURE)
+
+    # Use the exact same unlit brightness path as the wall panorama so the
+    # horizontal floor is not darkened by scene-light direction. A dedicated
+    # floor override remains available, but otherwise both surfaces share the
+    # panorama value.
+    emissive_strength = float(
+        os.environ.get(
+            "NAV_RESTAURANT_FLOOR_BRIGHTNESS",
+            os.environ.get("NAV_RESTAURANT_PANORAMA_BRIGHTNESS", "1.60"),
+        )
+    )
+    if not 0.0 <= emissive_strength <= 3.0:
+        raise ValueError(
+            "NAV_RESTAURANT_FLOOR_BRIGHTNESS must be between 0.0 and 3.0"
+        )
+
+    material_path = "/World/Looks/RestaurantFloorVisual"
+    material = UsdShade.Material.Define(stage, material_path)
+    surface = UsdShade.Shader.Define(stage, f"{material_path}/Surface")
+    surface.CreateIdAttr("UsdPreviewSurface")
+
+    texture = UsdShade.Shader.Define(stage, f"{material_path}/Texture")
+    texture.CreateIdAttr("UsdUVTexture")
+    texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(
+        Sdf.AssetPath(str(RESTAURANT_FLOOR_TEXTURE))
+    )
+    texture.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set(
+        "sRGB"
+    )
+    texture.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("clamp")
+    texture.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("clamp")
+
+    reader = UsdShade.Shader.Define(stage, f"{material_path}/Primvar")
+    reader.CreateIdAttr("UsdPrimvarReader_float2")
+    reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+    texture.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
+        reader.ConnectableAPI(), "result"
+    )
+    # Keep the overlay unlit like the wall panorama. A lit diffuse texture was
+    # multiplied by the scene illumination and rendered almost black even
+    # though the source PNG had the intended warm-gray color.
+    surface.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+        Gf.Vec3f(0.0, 0.0, 0.0)
+    )
+
+    # The source PNG is authored in sRGB. After conversion to linear color,
+    # the lit horizontal surface appears much darker than the same pixels in
+    # an image viewer (and than the unlit wall panorama). Add a restrained
+    # emissive copy so the viewport preserves the authored warm-gray value
+    # while diffuse lighting and object shadows remain visible.
+    emissive_texture = UsdShade.Shader.Define(
+        stage, f"{material_path}/EmissiveTexture"
+    )
+    emissive_texture.CreateIdAttr("UsdUVTexture")
+    emissive_texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(
+        Sdf.AssetPath(str(RESTAURANT_FLOOR_TEXTURE))
+    )
+    emissive_texture.CreateInput(
+        "sourceColorSpace", Sdf.ValueTypeNames.Token
+    ).Set("sRGB")
+    emissive_texture.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set(
+        "clamp"
+    )
+    emissive_texture.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set(
+        "clamp"
+    )
+    emissive_texture.CreateInput("scale", Sdf.ValueTypeNames.Float4).Set(
+        Gf.Vec4f(
+            emissive_strength,
+            emissive_strength,
+            emissive_strength,
+            1.0,
+        )
+    )
+    emissive_texture.CreateInput(
+        "st", Sdf.ValueTypeNames.Float2
+    ).ConnectToSource(reader.ConnectableAPI(), "result")
+    surface.CreateInput(
+        "emissiveColor", Sdf.ValueTypeNames.Color3f
+    ).ConnectToSource(emissive_texture.ConnectableAPI(), "rgb")
+
+    # This is optical roughness only; wheel friction, collision geometry, and
+    # the physics material on the original floor remain unchanged.
+    surface.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.82)
+    surface.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+    material.CreateSurfaceOutput().ConnectToSource(
+        surface.ConnectableAPI(), "surface"
+    )
+
+    visual_root = UsdGeom.Xform.Define(
+        stage, "/World/Architecture/RestaurantFloorVisualOverlay"
+    )
+
+    def add_visual_floor(name, x_min, x_max, y_min, y_max):
+        # One non-colliding quad per rectangular floor section. Stretch the
+        # floor pixels extracted directly from the wall panorama once over
+        # each section; this avoids repeat/cache differences from the wall.
+        z = 0.002
+        mesh = UsdGeom.Mesh.Define(
+            stage, f"{visual_root.GetPath()}/{name}"
+        )
+        mesh.CreatePointsAttr(
+            [
+                Gf.Vec3f(x_min, y_min, z),
+                Gf.Vec3f(x_max, y_min, z),
+                Gf.Vec3f(x_max, y_max, z),
+                Gf.Vec3f(x_min, y_max, z),
+            ]
+        )
+        mesh.CreateFaceVertexCountsAttr([4])
+        mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
+        mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+        mesh.CreateDoubleSidedAttr(False)
+        st = UsdGeom.PrimvarsAPI(mesh.GetPrim()).CreatePrimvar(
+            "st",
+            Sdf.ValueTypeNames.TexCoord2fArray,
+            UsdGeom.Tokens.faceVarying,
+        )
+        st.Set(
+            [
+                Gf.Vec2f(0.0, 0.0),
+                Gf.Vec2f(1.0, 0.0),
+                Gf.Vec2f(1.0, 1.0),
+                Gf.Vec2f(0.0, 1.0),
+            ]
+        )
+        UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(material)
+
+    add_visual_floor("Dining", -6.0, 6.0, -5.0, 5.0)
+    add_visual_floor("KitchenPatch", -2.5, 2.5, 5.0, 6.5)
+
+    print(
+        "[restaurant] floor_visual=wall_extracted_texture size=1024 "
+        f"emissive={emissive_strength:.2f} quads=2 physics=unchanged",
+        flush=True,
+    )
 
 
 def add_three_wall_restaurant_panorama(stage):
@@ -4526,6 +4672,7 @@ def main():
         set_robot_context(config["root"], config["spawn"])
         stage = open_restaurant_and_robot(open_stage=index == 0)
         if index == 0:
+            configure_restaurant_floor_visual_material(stage)
             add_three_wall_restaurant_panorama(stage)
         configure_wheel_contact_material(stage)
         configure_gripper_contact_material(stage)
