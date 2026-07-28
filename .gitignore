@@ -8,12 +8,14 @@ __pycache__/
 *.py[cod]
 
 # Downloaded/source asset packs that are too large or reproducible.
-assets/nvidia_restaurant/
-assets/kenney_furniture/
 external/
 
 # A collected Isaac scene is 200+ MB. Required runtime subsets are force-added
 # deliberately; unrelated block textures remain local.
 isaacpjt/M0609/Collected_m0609_camera2/
-isaacpjt/M0609/Collected_camera/
-isaacpjt/M0609/Collected_m0609_camera/Collected_m0609_camera/
+
+# Lightwheel Kitchen collected runtime (downloaded separately, see
+# assets/Lightwheel_Kitchen/README.md).
+assets/Lightwheel_Kitchen/Collected_KitchenRoom/
+dist/Lightwheel_Kitchen_runtime*.tar.zst
+dist/Lightwheel_Kitchen_runtime*.tar.zst.sha256
