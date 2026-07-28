@@ -362,11 +362,12 @@ ros2 topic hz /robot2/hand_safety/intrusion
 │   ├── map_gen/                  # 1회 SLAM 지도 생성
 │   ├── hand_safety/              # 손 감지·안전 ROS 2 패키지
 │   └── ridgeback_m0609_description/  # 로봇 URDF/메시 원본(COLCON_IGNORE, 빌드 대상 아님)
-├── isaacpjt/           # Isaac Sim 전용 스크립트(콜콘 패키지 아님)
+├── isaacpjt/           # Isaac Sim 전용 스크립트(대부분 콜콘 패키지 아님)
 │   ├── nav_restaurant_demo.py    # 메인 실행 진입점
 │   ├── {pizza,drink,cutlery}_serving.py 등  # 로봇팔 서빙 상태 머신
 │   ├── restaurant_two_wheel_demo.py  # 단일 로봇 진단 하네스(docs/TWO_WHEEL_RAILS_DIAGNOSTIC.md)
-│   └── M0609/          # M0609 로봇팔 USD/URDF, RMPflow 설정
+│   └── M0609/          # RMPflow 설정, RG2 그리퍼 메시
+│       └── doosan-robot2/  # m0609_isaac_description 패키지(URDF, colcon 빌드 대상)
 ├── assets/             # 3D 씬, 텍스처, 음식 모델 등
 ├── maps/               # Nav2용 식당 지도
 ├── tools/              # 실행/빌드/진단 스크립트
