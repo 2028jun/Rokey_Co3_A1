@@ -39,7 +39,6 @@
 ### 시스템 아키텍처 (PC 3대 + 로봇 2대)
 
 ```mermaid
-%%{init: {'flowchart': {'curve': 'natural'}}}%%
 flowchart TB
     Browser["브라우저"] --> HMI["HMI 대시보드\nFastAPI + WebSocket"]
     HMI -->|"/manager/order"| Fleet["Fleet Manager"]
@@ -236,16 +235,28 @@ source install/setup.bash
 클론한 디렉터리(= colcon 빌드 결과인 `build/`, `install/`, `log/`가 생기는
 루트)이며, PC마다 실제 경로로 바꿔서 사용하십시오. 각 단계는 이전 단계가
 준비된 뒤에 시작해야 합니다. 현재 내부망은 메인 Isaac/Manager 컴퓨터
-`10.10.0.1`, 원격 YOLO 컴퓨터 `10.10.0.2`이며, 모든 ROS 터미널은 같은
-`ROS_DOMAIN_ID=101`, `ROS_LOCALHOST_ONLY=0`을 사용하고, Isaac 터미널에는
+`10.10.0.1`, 원격 YOLO 컴퓨터 `10.10.0.2`이며, Isaac 터미널에는
 `/opt/ros/humble/setup.bash`를 source하지 않습니다.
+
+### 0. (최초 1회) 세 PC 모두 `~/.bashrc`에 ROS 도메인 설정
+
+매 터미널에서 직접 export하는 대신, 세 PC 모두 `~/.bashrc`에 아래 두 줄을
+추가해두면 새로 여는 모든 터미널에 자동으로 적용됩니다. 세 PC가 반드시
+같은 값을 써야 합니다.
+
+```bash
+export ROS_DOMAIN_ID=101
+export ROS_LOCALHOST_ONLY=0
+```
+
+추가한 뒤 `source ~/.bashrc`를 실행하거나 새 터미널을 여십시오. 이 값이
+이미 `~/.bashrc`에 설정되어 있다면 아래 단계들에서 다시 export할 필요가
+없습니다.
 
 ### 1. 메인 PC — ① Isaac Sim
 
 ```bash
 cd <워크스페이스 경로>
-export ROS_DOMAIN_ID=101
-export ROS_LOCALHOST_ONLY=0
 ./tools/run_multi_integrated_isaac.sh
 ```
 
@@ -258,8 +269,6 @@ export ROS_LOCALHOST_ONLY=0
 cd <워크스페이스 경로>
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-export ROS_DOMAIN_ID=101
-export ROS_LOCALHOST_ONLY=0
 ./tools/t2_ros.sh
 ```
 
@@ -285,13 +294,11 @@ use_sim_time:=true
 
 ```bash
 cd <워크스페이스 경로>
-export ROS_DOMAIN_ID=101
-export ROS_LOCALHOST_ONLY=0
 ./tools/run_remote_yolo.sh
 ```
 
-메인 PC와 같은 유선 LAN, 같은 `ROS_DOMAIN_ID`, `ROS_LOCALHOST_ONLY=0`이
-필요합니다.
+메인 PC와 같은 유선 LAN에 연결하고, `~/.bashrc`에 메인 PC와 같은
+`ROS_DOMAIN_ID`, `ROS_LOCALHOST_ONLY=0`이 설정되어 있어야 합니다.
 
 ### 4. 웹 UI PC — ④ HMI
 
@@ -299,8 +306,6 @@ export ROS_LOCALHOST_ONLY=0
 cd <워크스페이스 경로>
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-export ROS_DOMAIN_ID=101
-export ROS_LOCALHOST_ONLY=0
 ./tools/t3_hmi.sh
 ```
 
@@ -316,8 +321,6 @@ JPEG를 재인코딩하지 않고 브라우저로 그대로 전달합니다.
 cd <워크스페이스 경로>
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-export ROS_DOMAIN_ID=101
-export ROS_LOCALHOST_ONLY=0
 
 ping -c 3 10.10.0.2
 ros2 node list | grep hand_detector
@@ -326,9 +329,9 @@ ros2 topic info /robot2/hand_safety/intrusion -v
 ```
 
 `Publisher count`가 두 안전 토픽에서 각각 `1`이면 정상입니다. `0`이면
-원격 YOLO PC가 아직 붙지 않은 것이므로 3단계로 돌아가 domain ID와
-`ROS_LOCALHOST_ONLY` 설정을 다시 확인하십시오. 실제 heartbeat는 아래
-명령을 하나씩 실행해 주기가 출력되는지 확인하고 `Ctrl+C`로 종료합니다.
+원격 YOLO PC가 아직 붙지 않은 것이므로 원격 YOLO PC의 `~/.bashrc`에 설정된
+domain ID와 `ROS_LOCALHOST_ONLY` 값을 다시 확인하십시오. 실제 heartbeat는
+아래 명령을 하나씩 실행해 주기가 출력되는지 확인하고 `Ctrl+C`로 종료합니다.
 
 ```bash
 ros2 topic hz /robot1/hand_safety/intrusion
