@@ -708,26 +708,42 @@ class SimplifiedPathNavigator:
     def _apply_fleet_lane(
         self, points: list[dict] | list[Point]
     ) -> list[dict]:
-        """Shift corridor (near x=0) segments onto a per-robot lane.
+        """Shift central vertical segments while preserving orthogonality.
 
         robot1 keeps left of center, robot2 keeps right so simultaneous
         kitchen departures do not share the exact same spine.
         """
         lane_x = self._lane_x()
-
-        out: list[dict] = []
-        n = len(points)
-        for i, pt in enumerate(points):
+        raw: list[tuple[float, float]] = []
+        for pt in points:
             if isinstance(pt, dict):
                 x, y = float(pt["x"]), float(pt["y"])
             else:
                 x, y = float(pt[0]), float(pt[1])
-            if lane_x is not None and 0 < i < n - 1 and abs(x) < 0.55:
-                x = lane_x
-            out.append({"x": round(x, 4), "y": round(y, 4)})
-        # Drop near-duplicates after lane snap.
+            raw.append((x, y))
+        if lane_x is None or len(raw) < 2:
+            return [{"x": round(x, 4), "y": round(y, 4)} for x, y in raw]
+
+        out: list[tuple[float, float]] = [raw[0]]
+        for start, end in zip(raw, raw[1:]):
+            dx = end[0] - start[0]
+            dy = end[1] - start[1]
+            central_vertical = abs(dx) <= 0.03 and abs(start[0]) < 0.55
+            if central_vertical and abs(dy) > 0.03:
+                shifted_start = (lane_x, start[1])
+                if math.hypot(
+                    shifted_start[0] - out[-1][0],
+                    shifted_start[1] - out[-1][1],
+                ) > 0.05:
+                    out.append(shifted_start)
+                out.append((lane_x, end[1]))
+            else:
+                out.append(end)
+
+        # Drop near-duplicates after inserting horizontal lane connectors.
         cleaned: list[dict] = []
-        for p in out:
+        for x, y in out:
+            p = {"x": round(x, 4), "y": round(y, 4)}
             if (
                 not cleaned
                 or math.hypot(p["x"] - cleaned[-1]["x"], p["y"] - cleaned[-1]["y"])

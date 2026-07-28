@@ -140,13 +140,13 @@ def generate_launch_description():
     config = os.path.join(nav_share, "config")
     rviz_config = os.path.join(nav_share, "rviz", "multi_robot.rviz")
     robot1_worker = _worker(
-        "robot1", "-0.90", os.path.join(config, "routes_robot1.yaml"),
+        "robot1", "-0.70", os.path.join(config, "routes_robot1.yaml"),
         use_sim_time, enable_serving, navigation_only,
         enable_local_hand_detection,
         enable_jpeg_transport, jpeg_quality,
     )
     robot2_worker = _worker(
-        "robot2", "0.90", os.path.join(config, "routes_robot2.yaml"),
+        "robot2", "0.70", os.path.join(config, "routes_robot2.yaml"),
         use_sim_time, enable_serving, navigation_only,
         enable_local_hand_detection,
         enable_jpeg_transport, jpeg_quality,
