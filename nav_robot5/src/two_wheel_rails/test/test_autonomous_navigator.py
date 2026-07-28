@@ -54,16 +54,29 @@ def test_same_side_peer_does_not_block_kitchen_departure():
 
 
 def test_opposite_side_later_priority_waits_at_kitchen():
-    navigator = _bare_navigator(robot_id="robot2", priority=-100.0)
+    navigator = _bare_navigator(robot_id="robot2", priority=-101.0)
     navigator._peer_intents["robot1"] = {
         "active": True,
         "phase": "approaching",
         "table_id": 0,
-        "priority": -101.0,
+        "priority": -100.0,
         "pose_xy": (0.0, 2.0),
     }
 
     assert navigator._opposite_outbound_blocker(1) == "robot1"
+
+
+def test_opposite_side_earlier_priority_does_not_wait_at_kitchen():
+    navigator = _bare_navigator(robot_id="robot1", priority=-100.0)
+    navigator._peer_intents["robot2"] = {
+        "active": True,
+        "phase": "approaching",
+        "table_id": 1,
+        "priority": -101.0,
+        "pose_xy": (0.0, 2.0),
+    }
+
+    assert navigator._opposite_outbound_blocker(0) is None
 
 
 def test_peer_in_table_bay_releases_opposite_corridor():

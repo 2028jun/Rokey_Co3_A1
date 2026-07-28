@@ -528,8 +528,8 @@ class SimplifiedPathNavigator:
             return False
         if abs(my_priority - peer_priority) < 1e-9:
             return self._robot_id == "robot2"
-        # Priority is -monotonic: a later order is algebraically larger.
-        return my_priority > peer_priority
+        # Priority is -monotonic: a later order is algebraically smaller.
+        return my_priority < peer_priority
 
     @staticmethod
     def _peer_cleared_corridor(intent: dict) -> bool:

@@ -19,6 +19,8 @@ import time
 import gc
 from pathlib import Path
 
+from fleet_peer_yield import in_narrow_forward_strip, is_later_active_order
+
 
 # Arm serving targets are expressed in the docked robot frame.  The former
 # 40 mm / 2 degree completion window was adequate for navigation, but can move
@@ -305,6 +307,12 @@ FRONT_LIDAR_TOPIC = "/scan"
 
 LIDAR_MIN_RANGE = 0.20
 PEER_HARD_STOP_M = 1.10
+# Peer yielding uses a deliberately narrow forward strip instead of the
+# general obstacle polygon.  The 0.70 m total width stays inside Ridgeback's
+# body width, so a robot docked beside the aisle does not hold the passing
+# robot.  A wider release distance prevents stop/resume chatter at 1.10 m.
+PEER_HARD_STOP_HALF_WIDTH_M = 0.35
+PEER_HARD_STOP_RELEASE_M = 1.45
 # Corridor half-separation so simultaneous trips do not share the spine.
 FLEET_AISLE_OFFSET_M = 0.55
 FLEET_PASS_EXTRA_M = 0.30
@@ -2131,6 +2139,7 @@ class NavBridge(Node):
         self._obstacle_stop_started = None
         self._obstacle_stop_from_peer = False
         self._peer_hit_this_scan = False
+        self._peer_front_near_dist = float("inf")
         self._clearance_start = None
         self._obstacle_scale = 1.0
         self._last_scan_time = 0.0
@@ -2881,6 +2890,7 @@ class NavBridge(Node):
         person_hits = []
         self._peer_hit_this_scan = False
         self._peer_near_dist = float("inf")
+        self._peer_front_near_dist = float("inf")
         for index in range(LIDAR_SAMPLES):
             angle = angle_min + index * angle_increment
             world_angle = yaw + angle
@@ -2961,11 +2971,23 @@ class NavBridge(Node):
             )
             stop_for_peer = False
             if is_peer_robot and math.isfinite(distance):
-                # NEVER hard-stop for the peer robot. Mutual peer-stop at
-                # ~0.3m caused permanent face-to-face pending. Pass with
-                # opposite-lane swerve instead (person obstacles still stop).
                 self._peer_near_dist = min(self._peer_near_dist, distance)
                 self._peer_hit_this_scan = True
+                # Hard-stop eligibility is intentionally narrower than the
+                # robot body.  Track hits through the release distance so a
+                # yielded robot stays stopped until the earlier robot has
+                # actually passed; side/docked peers remain outside this strip.
+                local_x = LIDAR_SENSOR_FORWARD + distance * math.cos(angle)
+                local_y = distance * math.sin(angle)
+                if in_narrow_forward_strip(
+                    local_x,
+                    local_y,
+                    PEER_HARD_STOP_RELEASE_M,
+                    PEER_HARD_STOP_HALF_WIDTH_M,
+                ):
+                    self._peer_front_near_dist = min(
+                        self._peer_front_near_dist, local_x
+                    )
             if is_person and math.isfinite(distance):
                 obstacle_ranges.append(distance)
                 hit_x = origin[0] + direction[0] * distance
@@ -3088,12 +3110,31 @@ class NavBridge(Node):
             self._fleet_phases.pop(robot_name, None)
         if robot_name == (self.robot_name or ""):
             self._my_fleet_priority = self._fleet_priorities.get(robot_name)
-        # Drop any legacy peer-stop so we never stay pending on an empty aisle.
-        peer = "robot2" if (self.robot_name or "") == "robot1" else "robot1"
-        if self._obstacle_stop and self._obstacle_stop_from_peer:
+        # Release immediately when either intent ends or priority changes make
+        # this robot the keeper. Distance-based release remains scan-driven.
+        if (
+            self._obstacle_stop
+            and self._obstacle_stop_from_peer
+            and not self._should_yield_to_peer()
+        ):
             with self._lock:
-                if self._obstacle_stop and self._obstacle_stop_from_peer:
+                if (
+                    self._obstacle_stop
+                    and self._obstacle_stop_from_peer
+                    and not self._should_yield_to_peer()
+                ):
                     self._finish_obstacle_stop(float("inf"))
+
+    def _should_yield_to_peer(self) -> bool:
+        """Return True only for the robot running the later active order."""
+        me = self.robot_name or ""
+        peer = "robot2" if me == "robot1" else "robot1"
+        return is_later_active_order(
+            me,
+            peer,
+            self._fleet_active,
+            self._fleet_priorities,
+        )
 
     def _peer_swerve_bias(self, peer_hit: bool, nearest: float) -> float:
         """Legacy hook: constant-sign yaw bias is unsafe (wrong for northbound).
@@ -3173,9 +3214,10 @@ class NavBridge(Node):
             close_points = stop_hits
             peer_hit = bool(getattr(self, "_peer_hit_this_scan", False))
             peer_near = float(getattr(self, "_peer_near_dist", float("inf")))
-            # Swerve for nearby peers; never leave a sticky peer hard-stop.
-            if self._obstacle_stop and self._obstacle_stop_from_peer:
-                self._finish_obstacle_stop(peer_near)
+            peer_front = float(
+                getattr(self, "_peer_front_near_dist", float("inf"))
+            )
+            should_yield = self._should_yield_to_peer()
             swerve_range = peer_near if peer_near <= 2.0 else float("inf")
             self._peer_swerve_wz = self._peer_swerve_bias(
                 peer_hit or math.isfinite(swerve_range),
@@ -3185,8 +3227,9 @@ class NavBridge(Node):
             now = time.monotonic()
 
             if not self._obstacle_stop:
-                if len(close_points) >= 3:
-                    # Person (or non-peer) polygon stop only.
+                if should_yield and peer_front <= PEER_HARD_STOP_M:
+                    self._start_obstacle_stop(peer_front, from_peer=True)
+                elif len(close_points) >= 3:
                     self._start_obstacle_stop(nearest, from_peer=False)
                 elif slowdown_hits:
                     self._obstacle_scale = OBSTACLE_SLOWDOWN_RATIO
@@ -3194,11 +3237,23 @@ class NavBridge(Node):
                     self._obstacle_scale = 1.0
             else:
                 self._obstacle_scale = 0.0
-                if not slowdown_hits:
+                if self._obstacle_stop_from_peer:
+                    clear = (
+                        not should_yield
+                        or peer_front > PEER_HARD_STOP_RELEASE_M
+                    )
+                else:
+                    clear = not slowdown_hits
+                if clear:
                     if self._clearance_start is None:
                         self._clearance_start = now
                     elif now - self._clearance_start >= 0.5:
-                        self._finish_obstacle_stop(nearest)
+                        release_distance = (
+                            peer_front
+                            if self._obstacle_stop_from_peer
+                            else nearest
+                        )
+                        self._finish_obstacle_stop(release_distance)
                 else:
                     self._clearance_start = None
 
@@ -3529,9 +3584,6 @@ class NavBridge(Node):
         if mission is None:
             return None
         if self._navigation_paused or self._obstacle_stop:
-            # Legacy peer-stop must never freeze motion - clear and continue.
-            if self._obstacle_stop and self._obstacle_stop_from_peer:
-                self._finish_obstacle_stop(float("inf"))
             # Table park-out must reverse even if the dock furniture / peer /
             # person polygon trips a stop. Freezing here left phase=
             # park_out_backoff until ROS timed out -> manager sticky FAILED ->
