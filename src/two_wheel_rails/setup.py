@@ -25,7 +25,7 @@ setup(
     zip_safe=True,
     maintainer="rokey",
     maintainer_email="youngkim99@kakao.com",
-    description="Rail-following Nav2 missions for nav_robot5",
+    description="Rail-following Nav2 missions for the serving robots",
     license="Apache-2.0",
     entry_points={
         "console_scripts": [

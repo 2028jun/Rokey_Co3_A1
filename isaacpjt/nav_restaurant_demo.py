@@ -153,6 +153,9 @@ from table_route_module import build_table_route
 
 
 _package_roots = [
+    WORKSPACE / "src",
+    WORKSPACE / "isaacpjt/M0609",
+    WORKSPACE / "install/m0609_isaac_description/share",
     WORKSPACE / "install/ridgeback_m0609_description/share",
 ]
 os.environ["ROS_PACKAGE_PATH"] = ":".join(

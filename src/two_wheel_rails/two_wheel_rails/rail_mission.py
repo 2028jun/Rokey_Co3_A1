@@ -21,7 +21,7 @@ from two_wheel_rails.rail_navigator import RailNavigator
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="nav_robot5: routes.yaml 레일 + Nav2 추종 + 횡오차 검증"
+        description="two_wheel_rails: routes.yaml 레일 + Nav2 추종 + 횡오차 검증"
     )
     parser.add_argument("--table-id", type=int, default=0, choices=[0, 1, 2, 3])
     parser.add_argument(

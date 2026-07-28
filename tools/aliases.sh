@@ -9,13 +9,13 @@
 #   터미널2: t2
 #   터미널3: t3 --table-id 2
 
-_NAV_ROBOT5_TOOLS_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-export PROJECT_WS="${PROJECT_WS:-$(dirname "$_NAV_ROBOT5_TOOLS_DIR")}"
+_TWO_WHEEL_TOOLS_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+export PROJECT_WS="${PROJECT_WS:-$(dirname "$_TWO_WHEEL_TOOLS_DIR")}"
 if [[ -z "${ISAAC_SIM_ROOT:-}" ]]; then
   echo "ISAAC_SIM_ROOT가 설정되어 있지 않습니다. export ISAAC_SIM_ROOT=/path/to/isaac_sim/isaacsim/_build/linux-x86_64/release 실행 후 다시 시도하세요." >&2
   return 1 2>/dev/null || exit 1
 fi
-export NAV_ROBOT5_ISAAC_PYTHON="$ISAAC_SIM_ROOT/python.sh"
+export TWO_WHEEL_ISAAC_PYTHON="$ISAAC_SIM_ROOT/python.sh"
 
 # Older workspace scripts may already have t1/t2/t3 aliases in an interactive
 # shell. Bash expands those aliases while parsing `t1()`, causing a misleading
@@ -36,17 +36,17 @@ _nav5_ws() {
 
 t1() {
   cd "$PROJECT_WS" || return 1
-  [[ -x "$NAV_ROBOT5_ISAAC_PYTHON" ]] || {
-    echo "[t1] Isaac python 없음: $NAV_ROBOT5_ISAAC_PYTHON" >&2
+  [[ -x "$TWO_WHEEL_ISAAC_PYTHON" ]] || {
+    echo "[t1] Isaac python 없음: $TWO_WHEEL_ISAAC_PYTHON" >&2
     return 1
   }
-  echo "[t1] nav_robot5  ROS_DOMAIN_ID=$ROS_DOMAIN_ID"
-  exec "$NAV_ROBOT5_ISAAC_PYTHON" isaacpjt/restaurant_two_wheel_demo.py
+  echo "[t1] two_wheel_rails  ROS_DOMAIN_ID=$ROS_DOMAIN_ID"
+  exec "$TWO_WHEEL_ISAAC_PYTHON" isaacpjt/restaurant_two_wheel_demo.py
 }
 
 t2() {
   _nav5_ws || return 1
-  echo "[t2] nav_robot5  ROS_DOMAIN_ID=$ROS_DOMAIN_ID"
+  echo "[t2] two_wheel_rails  ROS_DOMAIN_ID=$ROS_DOMAIN_ID"
   ./tools/kill_nav2.sh
   exec ros2 launch two_wheel_rails nav2.launch.py \
     "map:=$PROJECT_WS/maps/restaurant/map.yaml"
@@ -55,20 +55,20 @@ t2() {
 t3() {
   _nav5_ws || return 1
   (($# == 0)) && set -- --table-id 0
-  echo "[t3] nav_robot5  ROS_DOMAIN_ID=$ROS_DOMAIN_ID  rail_mission"
+  echo "[t3] two_wheel_rails  ROS_DOMAIN_ID=$ROS_DOMAIN_ID  rail_mission"
   if ! timeout 4 ros2 topic info /two_wheel/odom_raw 2>/dev/null \
       | grep -q 'Publisher count: 1'; then
-    echo "[t3] 중단: nav_robot5 T1이 아닙니다." >&2
+    echo "[t3] 중단: two_wheel_rails T1이 아닙니다." >&2
     echo "     모든 기존 t1/t2/t3를 Ctrl+C로 끈 뒤, 각 터미널에서 이 aliases.sh를 다시 source하세요." >&2
     return 2
   fi
   if ! timeout 4 ros2 topic info /two_wheel/scan_raw 2>/dev/null \
       | grep -q 'Publisher count: 1'; then
-    echo "[t3] 중단: nav_robot5 LiDAR 토픽이 없습니다. T1 시작 완료를 기다리세요." >&2
+    echo "[t3] 중단: two_wheel_rails LiDAR 토픽이 없습니다. T1 시작 완료를 기다리세요." >&2
     return 2
   fi
   if [[ "$(timeout 4 ros2 lifecycle get /bt_navigator 2>/dev/null)" != "active [3]" ]]; then
-    echo "[t3] 중단: nav_robot5 Nav2가 active가 아닙니다. 새 aliases로 t2를 다시 실행하세요." >&2
+    echo "[t3] 중단: two_wheel_rails Nav2가 active가 아닙니다. 새 aliases로 t2를 다시 실행하세요." >&2
     return 2
   fi
   ros2 run two_wheel_rails rail_mission "$@"

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Save /map from slam_toolbox to src/two_wheel_rails/maps/restaurant/.
+# Save /map from slam_toolbox to the workspace's maps/restaurant/ directory.
 # Never overwrites an existing slam_map.* -- uses slam_map_YYYYMMDD_HHMMSS if taken.
 # Does NOT touch map.yaml/map.pgm, the map nav2.launch.py actually loads by
 # default -- that swap is a deliberate, separate, manual step (see README.md).
 set -eo pipefail
 
 WS_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-OUT_DIR="$WS_ROOT/src/two_wheel_rails/maps/restaurant"
+OUT_DIR="$WS_ROOT/maps/restaurant"
 BASE_NAME="${1:-slam_map}"
 
 mkdir -p "$OUT_DIR"

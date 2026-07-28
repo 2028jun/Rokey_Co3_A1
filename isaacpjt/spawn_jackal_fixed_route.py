@@ -36,7 +36,12 @@ from isaacsim.core.utils.types import ArticulationAction
 from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdPhysics, UsdShade
 
 
-URDF_PATH = WORKSPACE / "src/jackal_j100_description/urdf/j100_base.urdf"
+_jackal_urdf_path = os.environ.get("JACKAL_URDF_PATH")
+URDF_PATH = (
+    Path(_jackal_urdf_path).expanduser().resolve()
+    if _jackal_urdf_path
+    else None
+)
 ROBOT_USD = WORKSPACE / "assets/diagnostics/jackal_j100_stock_v1.usd"
 RESTAURANT_USD = WORKSPACE / "assets/lightweight_restaurant/lightweight_pizza_restaurant.usda"
 ROBOT_ROOT = "/World/JackalDiagnostic"
@@ -229,6 +234,11 @@ class Route:
 
 
 def main():
+    if URDF_PATH is None:
+        raise RuntimeError(
+            "JACKAL_URDF_PATH가 설정되어 있지 않습니다. "
+            "Jackal J100 URDF의 절대경로를 지정하세요."
+        )
     for path in (URDF_PATH, RESTAURANT_USD):
         if not path.is_file():
             raise FileNotFoundError(path)

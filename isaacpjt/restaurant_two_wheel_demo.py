@@ -1,8 +1,8 @@
-"""Isaac Sim 5.1 restaurant + two-wheel Ridgeback bridge & Direct Route Physics State Machine for nav_robot5.
+"""Isaac Sim 5.1 restaurant + two-wheel Ridgeback bridge and route diagnostics.
 
 # Direct route, axis, pivot, docking, and recovery controller
 # ported without behavioral simplification from:
-# nav_robot/isaacpjt/nav_restaurant_demo.py
+# isaacpjt/nav_restaurant_demo.py
 """
 
 from __future__ import annotations
@@ -46,7 +46,9 @@ if _needs_ros_env and os.environ.get("NAV_ROS_REEXEC") != "1":
 
 from isaacsim import SimulationApp
 
-HEADLESS = os.environ.get("NAV_ROBOT5_HEADLESS", "0") == "1"
+HEADLESS = os.environ.get(
+    "TWO_WHEEL_HEADLESS", os.environ.get("NAV_ROBOT5_HEADLESS", "0")
+) == "1"
 simulation_app = SimulationApp({"headless": HEADLESS})
 
 import numpy as np
@@ -306,7 +308,7 @@ def configure_wheel_contact_material(stage):
     missing = [name for name, count in bound.items() if count != 1]
     if missing:
         raise RuntimeError(f"wheel/caster collision material binding failed: {bound}")
-    print(f"[nav_robot5] contact materials ready: {bound}", flush=True)
+    print(f"[two_wheel_rails] contact materials ready: {bound}", flush=True)
 
 
 def find_articulation_path(stage) -> str:
@@ -357,7 +359,7 @@ def initialize_robot(articulation_path: str):
 
 # Direct route, axis, pivot, docking, and recovery controller
 # ported without behavioral simplification from:
-# nav_robot/isaacpjt/nav_restaurant_demo.py
+# isaacpjt/nav_restaurant_demo.py
 
 def build_stages_from_points(points: list[dict], current_x: float, current_y: float) -> list[dict]:
     stages = []
@@ -1018,7 +1020,7 @@ class DiffNavBridge(Node):
                         self.get_logger().warning(f"dock settle timeout after {DOCK_SETTLE_TIMEOUT}s; resuming fine control")
                     elif mission["settle_count"] >= DOCK_SETTLE_TICKS:
                         self.get_logger().info(
-                            f"[nav_robot5] docking completed: distance={distance:.3f}m "
+                            f"[two_wheel_rails] docking completed: distance={distance:.3f}m "
                             f"lateral={lateral_error:.3f}m "
                             f"yaw_error={math.degrees(yaw_error):.2f}deg"
                         )
@@ -1043,7 +1045,7 @@ class DiffNavBridge(Node):
                 vx = 0.0
                 wz = 0.0
                 self.get_logger().info(
-                    f"[nav_robot5] dock settle entered: distance={distance:.3f}m "
+                    f"[two_wheel_rails] dock settle entered: distance={distance:.3f}m "
                     f"lateral={lateral_error:.3f}m "
                     f"yaw_error={math.degrees(yaw_error):.2f}deg"
                 )
@@ -1140,7 +1142,7 @@ class DiffNavBridge(Node):
             mission["last_log"] = now
             if mission.get("settling", False):
                 self.get_logger().info(
-                    f"[nav_robot5] dock settling: count={mission.get('settle_count', 0)}/{DOCK_SETTLE_TICKS} "
+                    f"[two_wheel_rails] dock settling: count={mission.get('settle_count', 0)}/{DOCK_SETTLE_TICKS} "
                     f"distance={distance:.3f}m yaw_error={math.degrees(yaw_error):.2f}deg cmd=({vx:.3f},{wz:.3f})"
                 )
             else:
@@ -1305,7 +1307,7 @@ class DiffNavBridge(Node):
 
         if (abs(vx) > 1e-3 or abs(wz) > 1e-3) and now - self._last_cmd_log_time > 1.0:
             self._last_cmd_log_time = now
-            print(f"[nav_robot5] cmd vx={vx:.3f} wz={wz:.3f}", flush=True)
+            print(f"[two_wheel_rails] cmd vx={vx:.3f} wz={wz:.3f}", flush=True)
 
         wheel_velocities = self._differential_ik(vx, wz)
         self.articulation.apply_action(
@@ -1348,7 +1350,7 @@ def main():
     configure_physics_stability(stage, articulation_path)
     articulation, dof_names = initialize_robot(articulation_path)
 
-    print(f"[nav_robot5] PhysX raycast {RAW_SCAN_TOPIC} ready", flush=True)
+    print(f"[two_wheel_rails] PhysX raycast {RAW_SCAN_TOPIC} ready", flush=True)
 
     if not rclpy.ok():
         rclpy.init(args=[])
@@ -1363,7 +1365,7 @@ def main():
         timeline.play()
 
     print(
-        f"[nav_robot5] 2-wheel bridge running; "
+        f"[two_wheel_rails] 2-wheel bridge running; "
         f"Domain={os.environ.get('ROS_DOMAIN_ID', '0')} "
         f"spawn=({SPAWN_POSITION[0]:.2f},{SPAWN_POSITION[1]:.2f})",
         flush=True,

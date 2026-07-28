@@ -1,7 +1,7 @@
 # map_gen — 1회 SLAM 맵 생성 (younggi/map_generate 이식)
 
 식당을 `slam_toolbox`로 한 번 순찰하며 점유맵을 만들어
-`src/two_wheel_rails/maps/restaurant/slam_map.{pgm,yaml}`에 저장합니다.
+`maps/restaurant/slam_map.{pgm,yaml}`에 저장합니다.
 AMCL / controller_server / bt_navigator는 포함하지 않습니다 — 아직 맵이 없는
 상태이므로 로컬라이제이션이 성립하지 않기 때문입니다.
 
@@ -84,7 +84,7 @@ bash src/map_gen/tools/save_slam_map.sh
 기본으로 로드하는 맵)을 **절대 덮어쓰지 않습니다.** `slam_map.pgm`/
 `slam_map.yaml`로 별도 저장됩니다. 실제로 교체하려면:
 
-1. `src/two_wheel_rails/maps/restaurant/slam_map.yaml`을
+1. `maps/restaurant/slam_map.yaml`을
    RViz 등에서 열어 식당 형태가 제대로 나왔는지 확인
 2. 문제없으면 `two_wheel_rails/launch/nav2.launch.py`의 `map` 인자(또는
    기본 맵 탐색 로직)를 `slam_map.yaml`로 바꾸거나, 기존 `map.yaml`을

@@ -4,7 +4,7 @@
   <!-- The existing arm description is included as concrete links.  Its
        base_link is attached below to arm_mount_link; Ridgeback links use an
        explicit ridgeback_ prefix to keep the complete TF tree unambiguous. -->
-  <xacro:include filename="$(find m0609_isaac_description)/urdf/m0609_moveit.urdf.xacro"/>
+  <xacro:include filename="../../../isaacpjt/M0609/doosan-robot2/urdf/m0609_moveit.urdf.xacro"/>
 
   <material name="ridgeback_black"><color rgba="0.055 0.065 0.075 1"/></material>
   <material name="ridgeback_yellow"><color rgba="0.96 0.66 0.04 1"/></material>

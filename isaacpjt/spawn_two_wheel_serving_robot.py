@@ -22,13 +22,10 @@ from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
 
 WORKSPACE = diagnostic.WORKSPACE
-# This v2 URDF only existed in the old duplicate ridgeback_m0609_description
-# copy that was removed during the repo consolidation; this diagnostic script
-# (not part of the production launch flow) needs a v2 URDF re-added here to
-# run again.
+# The consolidated workspace keeps the canonical serving robot URDF here.
 SOURCE_URDF = (
     WORKSPACE
-    / "src/ridgeback_m0609_description/urdf/v2/ridgeback_m0609_v2.urdf"
+    / "src/ridgeback_m0609_description/urdf/ridgeback_m0609.urdf"
 )
 GENERATED_URDF = Path("/tmp/two_wheel_ridgeback_serving_robot.urdf")
 D455_USD = (
@@ -46,6 +43,8 @@ os.environ["ROS_PACKAGE_PATH"] = ":".join(
     value
     for value in (
         str(WORKSPACE / "src"),
+        str(WORKSPACE / "isaacpjt/M0609"),
+        str(WORKSPACE / "install/m0609_isaac_description/share"),
         os.environ.get("ROS_PACKAGE_PATH", ""),
     )
     if value

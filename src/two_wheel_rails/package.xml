@@ -3,7 +3,7 @@
 <package format="3">
   <name>two_wheel_rails</name>
   <version>0.1.0</version>
-  <description>Fixed rail paths + Nav2 tracking and cross-track validation (nav_robot5)</description>
+  <description>Fixed rail paths, Nav2 tracking, and cross-track validation.</description>
   <maintainer email="youngkim99@kakao.com">rokey</maintainer>
   <license>Apache-2.0</license>
 

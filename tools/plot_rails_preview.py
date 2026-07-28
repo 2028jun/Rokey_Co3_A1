@@ -76,7 +76,7 @@ def main() -> None:
         ax.plot(k["x"], k["y"], "s", color="gold", markersize=10)
         ax.annotate("K", (k["x"], k["y"]), fontsize=11)
     ax.legend(loc="upper right", fontsize=8)
-    ax.set_title("nav_robot5 rails (routes.yaml)")
+    ax.set_title("two_wheel_rails routes (routes.yaml)")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output, dpi=120)
     print(f"wrote {args.output}")

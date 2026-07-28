@@ -26,8 +26,8 @@
 
 ## 관련 파일
 
-- `nav_robot/assets/lightweight_restaurant/lightweight_pizza_restaurant.usda`
-- `nav_robot/isaacpjt/nav_restaurant_demo.py`
+- `assets/lightweight_restaurant/lightweight_pizza_restaurant.usda`
+- `isaacpjt/nav_restaurant_demo.py`
 - `assets/Lightwheel_Kitchen/`
 
 `map.pgm`, `map.yaml` 등 Nav2 점유 지도 파일은 변경하지 않았다.

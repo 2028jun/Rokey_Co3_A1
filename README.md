@@ -181,7 +181,8 @@ SLAM 지도 생성), **원격 YOLO PC**(손 안전 감지), **웹 UI PC**(HMI �
   - 지도를 새로 뜰 계획이면 추가: `ros-humble-slam-toolbox`,
     `ros-humble-nav2-map-server`
 - colcon 빌드 대상: `serving_robot_interfaces`, `serving_robot_manager`,
-  `two_wheel_rails`, `hand_safety`(로컬 진단용 빌드만, 기본은 원격 YOLO 사용)
+  `two_wheel_rails`, `m0609_isaac_description`,
+  `hand_safety`(로컬 진단용 빌드만, 기본은 원격 YOLO 사용)
 - Isaac Sim 내장 `python.sh`를 사용하므로 시뮬레이션 스크립트용 별도 pip
   설치는 필요 없습니다.
 
@@ -190,7 +191,7 @@ cd <워크스페이스 경로>
 source /opt/ros/humble/setup.bash
 PYTHONNOUSERSITE=1 ./tools/colcon_safe.py build \
   --symlink-install \
-  --packages-up-to serving_robot_interfaces serving_robot_manager two_wheel_rails hand_safety \
+  --packages-up-to serving_robot_interfaces serving_robot_manager two_wheel_rails m0609_isaac_description hand_safety \
   --executor sequential \
   --event-handlers console_start_end+ desktop_notification- status- terminal_title-
 source install/setup.bash
@@ -394,5 +395,5 @@ ros2 topic hz /robot2/hand_safety/intrusion
 재사용하는 일회성 `slam_toolbox` 매핑 모드입니다. 두 실행이 모두
 `cmd_vel`을 사용하므로 위 launch와 동시에 실행하지 마십시오.
 
-전체 절차와 생성된 지도를 `src/two_wheel_rails/maps/`에 적용하는
+전체 절차와 생성된 지도를 `maps/`에 적용하는
 방법은 [src/map_gen/README.md](src/map_gen/README.md)를 참고하십시오.

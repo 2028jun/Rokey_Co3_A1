@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ROS 2 integration smoke test for the two-wheel serving robot.
 
-Run after nav_robot5 t1 and t2. The default test is read-only. Use
+Run after the two_wheel_rails t1 and t2 commands. The default test is read-only. Use
 --motion-test only when the robot has free space in front of it.
 """
 
