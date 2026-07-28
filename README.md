@@ -32,7 +32,7 @@
 
 - **SLAM 지도 생성**: 별도 브리지 없이 Isaac이 이미 발행 중인 `/scan`,
   `/odom`, TF를 그대로 재사용하는 원샷 `slam_toolbox` 매핑 모드로 새 지도를
-  뽑아 `nav_robot5`의 경로 설정에 반영할 수 있습니다.
+  뽑아 `two_wheel_rails`의 경로 설정에 반영할 수 있습니다.
 
 ## 시스템 설계 및 플로우차트
 
@@ -173,28 +173,20 @@ Fleet Manager는 유휴 상태(`0` 또는 `6`)인 로봇 중 `robot1`을 우선 
 SLAM 지도 생성), **원격 YOLO PC**(손 안전 감지), **웹 UI PC**(HMI 대시보드).
 공통으로 세 PC 모두 Ubuntu 22.04 + ROS 2 Humble이 설치되어 있어야 합니다.
 
-저장소에는 `hand_safety`가 두 위치에 있습니다. `src/hand_safety`는
-`COLCON_IGNORE`가 포함된 이전 복사본이므로 빌드 대상에서 제외되고, 루트의
-`hand_safety`만 실제로 빌드됩니다.
-
 ### 메인 PC (Isaac Sim + Nav2 + Fleet Manager)
 
-- NVIDIA Isaac Sim 5.1.0 설치 및 GPU 드라이버. 설치 경로가 기본값
-  (`~/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release`)과 다르면
-  `ISAAC_SIM_ROOT` 환경변수로 지정하십시오.
-- 주방 3D 에셋: 식당 씬(`nav_robot/assets/lightweight_restaurant/`)은 git에
-  포함되어 있지만, 이 씬이 참조하는 주방 모델
+- NVIDIA Isaac Sim 5.1.0 설치 및 GPU 드라이버. 저장소 코드는 설치 경로를
+  하드코딩하지 않으므로 `ISAAC_SIM_ROOT` 환경변수로 반드시 지정해야 합니다
+  (예: `export ISAAC_SIM_ROOT=~/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release`).
+  `~/.bashrc`에 넣어두면 매 터미널마다 다시 지정할 필요가 없습니다.
+- 주방 3D 에셋: 식당 씬(`assets/lightweight_restaurant/`)은 git에 포함되어
+  있지만, 이 씬이 참조하는 주방 모델
   `assets/Lightwheel_Kitchen/Collected_KitchenRoom/KitchenRoom.usd`는 용량
   때문에 `.gitignore`로 제외되어 있어 클론 직후에는 없습니다. 다운로드 방법은
-  [nav_robot5/assets/Lightwheel_Kitchen/README.md](nav_robot5/assets/Lightwheel_Kitchen/README.md)를
+  [assets/Lightwheel_Kitchen/README.md](assets/Lightwheel_Kitchen/README.md)를
   참고해 압축을 풀고 `assets/Lightwheel_Kitchen/Collected_KitchenRoom/`
-  아래에 두십시오. 다른 폴더(`nav_robot`, `serving_robot`)에 이미 받아둔
-  사본이 있으면 `nav_robot5/tools/sync_restaurant_assets.sh`로 복사할 수
-  있습니다. 없는 상태로 Isaac Sim을 실행하면 주방 부분이 깨진 참조로
-  표시됩니다. `.gitignore`의 `assets/nvidia_restaurant/`,
-  `assets/kenney_furniture/`는 현재 `tools/` 실행 경로에서 쓰이지 않는
-  구버전 프로토타입 스크립트(`serving_robot/isaacpjt/` 아래) 전용이라
-  일반 실행에는 준비할 필요가 없습니다.
+  아래에 두십시오. 없는 상태로 Isaac Sim을 실행하면 주방 부분이 깨진 참조로
+  표시됩니다.
 - ROS 2 Humble Desktop (`rviz2` 포함)
 - apt(rosdep): `ros-humble-nav2-bringup`, `ros-humble-nav2-collision-monitor`,
   `ros-humble-nav2-lifecycle-manager`, `ros-humble-nav2-simple-commander`,
@@ -203,7 +195,8 @@ SLAM 지도 생성), **원격 YOLO PC**(손 안전 감지), **웹 UI PC**(HMI �
   - 지도를 새로 뜰 계획이면 추가: `ros-humble-slam-toolbox`,
     `ros-humble-nav2-map-server`
 - colcon 빌드 대상: `serving_robot_interfaces`, `serving_robot_manager`,
-  `two_wheel_rails`, `hand_safety`(로컬 진단용 빌드만, 기본은 원격 YOLO 사용)
+  `two_wheel_rails`, `m0609_isaac_description`,
+  `hand_safety`(로컬 진단용 빌드만, 기본은 원격 YOLO 사용)
 - Isaac Sim 내장 `python.sh`를 사용하므로 시뮬레이션 스크립트용 별도 pip
   설치는 필요 없습니다.
 
@@ -212,7 +205,7 @@ cd <워크스페이스 경로>
 source /opt/ros/humble/setup.bash
 PYTHONNOUSERSITE=1 ./tools/colcon_safe.py build \
   --symlink-install \
-  --packages-up-to serving_robot_interfaces serving_robot_manager two_wheel_rails hand_safety \
+  --packages-up-to serving_robot_interfaces serving_robot_manager two_wheel_rails m0609_isaac_description hand_safety \
   --executor sequential \
   --event-handlers console_start_end+ desktop_notification- status- terminal_title-
 source install/setup.bash
@@ -282,7 +275,9 @@ export ROS_LOCALHOST_ONLY=0
 
 추가한 뒤 `source ~/.bashrc`를 실행하거나 새 터미널을 여십시오. 이 값이
 이미 `~/.bashrc`에 설정되어 있다면 아래 단계들에서 다시 export할 필요가
-없습니다.
+없습니다. 메인 PC의 `~/.bashrc`에는 `ISAAC_SIM_ROOT`도 함께 추가하십시오
+(값은 "의존성 설치" 절 참고) — 설정되어 있지 않으면 Isaac Sim 실행
+스크립트가 바로 실패합니다.
 
 ### 1. 메인 PC — ① Isaac Sim
 
@@ -372,21 +367,29 @@ ros2 topic hz /robot2/hand_safety/intrusion
 ## 작업공간 구조
 
 ```text
-Rokey_Co3_A1/
-├── nav_robot/          # Isaac Sim 독립 실행 브리지(nav_restaurant_demo.py): /scan, /odom, TF,
-│                       #   direct_nav 미션 주행(주차 이탈, 주방 복귀, 테이블 도킹),
-│                       #   CrossingPedestrian / TypingCustomer 테스트 액터
-├── nav_robot5/         # two_wheel_rails ROS 2 패키지: Nav2 스택, nav2_collision_monitor,
-│                       #   topic_bridge, routes.yaml(map 좌표계 도킹/중앙 통로 좌표), maps/
-├── serving_robot/      # HMI 웹 대시보드 소스(src/serving_hmi) 및 run_hmi.sh
-├── src/                # serving_robot_manager, serving_robot_interfaces, map_gen, hand_safety(무시되는 복사본)
-├── hand_safety/        # 기준 손 감지 및 안전 ROS 2 패키지
+<워크스페이스 경로>/
+├── src/                # ROS 2 패키지 전부(하나의 colcon 워크스페이스)
+│   ├── serving_robot_interfaces/
+│   ├── serving_robot_manager/    # Manager, Fleet Manager, multi_robot.launch.py 등
+│   ├── two_wheel_rails/          # Nav2 스택, nav2_collision_monitor, topic_bridge, routes.yaml, maps/
+│   ├── serving_hmi/              # HMI 웹 대시보드 백엔드 + web_ui/
+│   ├── map_gen/                  # 1회 SLAM 지도 생성
+│   ├── hand_safety/              # 손 감지·안전 ROS 2 패키지
+│   └── ridgeback_m0609_description/  # 로봇 URDF/메시 원본(COLCON_IGNORE, 빌드 대상 아님)
+├── isaacpjt/           # Isaac Sim 전용 스크립트(대부분 콜콘 패키지 아님)
+│   ├── nav_restaurant_demo.py    # 메인 실행 진입점
+│   ├── {pizza,drink,cutlery}_serving.py 등  # 로봇팔 서빙 상태 머신
+│   ├── restaurant_two_wheel_demo.py  # 단일 로봇 진단 하네스(docs/TWO_WHEEL_RAILS_DIAGNOSTIC.md)
+│   └── M0609/          # RMPflow 설정, RG2 그리퍼 메시
+│       └── doosan-robot2/  # m0609_isaac_description 패키지(URDF, colcon 빌드 대상)
+├── assets/             # 3D 씬, 텍스처, 음식 모델 등
+├── maps/               # Nav2용 식당 지도
+├── tools/              # 실행/빌드/진단 스크립트
+├── docs/               # 부가 문서(OCCUPANCY_MAP.md 등)
 ├── .gitignore
+├── AGENTS.md
 └── README.md
 ```
-
-`src/hand_safety`와 `ISAAC_SIM_ROOT` 관련 안내는 "의존성 설치" 절을
-참고하십시오.
 
 ## HMI 테스트 제어
 
@@ -407,5 +410,5 @@ Rokey_Co3_A1/
 재사용하는 일회성 `slam_toolbox` 매핑 모드입니다. 두 실행이 모두
 `cmd_vel`을 사용하므로 위 launch와 동시에 실행하지 마십시오.
 
-전체 절차와 생성된 지도를 `nav_robot5/src/two_wheel_rails/maps/`에 적용하는
+전체 절차와 생성된 지도를 `maps/`에 적용하는
 방법은 [src/map_gen/README.md](src/map_gen/README.md)를 참고하십시오.

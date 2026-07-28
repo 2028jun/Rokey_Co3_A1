@@ -1,0 +1,53 @@
+# 2륜 Ridgeback 레일 주행 진단 하네스
+
+**고정 레일(`routes.yaml`)** + 2륜 직접 추종 + **횡오차(CTE)** 검증. 4-터미널
+프로덕션 실행 흐름(README.md "실행 순서")과는 별개로, `two_wheel_rails`
+패키지 하나만 단일 로봇으로 튜닝할 때 쓰는 진단 도구입니다. `ROS_DOMAIN_ID`를
+설정한 뒤, 저장소 루트에서 `source tools/aliases.sh` 후 `t1` / `t2` / `t3`를
+사용합니다.
+
+## 1회 준비
+
+```bash
+cd <워크스페이스 경로>
+source /opt/ros/humble/setup.bash
+colcon build --packages-select two_wheel_rails
+source install/setup.bash
+```
+
+## 실행 (3 터미널)
+
+```bash
+source <워크스페이스 경로>/tools/aliases.sh
+```
+
+| 터미널 | 명령 |
+|--------|------|
+| 1 | `t1` (Isaac이 자동으로 Play) |
+| 2 | `t2` |
+| 3 | `t3 --table-id 2` |
+
+`t1`: 식당과 2륜 USD, `/clock`, 원시 LiDAR/odom, `/cmd_vel` 구동
+`t2`: 원시 토픽 변환, TF, AMCL/Nav2, RViz
+`t3`: 원본 레일 미션을 2륜 전진·조향 제어로 수행
+
+### T3 예시
+
+```bash
+t3 --table-id 2
+t3 --table-id 2 --no-return-kitchen
+t3 --list-routes
+```
+
+## 설정
+
+- `src/two_wheel_rails/config/routes.yaml` — 레일 (`to_*`, `return_*`)
+- `src/two_wheel_rails/config/rail_check.yaml` — CTE, 주차 후진, **도킹 후 yaw 정렬** (`align_heading_at_dock`)
+
+**주차:** 전진 도킹 → `/cmd_vel` 직선 후진 → `return_*` spine 복귀.
+
+## 패키지 `two_wheel_rails`
+
+`topic_bridge`, `nav2.launch.py`, `rail_mission`
+
+기준 구현: `origin/younggi:nav_robot3` (`fb37644`), 로봇 구동부만 2륜 모델로 교체.

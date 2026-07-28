@@ -1,7 +1,7 @@
 # map_gen — 1회 SLAM 맵 생성 (younggi/map_generate 이식)
 
 식당을 `slam_toolbox`로 한 번 순찰하며 점유맵을 만들어
-`nav_robot5/src/two_wheel_rails/maps/restaurant/slam_map.{pgm,yaml}`에 저장합니다.
+`maps/restaurant/slam_map.{pgm,yaml}`에 저장합니다.
 AMCL / controller_server / bt_navigator는 포함하지 않습니다 — 아직 맵이 없는
 상태이므로 로컬라이제이션이 성립하지 않기 때문입니다.
 
@@ -50,17 +50,16 @@ export NAV_TYPING_CUSTOMER=0
 
 ```bash
 # 1) Isaac Sim (기존과 동일하게 Play) -- 움직이는 사람 비활성화
-cd /home/rokey/cobot3_ws/nav_robot
+cd <워크스페이스 경로>
 export NAV_CROSSING_PEDESTRIAN=0
 export NAV_TYPING_CUSTOMER=0
-export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$HOME/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/exts/isaacsim.ros2.bridge/humble/lib"
-/home/rokey/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/python.sh \
-  isaacpjt/nav_restaurant_demo.py
+export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$ISAAC_SIM_ROOT/exts/isaacsim.ros2.bridge/humble/lib"
+"$ISAAC_SIM_ROOT/python.sh" isaacpjt/nav_restaurant_demo.py
 ```
 
 ```bash
 # 2) topic_bridge + robot_state_publisher + slam_toolbox
-cd /home/rokey/cobot3_ws
+cd <워크스페이스 경로>
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 ros2 launch map_gen slam_mapping.launch.py rviz:=true
@@ -68,7 +67,7 @@ ros2 launch map_gen slam_mapping.launch.py rviz:=true
 
 ```bash
 # 3) 순찰 (1회 커버리지 주행, 완료되면 자동 종료)
-cd /home/rokey/cobot3_ws
+cd <워크스페이스 경로>
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 ros2 run map_gen slam_patrol
@@ -85,7 +84,7 @@ bash src/map_gen/tools/save_slam_map.sh
 기본으로 로드하는 맵)을 **절대 덮어쓰지 않습니다.** `slam_map.pgm`/
 `slam_map.yaml`로 별도 저장됩니다. 실제로 교체하려면:
 
-1. `nav_robot5/src/two_wheel_rails/maps/restaurant/slam_map.yaml`을
+1. `maps/restaurant/slam_map.yaml`을
    RViz 등에서 열어 식당 형태가 제대로 나왔는지 확인
 2. 문제없으면 `two_wheel_rails/launch/nav2.launch.py`의 `map` 인자(또는
    기본 맵 탐색 로직)를 `slam_map.yaml`로 바꾸거나, 기존 `map.yaml`을

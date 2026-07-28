@@ -25,10 +25,11 @@ from rclpy.qos import (
     ReliabilityPolicy,
     qos_profile_sensor_data,
 )
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage, Image
 from std_msgs.msg import Bool, String
 from ultralytics import YOLO
 
+from hand_safety.jpeg_codec import decode_jpeg
 from hand_safety.roi_intrusion import box_intrudes_roi, get_roi_polygon
 
 
@@ -47,6 +48,7 @@ class HandDetectorNode(Node):
             "input_topic",
             "/camera/color/image_raw",
         )
+        self.declare_parameter("input_transport", "raw")
         self.declare_parameter(
             "output_image_topic", "/hand_detection/image"
         )
@@ -60,7 +62,7 @@ class HandDetectorNode(Node):
             "table_arrived_topic", "/serving_robot/table_arrived"
         )
         self.declare_parameter("model_path", str(DEFAULT_MODEL_PATH))
-        self.declare_parameter("confidence", 0.60)
+        self.declare_parameter("confidence", 0.70)
         self.declare_parameter("iou", 0.7)
         # Preserve enough pixels for the relatively small rendered hand.
         self.declare_parameter("image_size", 1280)
@@ -73,7 +75,12 @@ class HandDetectorNode(Node):
         self.declare_parameter("device", "0")
         self.declare_parameter("half", False)
         self.declare_parameter("process_rate", 30.0)
-        self.declare_parameter("confirmation_frames", 3)
+        self.declare_parameter("confirmation_frames", 5)
+        # Simulator-first dynamic self-mask for the robot's dark material.
+        self.declare_parameter("self_mask_enabled", True)
+        self.declare_parameter("self_mask_value_max", 90)
+        self.declare_parameter("self_mask_saturation_max", 130)
+        self.declare_parameter("self_mask_min_box_overlap", 0.20)
         # Defaulted on for the vision GPU test: `ros2 run hand_safety
         # hand_detector_node` alone now opens a live cv2 window and
         # publishes the annotated stream, no --ros-args needed.
@@ -83,6 +90,9 @@ class HandDetectorNode(Node):
         self.input_topic = str(
             self.get_parameter("input_topic").value
         )
+        self.input_transport = str(
+            self.get_parameter("input_transport").value
+        ).lower()
         output_image_topic = str(
             self.get_parameter("output_image_topic").value
         )
@@ -127,6 +137,18 @@ class HandDetectorNode(Node):
         self.confirmation_frames = int(
             self.get_parameter("confirmation_frames").value
         )
+        self.self_mask_enabled = bool(
+            self.get_parameter("self_mask_enabled").value
+        )
+        self.self_mask_value_max = int(
+            self.get_parameter("self_mask_value_max").value
+        )
+        self.self_mask_saturation_max = int(
+            self.get_parameter("self_mask_saturation_max").value
+        )
+        self.self_mask_min_box_overlap = float(
+            self.get_parameter("self_mask_min_box_overlap").value
+        )
         self.publish_annotated_image = bool(
             self.get_parameter("publish_annotated_image").value
         )
@@ -136,6 +158,10 @@ class HandDetectorNode(Node):
 
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError("confidence must be between 0.0 and 1.0")
+        if self.input_transport not in {"raw", "compressed"}:
+            raise ValueError(
+                "input_transport must be either 'raw' or 'compressed'"
+            )
         if not 0.0 <= self.iou <= 1.0:
             raise ValueError("iou must be between 0.0 and 1.0")
         if self.image_size <= 0:
@@ -153,6 +179,16 @@ class HandDetectorNode(Node):
         if self.confirmation_frames <= 0:
             raise ValueError(
                 "confirmation_frames must be greater than zero"
+            )
+        if not 0 <= self.self_mask_value_max <= 255:
+            raise ValueError("self_mask_value_max must be between 0 and 255")
+        if not 0 <= self.self_mask_saturation_max <= 255:
+            raise ValueError(
+                "self_mask_saturation_max must be between 0 and 255"
+            )
+        if not 0.0 <= self.self_mask_min_box_overlap <= 1.0:
+            raise ValueError(
+                "self_mask_min_box_overlap must be between 0.0 and 1.0"
             )
         if self.device != "cpu" and not torch.cuda.is_available():
             raise RuntimeError(
@@ -196,7 +232,7 @@ class HandDetectorNode(Node):
 
         self.bridge = CvBridge()
         self.frame_lock = threading.Lock()
-        self.latest_message: Image | None = None
+        self.latest_message: Image | CompressedImage | None = None
         self.frame_sequence = 0
         self.last_processed_sequence = 0
         self.previous_time: float | None = None
@@ -223,8 +259,13 @@ class HandDetectorNode(Node):
         # Sensor-data QoS keeps the camera queue short, so the executor gets
         # recent frames instead of building an unbounded image backlog.
         self.image_callback_group = MutuallyExclusiveCallbackGroup()
+        input_message_type = (
+            CompressedImage
+            if self.input_transport == "compressed"
+            else Image
+        )
         self.rgb_subscription = self.create_subscription(
-            Image,
+            input_message_type,
             self.input_topic,
             self.image_callback,
             qos_profile=qos_profile_sensor_data,
@@ -248,7 +289,8 @@ class HandDetectorNode(Node):
         )
 
         self.get_logger().info(
-            f"Subscribing to RGB images on {self.input_topic}"
+            f"Subscribing to {self.input_transport} RGB images on "
+            f"{self.input_topic}"
         )
         self.get_logger().info(
             f"Publishing JSON detections to {detections_topic} and ROI "
@@ -267,7 +309,7 @@ class HandDetectorNode(Node):
             f"Hand inference is disabled until {table_arrived_topic} is true"
         )
 
-    def image_callback(self, message: Image) -> None:
+    def image_callback(self, message: Image | CompressedImage) -> None:
         with self.frame_lock:
             self.latest_message = message
             self.frame_sequence += 1
@@ -321,9 +363,7 @@ class HandDetectorNode(Node):
         self.last_processed_sequence = frame_sequence
 
         try:
-            frame = self.bridge.imgmsg_to_cv2(
-                message, desired_encoding="bgr8"
-            )
+            frame = self.message_to_bgr(message)
             if not self.input_size_logged:
                 height, width = frame.shape[:2]
                 self.get_logger().info(
@@ -350,11 +390,26 @@ class HandDetectorNode(Node):
             frame_height, frame_width = frame.shape[:2]
             roi_polygon = get_roi_polygon(frame_width, frame_height)
             roi_detections = []
+            self_masked_detections = []
+            robot_self_mask = (
+                self.build_robot_self_mask(frame)
+                if self.self_mask_enabled and candidate_detections
+                else None
+            )
             for detection in candidate_detections:
                 if box_intrudes_roi(
                     detection["bbox_xyxy"], roi_polygon
                 ):
                     detection["roi_intrusion"] = True
+                    mask_overlap = self.box_mask_overlap(
+                        detection["bbox_xyxy"], robot_self_mask
+                    )
+                    detection["self_mask_overlap"] = mask_overlap
+                    if mask_overlap >= self.self_mask_min_box_overlap:
+                        detection["self_masked"] = True
+                        self_masked_detections.append(detection)
+                        continue
+                    detection["self_masked"] = False
                     roi_detections.append(detection)
 
             # Recheck the arrival state after GPU inference before confirming
@@ -453,6 +508,8 @@ class HandDetectorNode(Node):
                 "roi_polygon": [list(point) for point in roi_polygon],
                 "roi_intrusion": intrusion_detected,
                 "detections": detections,
+                "self_mask_enabled": self.self_mask_enabled,
+                "self_masked_detections": self_masked_detections,
             }
             with self.detection_state_lock:
                 # Recheck at the publication boundary. The callback uses this
@@ -493,6 +550,41 @@ class HandDetectorNode(Node):
                 f"{traceback.format_exc()}"
             )
 
+    def build_robot_self_mask(self, frame: Any) -> Any:
+        """Return a per-frame mask of dark, low-saturation robot pixels."""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(
+            hsv,
+            np.asarray([0, 0, 0], dtype=np.uint8),
+            np.asarray(
+                [
+                    179,
+                    self.self_mask_saturation_max,
+                    self.self_mask_value_max,
+                ],
+                dtype=np.uint8,
+            ),
+        )
+        # Close small specular gaps without dilating over a nearby hand.
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    @staticmethod
+    def box_mask_overlap(box_xyxy: list[int], mask: Any) -> float:
+        """Return the fraction of a detection box covered by a binary mask."""
+        if mask is None or getattr(mask, "ndim", 0) != 2:
+            return 0.0
+        height, width = mask.shape
+        x1, y1, x2, y2 = box_xyxy
+        x1 = max(0, min(width, int(x1)))
+        x2 = max(0, min(width, int(x2)))
+        y1 = max(0, min(height, int(y1)))
+        y2 = max(0, min(height, int(y2)))
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+        crop = mask[y1:y2, x1:x2]
+        return float(cv2.countNonZero(crop)) / float(crop.size)
+
     def warn_throttled(
         self, key: str, message: str, period: float = 5.0
     ) -> None:
@@ -501,6 +593,16 @@ class HandDetectorNode(Node):
         if last_time is None or now - last_time >= period:
             self.warning_times[key] = now
             self.get_logger().warning(message)
+
+    def message_to_bgr(
+        self, message: Image | CompressedImage
+    ) -> Any:
+        """Convert the configured ROS image transport into a BGR frame."""
+        if self.input_transport == "compressed":
+            return decode_jpeg(message.data)
+        return self.bridge.imgmsg_to_cv2(
+            message, desired_encoding="bgr8"
+        )
 
     @staticmethod
     def bgr_frame_to_image_message(frame: Any, header: Any) -> Image:

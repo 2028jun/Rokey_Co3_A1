@@ -1,17 +1,19 @@
 # hand_safety
 
-ROS 2 Humble에서 `sensor_msgs/msg/Image` RGB 토픽을 구독해 HaGRIDv2
+ROS 2 Humble에서 raw 또는 JPEG 압축 RGB 토픽을 구독해 HaGRIDv2
 YOLOv10n 손 탐지를 수행합니다. 원본 모델의 제스처 클래스는 모두
 `hand` 단일 클래스로 통합하고 class-agnostic NMS를 적용합니다.
 
 ## 토픽
 
-- 입력: `/serving_robot/table_camera/color/image_raw`
+- 입력: `/camera/color/image_raw`
   (`sensor_msgs/msg/Image`)
+- 원격 입력: `/camera/color/image_raw/compressed`
+  (`sensor_msgs/msg/CompressedImage`, `input_transport:=compressed`)
 - 박스가 표시된 영상: `/hand_detection/image` (`sensor_msgs/msg/Image`,
   디버그 옵션을 켰을 때만 발행)
 - 탐지 결과: `/hand_detection/detections` (`std_msgs/msg/String`, JSON)
-- ROI 침입 상태: `/hand_safety/roi_intrusion` (`std_msgs/msg/Bool`)
+- ROI 침입 상태: `/hand_safety/intrusion` (`std_msgs/msg/Bool`)
 - 도착 상태 입력: `/serving_robot/table_arrived` (`std_msgs/msg/Bool`)
 
 `/hand_detection/detections`에는 단일 클래스 ID `0`, 클래스 이름
@@ -33,7 +35,7 @@ YOLOv10n 손 탐지를 수행합니다. 원본 모델의 제스처 클래스는 
 ## 빌드
 
 ```bash
-cd "$(git rev-parse --show-toplevel)/hand_safety"
+cd "$(git rev-parse --show-toplevel)"
 source /opt/ros/humble/setup.bash
 colcon build --symlink-install --packages-select hand_safety
 source install/setup.bash
@@ -61,6 +63,15 @@ ros2 run hand_safety hand_detector_node
 ros2 run hand_safety hand_detector_node \
   --ros-args \
   -p input_topic:=/camera/color/image_raw
+```
+
+다른 컴퓨터에서 JPEG 입력만 받는 예:
+
+```bash
+ros2 run hand_safety hand_detector_node \
+  --ros-args \
+  -p input_topic:=/camera/color/image_raw/compressed \
+  -p input_transport:=compressed
 ```
 
 CUDA가 사용 가능한 환경에서 GPU를 지정하는 예:
@@ -98,16 +109,41 @@ ros2 run hand_safety hand_detector_node \
 ros2 run rqt_image_view rqt_image_view /hand_detection/image
 ```
 
+Manager와 detector를 항상 함께 실행하려면 워크스페이스 루트에서
+`serving_robot_manager`도 같이 빌드한 뒤 통합 launch를 사용합니다.
+
+```bash
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 launch serving_robot_manager vision_manager_nav2.launch.py
+```
+
+박스와 ROI가 표시된 비전 화면을 발행하려면:
+
+```bash
+ros2 launch serving_robot_manager vision_manager_nav2.launch.py vision_debug:=true
+```
+
 ## 확인
 
 ```bash
-ros2 topic info /serving_robot/table_camera/color/image_raw
-ros2 topic hz /serving_robot/table_camera/color/image_raw
+ros2 topic info /camera/color/image_raw
+ros2 topic hz /camera/color/image_raw
 ros2 topic echo /serving_robot/table_arrived
+ros2 topic echo /hand_safety/intrusion
 ros2 topic echo /hand_detection/detections
 ros2 run rqt_image_view rqt_image_view /hand_detection/image
 ```
 
-입력 토픽은 `sensor_msgs/msg/Image`여야 합니다.
-`sensor_msgs/msg/CompressedImage` 토픽은 이 노드에서 직접 구독하지
-않습니다.
+`input_transport:=raw`는 `sensor_msgs/msg/Image`, `compressed`는 JPEG
+`sensor_msgs/msg/CompressedImage` 토픽을 구독합니다. 압축 입력에서는 원본
+해상도와 헤더를 유지한 채 OpenCV로 JPEG를 해제한 뒤 같은 추론 경로를
+사용합니다.
+
+## 알려진 캘리브레이션 이슈
+
+`vision-test` GPU 검증에서 RG2 그리퍼가 손으로 오탐되어 ROI 침입이
+계속 `true`로 나오는 케이스가 확인됐습니다. 카메라 구도별 그리퍼
+박스 좌표가 제공되지 않아 임의 제외 마스크는 적용하지 않았습니다.
+실제 프레임에서 ROI 다각형 또는 오탐 제외 영역을 다시 캘리브레이션해야
+최종 안전 판정을 신뢰할 수 있습니다.
