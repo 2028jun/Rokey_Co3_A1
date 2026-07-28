@@ -36,7 +36,86 @@
 
 ## 시스템 설계 및 플로우차트
 
-<!-- TODO: 시스템 아키텍처 다이어그램 및 플로우차트 추가 -->
+### 시스템 아키텍처 (PC 3대 + 로봇 2대)
+
+```mermaid
+flowchart LR
+    subgraph WebPC["웹 UI PC"]
+        Browser["브라우저<br/>주문 화면 · 관리자 화면"] <--> HMI["serving_hmi<br/>FastAPI + WebSocket"]
+    end
+
+    subgraph MainPC["메인 PC — Isaac Sim + Nav2 + Fleet Manager"]
+        Fleet["Fleet Manager<br/>fleet_manager_node"]
+
+        subgraph Robot1["robot1"]
+            M1["Manager"] --> N1["Nav2 스택<br/>AMCL/Planner/Controller/BT<br/>+ nav2_collision_monitor"]
+            M1 --> A1["isaac_subsystem_adapter<br/>로봇팔 pick & place"]
+        end
+
+        subgraph Robot2["robot2"]
+            M2["Manager"] --> N2["Nav2 스택"]
+            M2 --> A2["로봇팔 pick & place"]
+        end
+
+        Isaac["Isaac Sim<br/>nav_restaurant_demo.py<br/>Ridgeback + M0609/RG2 x2, LiDAR, 카메라"]
+
+        Fleet --> M1
+        Fleet --> M2
+        N1 <--> Isaac
+        N2 <--> Isaac
+        A1 <--> Isaac
+        A2 <--> Isaac
+    end
+
+    subgraph YoloPC["원격 YOLO PC"]
+        Y1["hand_detector<br/>robot1"]
+        Y2["hand_detector<br/>robot2"]
+    end
+
+    HMI -- "/manager/order" --> Fleet
+    HMI -. "직접 호출(개별 검증용)" .-> M1
+    HMI -. "직접 호출(개별 검증용)" .-> M2
+    Isaac -- "camera/.../compressed" --> Y1
+    Isaac -- "camera/.../compressed" --> Y2
+    Y1 -- "hand_safety/intrusion" --> M1
+    Y2 -- "hand_safety/intrusion" --> M2
+    Isaac -- "카메라 · 지도 · 로봇 상태" --> HMI
+```
+
+### 주문 처리 플로우 (로봇 1대 기준 `system/status`)
+
+```mermaid
+stateDiagram-v2
+    state "0: 대기" as Idle
+    state "1: 주방 복귀" as Return
+    state "2: 음식 스폰" as Spawn
+    state "3: 테이블 이동" as Move
+    state "4: 로봇팔 서빙" as Serve
+    state "5: 손 침입 일시정지" as Paused
+    state "6: 완료" as Done
+    state "7: 실패" as Failed
+
+    [*] --> Idle
+    Idle --> Return: 초기 주방 위치 미확인
+    Idle --> Spawn: 주문 접수
+    Return --> Spawn
+    Spawn --> Move
+    Move --> Serve
+    Serve --> Paused: ROI에 손 5프레임 이상 감지 (arm pause 99)
+    Paused --> Serve: 손 빠짐 (resume 98)
+    Serve --> Return: 서빙 완료
+    Return --> Done
+    Done --> [*]
+
+    Spawn --> Failed
+    Move --> Failed
+    Serve --> Failed
+    Failed --> Idle: /manager/reset_fault
+```
+
+Fleet Manager는 유휴 상태(`0` 또는 `6`)인 로봇 중 `robot1`을 우선 배정하고,
+`robot1`이 주행 중이면 다음 주문을 `robot2`에 배정합니다. 손 안전 토픽이
+서빙 중 2초 이상 끊기면 fail-safe로 상태 `7`이 됩니다.
 
 ## 운영체제 및 환경
 
