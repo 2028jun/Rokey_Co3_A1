@@ -3,8 +3,8 @@
 
 Run with Isaac's python (not system python), for example:
 
-  cd ~/git/Rokey_Co3_A1/nav_robot5
-  /path/to/isaacsim/.../python.sh tools/generate_occupancy_map_isaac.py
+  cd <워크스페이스 경로>
+  "$ISAAC_SIM_ROOT/python.sh" tools/generate_occupancy_map_isaac.py
 
 Outputs:
   maps/restaurant/map.pgm

@@ -1,14 +1,15 @@
-# nav_robot5 — 2륜 Ridgeback 레일 주행
+# 2륜 Ridgeback 레일 주행 진단 하네스
 
-**고정 레일(`routes.yaml`)** + 2륜 직접 추종 + **횡오차(CTE)** 검증.
-각 PC의 `~/.bashrc`에 서로 다른 `ROS_DOMAIN_ID`를 설정한 뒤, 저장소 루트에서
-`source tools/aliases.sh` 후 `t1` / `t2` / `t3`를 사용합니다.
+**고정 레일(`routes.yaml`)** + 2륜 직접 추종 + **횡오차(CTE)** 검증. 4-터미널
+프로덕션 실행 흐름(README.md "실행 순서")과는 별개로, `two_wheel_rails`
+패키지 하나만 단일 로봇으로 튜닝할 때 쓰는 진단 도구입니다. `ROS_DOMAIN_ID`를
+설정한 뒤, 저장소 루트에서 `source tools/aliases.sh` 후 `t1` / `t2` / `t3`를
+사용합니다.
 
 ## 1회 준비
 
 ```bash
-cd /home/rokey/cobot3_ws/nav_robot5
-./tools/sync_restaurant_assets.sh
+cd <워크스페이스 경로>
 source /opt/ros/humble/setup.bash
 colcon build --packages-select two_wheel_rails
 source install/setup.bash
@@ -17,7 +18,7 @@ source install/setup.bash
 ## 실행 (3 터미널)
 
 ```bash
-source /home/rokey/cobot3_ws/nav_robot5/tools/aliases.sh
+source <워크스페이스 경로>/tools/aliases.sh
 ```
 
 | 터미널 | 명령 |

@@ -11,7 +11,7 @@ from isaac_scene_utils import find_serving_robot_prim, prim_world_pose
 
 
 WORKSPACE = Path(
-    os.environ.get("COBOT3_WS", Path(__file__).resolve().parents[1])
+    os.environ.get("PROJECT_WS", Path(__file__).resolve().parents[1])
 ).resolve()
 
 PLATE_RACK_PATH = "/World/ServingPlateRack"

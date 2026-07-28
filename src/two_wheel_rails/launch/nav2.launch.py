@@ -15,7 +15,7 @@ from nav2_common.launch import RewrittenYaml
 
 def _workspace_root() -> str:
     return os.environ.get(
-        "NAV_ROBOT5_WS",
+        "PROJECT_WS",
         os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")),
     )
 

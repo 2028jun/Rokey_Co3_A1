@@ -103,8 +103,8 @@ LEAN_TARGET = (
 PERSON_PRIM_PATH = "/World/HandSafetyTestActor"
 HAND_ONLY_PRIM_PATH = "/World/HandSafetyTestHand"
 HAND_ONLY_USD = (
-    Path(__file__).resolve().parents[2]
-    / "nav_robot/assets/hand_safety/f_business_02_right_hand.usda"
+    Path(__file__).resolve().parents[1]
+    / "assets/hand_safety/f_business_02_right_hand.usda"
 )
 
 # --- Reach timing. The task asks for a reach every 5-10 seconds.

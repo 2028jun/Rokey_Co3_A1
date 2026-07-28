@@ -16,7 +16,7 @@ from m0609_rmpflow_controller import RMPFlowController
 
 
 WORKSPACE = Path(
-    os.environ.get("COBOT3_WS", Path(__file__).resolve().parents[1])
+    os.environ.get("PROJECT_WS", Path(__file__).resolve().parents[1])
 ).resolve()
 RMPFLOW_DIR = WORKSPACE / "isaacpjt/M0609/rmpflow"
 M0609_RMPFLOW_URDF = (

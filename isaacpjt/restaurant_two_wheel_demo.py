@@ -16,10 +16,13 @@ import threading
 import time
 from pathlib import Path
 
-ISAAC_SIM_ROOT = os.environ.get(
-    "ISAAC_SIM_ROOT",
-    str(Path.home() / "dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release"),
-)
+ISAAC_SIM_ROOT = os.environ.get("ISAAC_SIM_ROOT")
+if not ISAAC_SIM_ROOT:
+    raise RuntimeError(
+        "ISAAC_SIM_ROOT가 설정되어 있지 않습니다. "
+        "export ISAAC_SIM_ROOT=/path/to/isaac_sim/isaacsim/_build/linux-x86_64/release "
+        "실행 후 다시 시도하세요."
+    )
 _ros_bridge_lib = Path(ISAAC_SIM_ROOT) / "exts/isaacsim.ros2.bridge/humble/lib"
 os.environ.setdefault("ROS_DISTRO", "humble")
 os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
@@ -76,21 +79,13 @@ from rosgraph_msgs.msg import Clock
 from builtin_interfaces.msg import Time as RosTime
 
 WORKSPACE = Path(
-    os.environ.get("NAV_ROBOT5_WS", Path(__file__).resolve().parents[1])
+    os.environ.get("PROJECT_WS", Path(__file__).resolve().parents[1])
 ).resolve()
 
 RESTAURANT_USD = (
     WORKSPACE / "assets/lightweight_restaurant/lightweight_pizza_restaurant.usda"
 )
-if not RESTAURANT_USD.is_file():
-    RESTAURANT_USD = WORKSPACE.parent / "nav_robot" / "assets/lightweight_restaurant/lightweight_pizza_restaurant.usda"
-
 ROBOT_USD = WORKSPACE / "assets/diagnostics/two_wheel_serving_robot_v2.usd"
-if not ROBOT_USD.is_file():
-    ROBOT_USD = (
-        WORKSPACE.parent
-        / "nav_robot/assets/diagnostics/two_wheel_serving_robot_v2.usd"
-    )
 ROBOT_ASSET_ROOT = "/two_wheel_ridgeback_serving_robot"
 
 SPAWN_POSITION = Gf.Vec3d(0.00, 5.25, 0.002)

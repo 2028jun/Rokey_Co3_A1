@@ -1,9 +1,9 @@
-# nav_robot5 autonomous path simplification patch
+# two_wheel_rails autonomous path simplification patch
 
-Copy these files into `nav_robot5/src/two_wheel_rails/`, rebuild, and run:
+Copy these files into `src/two_wheel_rails/`, rebuild, and run:
 
 ```bash
-cd /home/rokey/cobot3_ws/nav_robot5
+cd <워크스페이스 경로>
 source /opt/ros/humble/setup.bash
 colcon build --symlink-install --packages-select two_wheel_rails
 source install/setup.bash

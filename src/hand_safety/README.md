@@ -115,13 +115,13 @@ Manager와 detector를 항상 함께 실행하려면 워크스페이스 루트�
 ```bash
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-ros2 launch serving_robot_manager vision_manager.launch.py
+ros2 launch serving_robot_manager vision_manager_nav2.launch.py
 ```
 
 박스와 ROI가 표시된 비전 화면을 발행하려면:
 
 ```bash
-ros2 launch serving_robot_manager vision_manager.launch.py vision_debug:=true
+ros2 launch serving_robot_manager vision_manager_nav2.launch.py vision_debug:=true
 ```
 
 ## 확인

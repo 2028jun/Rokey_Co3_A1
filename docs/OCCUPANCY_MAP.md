@@ -1,4 +1,4 @@
-# Occupancy Map for nav_robot
+# Occupancy Map 생성
 
 1차 개발은 Isaac Sim **Occupancy Map Generator**로 정답 맵을 뽑고 Nav2에 넣습니다.
 SLAM은 2차 범위입니다.
@@ -6,15 +6,11 @@ SLAM은 2차 범위입니다.
 ## 준비
 
 - Isaac Sim 5.1
-- 워크스페이스: `nav_robot/`
+- 워크스페이스: 저장소 루트 (`<워크스페이스 경로>`)
 - 식당 스테이지: `assets/lightweight_restaurant/lightweight_pizza_restaurant.usda`
-- Lightwheel Kitchen 런타임 (대용량, gitignore):
-
-```bash
-cd nav_robot/assets/Lightwheel_Kitchen
-# 이미 팀 머신에 serving_robot 자산이 있으면:
-ln -sfn ../../../serving_robot/assets/Lightwheel_Kitchen/Collected_KitchenRoom Collected_KitchenRoom
-```
+- Lightwheel Kitchen 런타임(대용량, gitignore): 다운로드 방법은
+  [../assets/Lightwheel_Kitchen/README.md](../assets/Lightwheel_Kitchen/README.md)를
+  참고해 `assets/Lightwheel_Kitchen/Collected_KitchenRoom/`에 배치하십시오.
 
 ## Isaac Occupancy Map Generator 절차
 
@@ -27,18 +23,17 @@ ln -sfn ../../../serving_robot/assets/Lightwheel_Kitchen/Collected_KitchenRoom C
    - upper bound: `(6.5, 9.5, 0.35)`
 4. Cell size / resolution: `0.05` m (Nav2 params와 동일).
 5. Compute 후 **Image** / **YAML** 로 저장:
-   - `nav_robot/maps/restaurant/map.pgm`
-   - `nav_robot/maps/restaurant/map.yaml`
+   - `maps/restaurant/map.pgm`
+   - `maps/restaurant/map.yaml`
 
 ### B. CLI (권장, Isaac python)
 
 Nav demo와 **동시에** 돌리지 마세요 (Isaac 인스턴스 충돌).
 
 ```bash
-cd ~/git/Rokey_Co3_A1/nav_robot
+cd <워크스페이스 경로>
 # Isaac demo가 꺼진 상태에서
-/home/rokey/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/python.sh \
-  tools/generate_occupancy_map_isaac.py
+"$ISAAC_SIM_ROOT/python.sh" tools/generate_occupancy_map_isaac.py
 ```
 
 `origin`은 Generator/스크립트가 내보낸 값을 **그대로** 쓰고, AMCL/waypoint의 `map` 프레임과 일치하는지 RViz에서 확인합니다.
@@ -89,21 +84,22 @@ rviz2
 
 - 레이저 점이 맵 벽·테이블 윤곽에 겹침
 - `/amcl_pose`가 kitchen 근처 `(≈0.21, 5.25)`에서 안정
-- `config/waypoints.yaml`의 table dock이 free 공간(테이블 **옆**)에 있음
+- `src/two_wheel_rails/config/routes.yaml`의 dock 좌표가 free 공간(테이블 **옆**)에 있음
 
 어긋나면 Generator `origin`/bounds와 `map→odom` identity TF를 확인합니다.
 
-waypoint 좌표 (serving dock과 동일):
+dock 좌표 (`routes.yaml` 기준):
 
-| id | name | (x, y) |
-|----|------|--------|
-| 0 | table_0 | (-1.82, -2.20) |
-| 1 | table_1 | (1.82, -2.20) |
-| 2 | table_2 | (-1.82, 0.70) |
-| 3 | table_3 | (1.82, 0.70) |
-| 4 | kitchen | (0.21, 5.25) |
+| route | dock (x, y) |
+|-------|-------------|
+| to_0 | (-1.82, -2.20) |
+| to_1 | (1.82, -2.20) |
+| to_2 | (-1.82, 0.70) |
+| to_3 | (1.82, 0.70) |
+| kitchen | (0.21, 4.90) |
+| spawn | (0.00, 5.25) |
 
-AMCL/라이다는 테이블 **이름**을 인식하지 않습니다. 정렬 = 맵 점유 + 레이저 윤곽 + waypoint 좌표가 같은 `map` 프레임에 맞는지입니다.
+AMCL/라이다는 dock 이름을 인식하지 않습니다. 정렬 = 맵 점유 + 레이저 윤곽 + dock 좌표가 같은 `map` 프레임에 맞는지입니다.
 
 ## 플레이스홀더 맵
 
@@ -118,6 +114,6 @@ python3 tools/generate_placeholder_map.py
 ## Nav2에서 로드
 
 ```bash
-ros2 launch nav_robot_bringup nav2_restaurant.launch.py \
+ros2 launch two_wheel_rails nav2.launch.py \
   map:=$PWD/maps/restaurant/map.yaml
 ```

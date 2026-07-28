@@ -2,7 +2,11 @@
 set -euo pipefail
 
 workspace_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-isaac_root="${ISAAC_SIM_ROOT:-/home/rokey/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release}"
+if [[ -z "${ISAAC_SIM_ROOT:-}" ]]; then
+  echo "ISAAC_SIM_ROOT가 설정되어 있지 않습니다. export ISAAC_SIM_ROOT=/path/to/isaac_sim/isaacsim/_build/linux-x86_64/release 실행 후 다시 시도하세요." >&2
+  exit 1
+fi
+isaac_root="$ISAAC_SIM_ROOT"
 isaac_python="$isaac_root/python.sh"
 bridge_lib="$isaac_root/exts/isaacsim.ros2.bridge/humble/lib"
 
@@ -24,4 +28,4 @@ export NAV_DOCK_XY_TOLERANCE_M="${NAV_DOCK_XY_TOLERANCE_M:-0.025}"
 export NAV_DOCK_YAW_TOLERANCE_DEG="${NAV_DOCK_YAW_TOLERANCE_DEG:-1.0}"
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$bridge_lib"
 cd "$workspace_root"
-exec "$isaac_python" nav_robot/isaacpjt/nav_restaurant_demo.py "$@"
+exec "$isaac_python" isaacpjt/nav_restaurant_demo.py "$@"

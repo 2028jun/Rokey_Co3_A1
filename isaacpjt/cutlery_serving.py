@@ -13,7 +13,7 @@ from isaac_scene_utils import find_serving_robot_prim, prim_world_pose
 
 
 WORKSPACE = Path(
-    os.environ.get("COBOT3_WS", Path(__file__).resolve().parents[1])
+    os.environ.get("PROJECT_WS", Path(__file__).resolve().parents[1])
 ).resolve()
 CUTLERY_BOX_GLB = WORKSPACE / "assets/source_food/cutlery_box.glb"
 CUTLERY_WOOD_TEXTURE = WORKSPACE / "assets/source_food/cutlery_box_wood.png"

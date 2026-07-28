@@ -5,8 +5,7 @@ Loads the lightweight pizza restaurant + Ridgeback USD, publishes
 and applies /nav_robot/cmd_vel (differential vx+yaw) to wheels.
 
 Run with Isaac's python, for example:
-  /home/rokey/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/python.sh \\
-    isaacpjt/nav_restaurant_demo.py
+  "$ISAAC_SIM_ROOT/python.sh" isaacpjt/nav_restaurant_demo.py
 """
 
 from __future__ import annotations
@@ -32,14 +31,16 @@ DOCK_YAW_TOLERANCE_RAD = math.radians(
 )
 
 WORKSPACE = Path(
-    os.environ.get("NAV_ROBOT_WS", Path(__file__).resolve().parents[1])
+    os.environ.get("PROJECT_WS", Path(__file__).resolve().parents[1])
 ).resolve()
-SERVING_WORKSPACE = WORKSPACE.parent / "serving_robot"
 
-ISAAC_SIM_ROOT = os.environ.get(
-    "ISAAC_SIM_ROOT",
-    str(Path.home() / "dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release"),
-)
+ISAAC_SIM_ROOT = os.environ.get("ISAAC_SIM_ROOT")
+if not ISAAC_SIM_ROOT:
+    raise RuntimeError(
+        "ISAAC_SIM_ROOT가 설정되어 있지 않습니다. "
+        "export ISAAC_SIM_ROOT=/path/to/isaac_sim/isaacsim/_build/linux-x86_64/release "
+        "실행 후 다시 시도하세요."
+    )
 _ros_bridge_lib = Path(ISAAC_SIM_ROOT) / "exts/isaacsim.ros2.bridge/humble/lib"
 os.environ.setdefault("ROS_DISTRO", "humble")
 os.environ.setdefault("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
@@ -114,8 +115,7 @@ except (ImportError, ModuleNotFoundError) as _task_command_import_error:
         flush=True,
     )
 
-sys.path.insert(0, str(SERVING_WORKSPACE / "isaacpjt"))
-sys.path.insert(0, str(SERVING_WORKSPACE / "isaacpjt/M0609/rmpflow"))
+sys.path.insert(0, str(WORKSPACE / "isaacpjt"))
 sys.path.insert(0, str(WORKSPACE / "isaacpjt/M0609/rmpflow"))
 # Defaults when serving food modules cannot be imported (nav-only path).
 GRIP_CONTACT_STATIC_FRICTION = float(os.environ.get("NAV_GRIP_STATIC_FRICTION", "6.0"))
@@ -153,23 +153,16 @@ from table_route_module import build_table_route
 
 
 _package_roots = [
-    WORKSPACE / "install/m0609_isaac_description/share",
     WORKSPACE / "install/ridgeback_m0609_description/share",
-    WORKSPACE.parent / "install/m0609_isaac_description/share",
-    WORKSPACE.parent / "install/ridgeback_m0609_description/share",
-    WORKSPACE.parent / "serving_robot/install/m0609_isaac_description/share",
-    WORKSPACE.parent / "serving_robot/install/ridgeback_m0609_description/share",
 ]
 os.environ["ROS_PACKAGE_PATH"] = ":".join(
     [str(path) for path in _package_roots if path.is_dir()]
     + ([os.environ["ROS_PACKAGE_PATH"]] if os.environ.get("ROS_PACKAGE_PATH") else [])
 )
 
-# The serving workspace owns the canonical robot model.  nav_robot contains an
-# older description copy without the split sliding tray; never use that copy
-# to regenerate or overwrite the shared v2 USD.
+# Canonical robot model, includes the split sliding tray.
 URDF_PATH = (
-    SERVING_WORKSPACE
+    WORKSPACE
     / "src/ridgeback_m0609_description/urdf/ridgeback_m0609.urdf"
 )
 RESTAURANT_USD = (
@@ -188,14 +181,14 @@ ROBOT_USD = (
 )
 ROBOT_ASSET_ROOT = "/two_wheel_ridgeback_serving_robot"
 M0609_VISUAL_USD = (
-    SERVING_WORKSPACE
+    WORKSPACE
     / "isaacpjt/M0609/Collected_m0609_camera2/m0609_gripper.usd"
 )
 M0609_DARK_SAFETY_MATERIAL_USD = (
     WORKSPACE / "assets/materials/m0609_dark_safety.usda"
 )
 D455_ASSET_USD = (
-    SERVING_WORKSPACE
+    WORKSPACE
     / "isaacpjt/M0609/Collected_m0609_camera2/"
     "omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/"
     "Isaac/5.1/Isaac/Sensors/Intel/RealSense/rsd455.usd"

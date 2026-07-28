@@ -19,21 +19,17 @@ import traceback
 from pathlib import Path
 
 
-WORKSPACE = Path(__file__).resolve().parents[2]
-NAV_WORKSPACE = WORKSPACE / "nav_robot"
-SERVING_WORKSPACE = WORKSPACE / "serving_robot"
+WORKSPACE = Path(__file__).resolve().parents[1]
 
 # nav_restaurant_demo owns the proven two-robot composition and physics setup.
 # Importing it creates SimulationApp, but its main() (ROS bridges, sensors,
 # pedestrians and navigation) is not called by this test.
-os.environ.setdefault("NAV_ROBOT_WS", str(NAV_WORKSPACE))
+os.environ.setdefault("PROJECT_WS", str(WORKSPACE))
 os.environ.setdefault("NAV_CROSSING_PEDESTRIAN", "0")
 os.environ.setdefault("NAV_TYPING_CUSTOMER", "0")
 
-if str(NAV_WORKSPACE / "isaacpjt") not in sys.path:
-    sys.path.insert(0, str(NAV_WORKSPACE / "isaacpjt"))
-if str(SERVING_WORKSPACE / "isaacpjt") not in sys.path:
-    sys.path.insert(0, str(SERVING_WORKSPACE / "isaacpjt"))
+if str(WORKSPACE / "isaacpjt") not in sys.path:
+    sys.path.insert(0, str(WORKSPACE / "isaacpjt"))
 
 import nav_restaurant_demo as demo
 from pxr import Gf, UsdGeom
