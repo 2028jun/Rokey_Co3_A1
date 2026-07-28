@@ -39,13 +39,19 @@ class Nav2LifecycleSequencer(Node):
 
     def __init__(self) -> None:
         super().__init__("nav2_lifecycle_sequencer")
-        self.declare_parameter("service_wait_timeout_sec", 60.0)
-        self.declare_parameter("transition_timeout_sec", 2.0)
+        # A single 60 second wait made robot2 look dead whenever its first
+        # Fast DDS service discovery window was missed. Short probes plus the
+        # idempotent outer retry continue startup as soon as each service is
+        # visible, without reconfiguring nodes that are already active.
+        self.declare_parameter("service_wait_timeout_sec", 2.0)
+        self.declare_parameter("transition_timeout_sec", 5.0)
         # Costmap activation can legitimately block while the first map->base
         # transform catches up to simulation time. Keep polling the node state
         # long enough for that transition instead of issuing it twice.
         self.declare_parameter("state_wait_timeout_sec", 30.0)
         self.declare_parameter("transition_retries", 3)
+        self.declare_parameter("startup_retries", 90)
+        self.declare_parameter("startup_retry_delay_sec", 1.0)
         self._service_wait_timeout = float(
             self.get_parameter("service_wait_timeout_sec").value
         )
@@ -58,6 +64,18 @@ class Nav2LifecycleSequencer(Node):
         self._transition_retries = int(
             self.get_parameter("transition_retries").value
         )
+        self._startup_retries = int(
+            self.get_parameter("startup_retries").value
+        )
+        self._startup_retry_delay = float(
+            self.get_parameter("startup_retry_delay_sec").value
+        )
+        if self._service_wait_timeout <= 0.0:
+            raise ValueError("service_wait_timeout_sec must be greater than zero")
+        if self._startup_retries < 1:
+            raise ValueError("startup_retries must be at least 1")
+        if self._startup_retry_delay < 0.0:
+            raise ValueError("startup_retry_delay_sec must be non-negative")
         self._change_clients: dict[str, object] = {}
         self._state_clients: dict[str, object] = {}
 
@@ -227,12 +245,38 @@ class Nav2LifecycleSequencer(Node):
         self.get_logger().info("all Nav2 lifecycle nodes are verified active")
         return True
 
+    def start_with_retries(self) -> bool:
+        """Resume partial lifecycle startup after transient DDS timeouts.
+
+        Every transition in ``start()`` is state-checked and idempotent, so a
+        retry safely continues from nodes that already configured or became
+        active even when their service response was lost.
+        """
+        for attempt in range(1, self._startup_retries + 1):
+            if self.start():
+                return True
+            if not rclpy.ok() or attempt >= self._startup_retries:
+                break
+            self.get_logger().warning(
+                "Nav2 lifecycle startup incomplete; retrying from actual "
+                f"node states in {self._startup_retry_delay:.1f}s "
+                f"(attempt {attempt + 1}/{self._startup_retries})"
+            )
+            deadline = time.monotonic() + self._startup_retry_delay
+            while rclpy.ok() and time.monotonic() < deadline:
+                rclpy.spin_once(self, timeout_sec=0.1)
+        self.get_logger().error(
+            "Nav2 lifecycle startup exhausted "
+            f"{self._startup_retries} attempts"
+        )
+        return False
+
 
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = Nav2LifecycleSequencer()
     try:
-        success = node.start()
+        success = node.start_with_retries()
         if success:
             # Keep the transient-local readiness publisher alive. The auto
             # initializer may start before or after lifecycle bringup.

@@ -12,6 +12,18 @@ let lastTelemetryData = null;
 let openModalRobot = null;
 
 const ROBOT_LABELS = { robot1: 'Robot 1', robot2: 'Robot 2' };
+const ORDER_STATUS_LABELS = {
+    PENDING: '대기',
+    PICKING_UP: '주방 수거',
+    NAVIGATING: '이동 중',
+    SERVING: '서빙 중',
+};
+const ORDER_STATUS_PRIORITY = {
+    PENDING: 0,
+    PICKING_UP: 1,
+    NAVIGATING: 2,
+    SERVING: 3,
+};
 const MISSION_STEPS = [
     { key: 'PENDING', icon: 'fa-clipboard-check', name: '주문 접수' },
     { key: 'PICKING_UP', icon: 'fa-kitchen-set', name: '주방 수거' },
@@ -167,10 +179,81 @@ function updateSystemTelemetry(data) {
         );
     }
 
-    // 4. If a robot's detail modal is open, keep it live-updating too.
+    // 4. Keep the compact active-order queue visible without opening a modal.
+    renderAdminOrderQueue(data.orders || []);
+
+    // 5. If a robot's detail modal is open, keep it live-updating too.
     if (openModalRobot) {
         renderRobotModal(openModalRobot, data);
     }
+}
+
+function escapeHtml(value) {
+    return String(value === null || value === undefined ? '' : value).replace(/[&<>'"]/g, char => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        "'": '&#39;',
+        '"': '&quot;',
+    })[char]);
+}
+
+function renderAdminOrderQueue(orders) {
+    const listEl = document.getElementById('admin-order-list');
+    const countEl = document.getElementById('admin-order-count');
+    if (!listEl || !countEl) return;
+
+    const activeOrders = [...orders]
+        .filter(order => !['COMPLETED', 'CANCELLED'].includes(order.status))
+        .sort((a, b) => {
+            const aPriority = Object.prototype.hasOwnProperty.call(ORDER_STATUS_PRIORITY, a.status)
+                ? ORDER_STATUS_PRIORITY[a.status] : 99;
+            const bPriority = Object.prototype.hasOwnProperty.call(ORDER_STATUS_PRIORITY, b.status)
+                ? ORDER_STATUS_PRIORITY[b.status] : 99;
+            const statusDiff = aPriority - bPriority;
+            if (statusDiff !== 0) return statusDiff;
+            return Number(a.created_at || 0) - Number(b.created_at || 0);
+        });
+    const waitingCount = activeOrders.filter(order => order.status === 'PENDING').length;
+    countEl.innerText = `주문 ${activeOrders.length} · 대기 ${waitingCount}`;
+    countEl.classList.toggle('has-waiting', waitingCount > 0);
+
+    if (activeOrders.length === 0) {
+        listEl.innerHTML = `
+            <div class="admin-order-empty">
+                <i class="fa-regular fa-clipboard"></i>
+                <span>대기 또는 진행 중인 주문이 없습니다.</span>
+            </div>`;
+        return;
+    }
+
+    listEl.innerHTML = activeOrders.map(order => {
+        const status = escapeHtml(order.status || 'PENDING');
+        const statusLabel = ORDER_STATUS_LABELS[order.status] || status;
+        const robot = order.assigned_robot
+            ? (ROBOT_LABELS[order.assigned_robot] || order.assigned_robot)
+            : '배정 대기';
+        const items = Array.isArray(order.items) && order.items.length > 0
+            ? order.items.map(item => {
+                const name = escapeHtml(item.name || '메뉴');
+                const quantity = Number(item.quantity || 1);
+                return `${name} ×${quantity}`;
+            }).join(', ')
+            : '메뉴 정보 없음';
+        return `
+            <article class="admin-order-card ${order.status === 'PENDING' ? 'waiting' : ''}">
+                <div class="admin-order-main">
+                    <strong>${escapeHtml(order.order_id || '-')}</strong>
+                    <span class="admin-order-table">Table ${escapeHtml(order.table_number)}</span>
+                    <span class="status-badge-tag status-${status}">${escapeHtml(statusLabel)}</span>
+                </div>
+                <div class="admin-order-items" title="${items}">${items}</div>
+                <div class="admin-order-assignment ${order.assigned_robot ? '' : 'unassigned'}">
+                    <i class="fa-solid ${order.assigned_robot ? 'fa-robot' : 'fa-hourglass-half'}"></i>
+                    ${escapeHtml(robot)}
+                </div>
+            </article>`;
+    }).join('');
 }
 
 function updateRobotSelectButton(robotName, r) {
@@ -187,15 +270,19 @@ function updateCameraFeed(imgId, placeholderId, statusId, connected, imgData) {
     const camPlaceholder = document.getElementById(placeholderId);
     const camStatus = document.getElementById(statusId);
 
-    if (connected && imgData && imgData.length > 0) {
+    // Keep the last valid frame visible across temporary DDS/network gaps.
+    // The placeholder is only for startup, before any frame has arrived.
+    if (imgData && imgData.length > 0) {
         if (camImgEl) {
-            camImgEl.src = imgData;
+            if (camImgEl.src !== imgData) camImgEl.src = imgData;
             camImgEl.style.display = 'block';
         }
         if (camPlaceholder) camPlaceholder.style.display = 'none';
         if (camStatus) {
-            camStatus.innerText = "LIVE (Receiving Topic)";
-            camStatus.style.color = "#10b981";
+            camStatus.innerText = connected
+                ? "LIVE (Receiving Topic)"
+                : "HOLD (Last Frame)";
+            camStatus.style.color = connected ? "#10b981" : "#f59e0b";
         }
     } else {
         if (camImgEl) camImgEl.style.display = 'none';

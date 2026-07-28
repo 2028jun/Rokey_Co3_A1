@@ -50,9 +50,15 @@ class HMIBridgeNode(Node):
         super().__init__('serving_hmi_bridge_node')
 
         self.declare_parameter('robot_namespace', 'robot1')
+        self.declare_parameter('camera_stale_timeout_sec', 15.0)
         robot_namespace = str(
             self.get_parameter('robot_namespace').value
         ).strip('/')
+        self.camera_stale_timeout_sec = float(
+            self.get_parameter('camera_stale_timeout_sec').value
+        )
+        if self.camera_stale_timeout_sec <= 0.0:
+            raise ValueError('camera_stale_timeout_sec must be greater than zero')
         topic_prefix = f'/{robot_namespace}' if robot_namespace else ''
         self.camera_topic = (
             f'{topic_prefix}/camera/color/image_raw/compressed'
@@ -82,6 +88,7 @@ class HMIBridgeNode(Node):
         self._pending_manager_orders = {}
         self._manager_order_inflight = set()
         self._manager_order_retry_after = {}
+        self._manager_order_dispatched_at = {}
         self._robot_status_labels = {
             0: "IDLE",
             1: "RETURNING TO KITCHEN",
@@ -234,7 +241,8 @@ class HMIBridgeNode(Node):
         self.create_timer(0.05, self.check_liveness_timer)
         self.get_logger().info(
             "HMI ROS 2 Bridge Node initialized: "
-            f"camera={self.camera_topic}, odom={self.odom_topic}"
+            f"camera={self.camera_topic}, odom={self.odom_topic}, "
+            f"camera_stale_timeout={self.camera_stale_timeout_sec:.1f}s"
         )
 
     def set_hand_test_visible(self, visible: bool):
@@ -299,6 +307,16 @@ class HMIBridgeNode(Node):
     def table_camera_callback(self, msg):
         """Compatibility callback for older single-robot launch files."""
         return self._make_camera_callback("robot1")(msg)
+
+    def camera_is_connected(self, robot_name: str, now: float = None) -> bool:
+        """Keep the last frame visible across short DDS/network stalls."""
+        if now is None:
+            now = time.time()
+        last_frame_time = self._robot_camera_times.get(robot_name, 0.0)
+        return bool(
+            last_frame_time > 0.0
+            and now - last_frame_time <= self.camera_stale_timeout_sec
+        )
 
     def _make_odom_callback(self, robot_name):
         def callback(msg: Odometry):
@@ -485,10 +503,7 @@ class HMIBridgeNode(Node):
         now = time.time()
         for name in ("robot1", "robot2"):
             code = self._robot_status_codes.get(name)
-            camera_connected = (
-                self._robot_camera_times.get(name, 0.0) > 0.0
-                and now - self._robot_camera_times[name] <= 2.0
-            )
+            camera_connected = self.camera_is_connected(name, now)
             order = order_manager.active_order_for_robot(name)
             if code is None:
                 state = "UNKNOWN"
@@ -505,10 +520,9 @@ class HMIBridgeNode(Node):
                 "parking_brake": code not in (1, 3),
                 "battery": 98.0,
                 "camera_connected": camera_connected,
-                "camera_image": (
-                    self._robot_camera_base64[name]
-                    if camera_connected else ""
-                ),
+                # Always retain the latest valid frame. camera_connected only
+                # reports freshness; a short DDS gap must not blank the HMI.
+                "camera_image": self._robot_camera_base64[name],
                 "active_order_id": order.order_id if order else None,
             }
         return snapshot
@@ -621,6 +635,7 @@ class HMIBridgeNode(Node):
             flush=True,
         )
         self._manager_order_inflight.add(order_id)
+        self._manager_order_dispatched_at[order_id] = time.time()
         future = self.manager_order_client.call_async(req)
         future.add_done_callback(
             lambda completed, oid=order_id: self._on_manager_order_response(oid, completed)
@@ -632,6 +647,9 @@ class HMIBridgeNode(Node):
             response = future.result()
             if response is not None and response.success:
                 assigned = getattr(response, "assigned_robot", "") or ""
+                dispatched_at = self._manager_order_dispatched_at.pop(
+                    order_id, 0.0
+                )
                 self._pending_manager_orders.pop(order_id, None)
                 self._manager_order_retry_after.pop(order_id, None)
                 order_manager.assign_robot(order_id, assigned)
@@ -640,8 +658,19 @@ class HMIBridgeNode(Node):
                 # arrived just before the service response.
                 order_manager.update_status(order_id, OrderStatus.PICKING_UP)
                 worker_code = self._robot_status_codes.get(assigned)
-                if worker_code is not None:
+                worker_status_time = self._robot_status_times.get(
+                    assigned, 0.0
+                )
+                if (
+                    worker_code is not None
+                    and worker_status_time >= dispatched_at
+                ):
                     self._apply_order_status_code(order_id, int(worker_code))
+                elif worker_code is not None:
+                    self.get_logger().info(
+                        f"Ignoring stale {assigned} status={worker_code} "
+                        f"for newly assigned order {order_id}"
+                    )
                 self.get_logger().info(
                     f"Manager accepted HMI order {order_id}"
                     + (f" -> {assigned}" if assigned else "")
@@ -653,6 +682,7 @@ class HMIBridgeNode(Node):
 
         # Rejection commonly means both workers are temporarily occupied.
         # Preserve the order and retry instead of reporting a false cancel.
+        self._manager_order_dispatched_at.pop(order_id, None)
         self._manager_order_retry_after[order_id] = time.monotonic() + 1.0
         self.get_logger().warning(
             f"HMI order {order_id} remains pending: {reason}; retrying"
@@ -798,8 +828,7 @@ def get_system_status_payload():
     is_mock = (ros_node.drive_mode == "MOCK") if ros_node else True
     camera_connected = bool(
         ros_node
-        and ros_node.last_camera_recv_time > 0.0
-        and time.time() - ros_node.last_camera_recv_time <= 2.0
+        and ros_node.camera_is_connected("robot1")
     )
     robots = (
         ros_node.fleet_robot_snapshot()
@@ -830,8 +859,7 @@ def get_system_status_payload():
         "robots": robots,
         "camera_connected": camera_connected,
         "obstacle": (ros_node.obstacle_info if ros_node else {"active": False, "x": 0.0, "y": 2.8, "stop": False}),
-        "camera_image": (
-            ros_node.last_camera_base64 if camera_connected else ""),
+        "camera_image": ros_node.last_camera_base64 if ros_node else "",
         "orders": order_manager.get_all_orders_dict(),
         "active_order_id": order_manager.active_order_id,
         "active_order_ids": {

@@ -155,15 +155,18 @@ function updateSystemTelemetry(data) {
     const camPlaceholder = document.getElementById('camera-placeholder');
     const camStatus = document.getElementById('camera-status-text');
 
-    if (data.camera_connected && camImgData && camImgData.length > 0) {
+    // Preserve the most recent valid frame during temporary stream gaps.
+    if (camImgData && camImgData.length > 0) {
         if (camImgEl) {
-            camImgEl.src = camImgData;
+            if (camImgEl.src !== camImgData) camImgEl.src = camImgData;
             camImgEl.style.display = 'block';
         }
         if (camPlaceholder) camPlaceholder.style.display = 'none';
         if (camStatus) {
-            camStatus.innerText = "LIVE (Receiving Topic)";
-            camStatus.style.color = "#10b981";
+            camStatus.innerText = data.camera_connected
+                ? "LIVE (Receiving Topic)"
+                : "HOLD (Last Frame)";
+            camStatus.style.color = data.camera_connected ? "#10b981" : "#f59e0b";
         }
     } else {
         if (camImgEl) camImgEl.style.display = 'none';

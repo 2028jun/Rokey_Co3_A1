@@ -225,6 +225,11 @@ class ManagerNode(Node):
         self._nav_command_accepted = False
         self._nav_command_epoch = 0
         self._kitchen_location_since = None
+        # A stable kitchen location may be accepted before the navigation
+        # subsystem publishes its delayed terminal ARRIVED/detail messages.
+        # Preserve that decision across the COMPLETED display interval so a
+        # queued order does not issue a duplicate kitchen mission.
+        self._kitchen_arrival_confirmed = False
         self._arm_status = None
         self._arm_working_confirmed = False
         self._arm_command_accepted = False
@@ -477,7 +482,8 @@ class ManagerNode(Node):
         # 보내지 않는다. 위치나 상태 중 하나라도 불확실한 Manager 재시작 직후에는 기존처럼
         # 주방 복귀 명령으로 능동 확인한다.
         if (self._nav_location == NAV_LOCATION_KITCHEN
-                and self._nav_status == NAV_STATUS_ARRIVED):
+                and (self._nav_status == NAV_STATUS_ARRIVED
+                     or getattr(self, '_kitchen_arrival_confirmed', False))):
             self.get_logger().info(
                 '🏠 현재 위치가 주방으로 확인되어 중복 주방 복귀를 생략합니다.')
             self._publish_table_occupancy('clear')
@@ -538,6 +544,9 @@ class ManagerNode(Node):
     # 서비스 호출 (모두 작업 세대를 붙여 지연 응답을 걸러낸다)
     # ------------------------------------------------------------------
     def _call_nav_command(self, command):
+        # Any new navigation command leaves the previously confirmed kitchen
+        # arrival context. A fresh kitchen return must be confirmed again.
+        self._kitchen_arrival_confirmed = False
         self._nav_status = None
         self._nav_location = None
         self._nav_detail_state = None
@@ -746,6 +755,8 @@ class ManagerNode(Node):
     def _on_nav_location(self, msg):
         prev_location = getattr(self, "_nav_location", None)
         self._nav_location = msg.data
+        if self._nav_location != NAV_LOCATION_KITCHEN:
+            self._kitchen_arrival_confirmed = False
         if prev_location != msg.data:
             loc_name = "주방" if msg.data == 4 else f"테이블 {msg.data}"
             self.get_logger().info(f'📥 [수신/RECV Topic] /navigation/current_location = {msg.data} ({loc_name})')
@@ -849,6 +860,7 @@ class ManagerNode(Node):
         if self._state != _State.RETURNING_TO_KITCHEN:
             return
         self._kitchen_location_since = None
+        self._kitchen_arrival_confirmed = True
         if reason:
             self.get_logger().info(
                 f'🏠 [ARRIVED] 주방 대기 위치 도착 확인 완료 ({reason})'

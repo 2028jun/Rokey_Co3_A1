@@ -963,15 +963,10 @@ def configure_restaurant_floor_visual_material(stage):
     if not RESTAURANT_FLOOR_TEXTURE.is_file():
         raise FileNotFoundError(RESTAURANT_FLOOR_TEXTURE)
 
-    # Use the exact same unlit brightness path as the wall panorama so the
-    # horizontal floor is not darkened by scene-light direction. A dedicated
-    # floor override remains available, but otherwise both surfaces share the
-    # panorama value.
+    # Keep the floor unlit like the panorama, but slightly dimmer so the real
+    # foreground does not read as a bright plate in front of the backdrop.
     emissive_strength = float(
-        os.environ.get(
-            "NAV_RESTAURANT_FLOOR_BRIGHTNESS",
-            os.environ.get("NAV_RESTAURANT_PANORAMA_BRIGHTNESS", "1.60"),
-        )
+        os.environ.get("NAV_RESTAURANT_FLOOR_BRIGHTNESS", "1.40")
     )
     if not 0.0 <= emissive_strength <= 3.0:
         raise ValueError(
@@ -1000,18 +995,12 @@ def configure_restaurant_floor_visual_material(stage):
     texture.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
         reader.ConnectableAPI(), "result"
     )
-    # Keep the overlay unlit like the wall panorama. A lit diffuse texture was
-    # multiplied by the scene illumination and rendered almost black even
-    # though the source PNG had the intended warm-gray color.
     surface.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
         Gf.Vec3f(0.0, 0.0, 0.0)
     )
 
-    # The source PNG is authored in sRGB. After conversion to linear color,
-    # the lit horizontal surface appears much darker than the same pixels in
-    # an image viewer (and than the unlit wall panorama). Add a restrained
-    # emissive copy so the viewport preserves the authored warm-gray value
-    # while diffuse lighting and object shadows remain visible.
+    # Emit the floor texture directly. Contact shadows are authored as a
+    # separate visual-only layer below, so lighting cannot shift this color.
     emissive_texture = UsdShade.Shader.Define(
         stage, f"{material_path}/EmissiveTexture"
     )
@@ -1096,6 +1085,86 @@ def configure_restaurant_floor_visual_material(stage):
     print(
         "[restaurant] floor_visual=wall_extracted_texture size=1024 "
         f"emissive={emissive_strength:.2f} quads=2 physics=unchanged",
+        flush=True,
+    )
+
+
+def add_restaurant_contact_shadows(stage):
+    """Add cheap visual-only grounding under the real tables and chairs."""
+    root = UsdGeom.Xform.Define(
+        stage, "/World/Architecture/RestaurantContactShadows"
+    )
+
+    table_centers = (
+        (-3.2, -2.2),
+        (3.2, -2.2),
+        (-3.2, 0.7),
+        (3.2, 0.7),
+    )
+    shadow_shapes = []
+    for table_x, table_y in table_centers:
+        shadow_shapes.append((table_x, table_y, 1.02, 0.56))
+        for offset_x in (-0.5, 0.5):
+            for offset_y in (-1.0, 1.0):
+                shadow_shapes.append(
+                    (table_x + offset_x, table_y + offset_y, 0.25, 0.22)
+                )
+
+    # Three batched ellipse meshes provide a soft edge with only three
+    # materials/draw groups. They have no collision or physics APIs.
+    layers = (
+        ("Outer", 1.45, 0.035, 0.0030),
+        ("Middle", 1.22, 0.050, 0.0035),
+        ("Core", 1.00, 0.070, 0.0040),
+    )
+    segment_count = 16
+    for layer_name, radius_scale, opacity, z in layers:
+        material_path = f"/World/Looks/RestaurantContactShadow{layer_name}"
+        material = UsdShade.Material.Define(stage, material_path)
+        surface = UsdShade.Shader.Define(
+            stage, f"{material_path}/Surface"
+        )
+        surface.CreateIdAttr("UsdPreviewSurface")
+        surface.CreateInput(
+            "diffuseColor", Sdf.ValueTypeNames.Color3f
+        ).Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        surface.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(1.0)
+        surface.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+        surface.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(opacity)
+        material.CreateSurfaceOutput().ConnectToSource(
+            surface.ConnectableAPI(), "surface"
+        )
+
+        points = []
+        counts = []
+        indices = []
+        for center_x, center_y, radius_x, radius_y in shadow_shapes:
+            first_index = len(points)
+            for segment in range(segment_count):
+                angle = 2.0 * math.pi * segment / segment_count
+                points.append(
+                    Gf.Vec3f(
+                        center_x + radius_x * radius_scale * math.cos(angle),
+                        center_y + radius_y * radius_scale * math.sin(angle),
+                        z,
+                    )
+                )
+            counts.append(segment_count)
+            indices.extend(
+                range(first_index, first_index + segment_count)
+            )
+
+        mesh = UsdGeom.Mesh.Define(stage, f"{root.GetPath()}/{layer_name}")
+        mesh.CreatePointsAttr(points)
+        mesh.CreateFaceVertexCountsAttr(counts)
+        mesh.CreateFaceVertexIndicesAttr(indices)
+        mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+        mesh.CreateDoubleSidedAttr(False)
+        UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(material)
+
+    print(
+        "[restaurant] contact_shadows=table+chairs layers=3 "
+        f"shapes={len(shadow_shapes)} physics=none",
         flush=True,
     )
 
@@ -2029,6 +2098,7 @@ class NavBridge(Node):
         self._pending_arm_command = None
         self._active_serving_task = None
         self._serving_paused = False
+        self._serving_pause_started_at = None
         self._arm_returning_to_stow = False
         self._arm_stow_started_at = None
         self._arm_stow_settle_count = 0
@@ -2351,8 +2421,10 @@ class NavBridge(Node):
                     and not self._tray_returning_home
                 ):
                     return False
-                self._serving_paused = True
-                self.get_logger().warning("integrated serving paused")
+                if not self._serving_paused:
+                    self._serving_paused = True
+                    self._serving_pause_started_at = time.monotonic()
+                    self.get_logger().warning("integrated serving paused")
                 return True
             if command == 98:
                 if (
@@ -2361,8 +2433,27 @@ class NavBridge(Node):
                     and not self._tray_returning_home
                 ):
                     return False
-                self._serving_paused = False
-                self.get_logger().info("integrated serving resumed")
+                if self._serving_paused:
+                    now = time.monotonic()
+                    paused_for = max(
+                        0.0, now - (self._serving_pause_started_at or now)
+                    )
+                    # Safety pauses must not consume the arm-stow or tray-home
+                    # timeout budget. Previously a hand intrusion lasting more
+                    # than 30 seconds caused an immediate FAILED on resume,
+                    # before the trays had any chance to retract.
+                    if self._arm_stow_started_at is not None:
+                        self._arm_stow_started_at += paused_for
+                        self._arm_stow_last_update = now
+                        self._arm_stow_last_log = now
+                    if self._tray_home_started_at is not None:
+                        self._tray_home_started_at += paused_for
+                    self._serving_paused = False
+                    self._serving_pause_started_at = None
+                    self.get_logger().info(
+                        "integrated serving resumed after "
+                        f"{paused_for:.1f}s safety pause"
+                    )
                 return True
             if (
                 command <= 0
@@ -4267,6 +4358,7 @@ class NavBridge(Node):
                 task.initialize(self.articulation, self.dof_names)
                 self._active_serving_task = task
                 self._serving_paused = False
+                self._serving_pause_started_at = None
                 self.get_logger().info(
                     f"[integrated-serving] started arm_command={arm_command}"
                 )
@@ -4673,6 +4765,7 @@ def main():
         stage = open_restaurant_and_robot(open_stage=index == 0)
         if index == 0:
             configure_restaurant_floor_visual_material(stage)
+            add_restaurant_contact_shadows(stage)
             add_three_wall_restaurant_panorama(stage)
         configure_wheel_contact_material(stage)
         configure_gripper_contact_material(stage)

@@ -208,6 +208,29 @@ def test_unknown_kitchen_state_still_requests_return_navigation():
     manager._call_nav_command.assert_called_once_with(4)
 
 
+def test_soft_kitchen_arrival_skips_duplicate_return_for_queued_order():
+    """소프트 도착 확정 뒤 다음 주문이 중복 command=4를 보내지 않는다."""
+    manager = _bare_manager(_State.RETURNING_TO_KITCHEN)
+    manager._nav_location = 4
+    manager._nav_status = 1
+    manager._kitchen_arrival_confirmed = False
+    manager._publish_table_occupancy = Mock()
+    manager._start_next_trip = Mock()
+
+    manager._complete_kitchen_arrival(reason='soft kitchen arrival')
+
+    assert manager._kitchen_arrival_confirmed is True
+    manager._start_next_trip.assert_called_once_with()
+
+    manager._serve_queue = [Trip(1, 0, False)]
+    manager._call_nav_command = Mock()
+    manager._start_next_trip.reset_mock()
+    manager._return_to_kitchen_for_next_trip()
+
+    manager._call_nav_command.assert_not_called()
+    manager._start_next_trip.assert_called_once_with()
+
+
 def test_navigation_only_trip_drives_to_table_without_spawn_or_arm():
     """주행 전용 트립은 스폰·팔 없이 테이블 도착 후 즉시 주방으로 복귀한다."""
     manager = _bare_manager()
@@ -300,6 +323,7 @@ def test_fleet_assigns_second_order_to_robot2_while_robot1_is_reserved():
     fleet._states = {'robot1': 0, 'robot2': 0}
     fleet._reserved = {}
     fleet._table_claims = {}
+    fleet._status_pub = Mock()
     fleet.get_logger = Mock(return_value=Mock())
     accepted = type('Response', (), {'success': True})()
     fleet._order_clients = {
@@ -320,6 +344,57 @@ def test_fleet_assigns_second_order_to_robot2_while_robot1_is_reserved():
     assert second_response.assigned_robot == 'robot2'
     fleet._order_clients['robot1'].call_async.assert_called_once()
     fleet._order_clients['robot2'].call_async.assert_called_once()
+
+
+def test_third_auto_order_retries_to_first_completed_robot():
+    """동시 3주문 중 세 번째는 먼저 복귀 완료한 로봇에 배정된다."""
+    fleet = FleetManager.__new__(FleetManager)
+    fleet._robots = ['robot1', 'robot2']
+    fleet._serialize_shared_payloads = False
+    fleet._states = {'robot1': 0, 'robot2': 0}
+    fleet._reserved = {}
+    fleet._table_claims = {}
+    fleet._status_pub = Mock()
+    fleet.get_logger = Mock(return_value=Mock())
+    accepted = type('Response', (), {'success': True})()
+    fleet._order_clients = {
+        'robot1': Mock(service_is_ready=Mock(return_value=True)),
+        'robot2': Mock(service_is_ready=Mock(return_value=True)),
+    }
+    for client in fleet._order_clients.values():
+        client.call_async.return_value = _FinishedFuture(accepted)
+
+    first = type('Response', (), {'success': False, 'assigned_robot': ''})()
+    second = type('Response', (), {'success': False, 'assigned_robot': ''})()
+    third_initial = type(
+        'Response', (), {'success': False, 'assigned_robot': ''}
+    )()
+
+    fleet._on_order(_order_request(0), first)
+    fleet._on_order(_order_request(1), second)
+    assert first.assigned_robot == 'robot1'
+    assert second.assigned_robot == 'robot2'
+
+    # Both workers report that their accepted jobs have started. This also
+    # clears the short dispatch reservations.
+    fleet._on_status('robot1', Int32(data=3))
+    fleet._on_status('robot2', Int32(data=3))
+    fleet._on_order(_order_request(2), third_initial)
+    assert third_initial.success is False
+    assert third_initial.assigned_robot == ''
+
+    # robot2 returns first. HMI retries the same pending third request and
+    # Fleet must choose robot2 while robot1 remains busy.
+    fleet._on_status('robot2', Int32(data=6))
+    third_retry = type(
+        'Response', (), {'success': False, 'assigned_robot': ''}
+    )()
+    fleet._on_order(_order_request(2), third_retry)
+
+    assert third_retry.success is True
+    assert third_retry.assigned_robot == 'robot2'
+    assert fleet._order_clients['robot1'].call_async.call_count == 1
+    assert fleet._order_clients['robot2'].call_async.call_count == 2
 
 
 def test_fleet_assigns_order_to_robot2_while_robot1_is_driving():

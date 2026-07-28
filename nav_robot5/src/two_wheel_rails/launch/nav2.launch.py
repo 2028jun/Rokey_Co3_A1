@@ -130,7 +130,17 @@ def generate_launch_description():
             executable="nav2_lifecycle_sequencer",
             name="nav2_lifecycle_sequencer",
             output="screen",
-            parameters=[{"use_sim_time": use_sim_time}],
+            parameters=[{
+                "use_sim_time": use_sim_time,
+                # Service discovery for the second namespaced stack can miss
+                # its first Fast DDS discovery window. Never block a whole
+                # minute on one stale wait; poll briefly and resume from the
+                # lifecycle states that are already available.
+                "service_wait_timeout_sec": 2.0,
+                "transition_timeout_sec": 5.0,
+                "startup_retries": 90,
+                "startup_retry_delay_sec": 1.0,
+            }],
         ),
     ])
 

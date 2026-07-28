@@ -506,6 +506,133 @@ body {
 .status-SERVING { background: rgba(168, 85, 247, 0.2); color: var(--accent-neon); }
 .status-COMPLETED { background: rgba(16, 185, 129, 0.2); color: var(--success); }
 .status-CANCELLED { background: rgba(239, 68, 68, 0.2); color: var(--danger); }
+.status-PICKING_UP { background: rgba(14, 165, 233, 0.2); color: #38bdf8; }
+
+/* Compact active-order queue between robot controls and simulation tests */
+.admin-order-queue {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+    min-height: 0;
+}
+
+.admin-order-queue-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.admin-order-queue-header h3 {
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: var(--text-main);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.admin-order-queue-header h3 i {
+    color: var(--primary);
+}
+
+.admin-order-count {
+    padding: 3px 7px;
+    border-radius: 999px;
+    color: var(--text-muted);
+    background: rgba(148, 163, 184, 0.12);
+    font-family: var(--font-mono);
+    font-size: 0.67rem;
+    white-space: nowrap;
+}
+
+.admin-order-count.has-waiting {
+    color: var(--warning);
+    background: rgba(245, 158, 11, 0.16);
+}
+
+.admin-order-list {
+    max-height: 230px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding-right: 3px;
+}
+
+.admin-order-card {
+    padding: 9px 10px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-left: 3px solid var(--primary);
+    border-radius: 8px;
+    background: rgba(15, 23, 42, 0.62);
+    display: grid;
+    gap: 5px;
+}
+
+.admin-order-card.waiting {
+    border-left-color: var(--warning);
+    background: rgba(245, 158, 11, 0.07);
+}
+
+.admin-order-main {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+}
+
+.admin-order-main strong {
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+}
+
+.admin-order-table {
+    color: var(--text-muted);
+    font-size: 0.75rem;
+}
+
+.admin-order-main .status-badge-tag {
+    margin-left: auto;
+    white-space: nowrap;
+}
+
+.admin-order-items {
+    overflow: hidden;
+    color: #cbd5e1;
+    font-size: 0.75rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.admin-order-assignment {
+    color: #a5b4fc;
+    font-size: 0.72rem;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.admin-order-assignment.unassigned {
+    color: var(--warning);
+}
+
+.admin-order-empty {
+    min-height: 68px;
+    border: 1px dashed rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    color: var(--text-muted);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    font-size: 0.75rem;
+    text-align: center;
+}
 
 /* Test Controls Panel */
 .test-controls-wrapper {
