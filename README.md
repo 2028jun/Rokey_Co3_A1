@@ -42,14 +42,29 @@
 flowchart TB
     Browser["브라우저"] --> HMI["HMI 대시보드\nFastAPI + WebSocket"]
     HMI -->|"/manager/order"| Fleet["Fleet Manager"]
-    Fleet --> M1["robot1\nManager · Nav2 · 로봇팔"]
-    Fleet --> M2["robot2\nManager · Nav2 · 로봇팔"]
-    M1 <--> Isaac["Isaac Sim\n식당 씬 · 로봇 2대"]
-    M2 <--> Isaac
-    Isaac -->|"카메라 압축 스트림"| Y1["hand_detector\nrobot1"]
-    Isaac -->|"카메라 압축 스트림"| Y2["hand_detector\nrobot2"]
-    Y1 -->|"hand_safety/intrusion"| M1
-    Y2 -->|"hand_safety/intrusion"| M2
+
+    subgraph Robots [ ]
+        direction LR
+        M1["robot1\nManager · Nav2 · 로봇팔"]
+        M2["robot2\nManager · Nav2 · 로봇팔"]
+    end
+    style Robots fill:none,stroke:none
+
+    Fleet --> M1
+    Fleet --> M2
+
+    M1 --> Isaac["Isaac Sim\n식당 씬 · 로봇 2대"]
+    M2 --> Isaac
+
+    subgraph Detectors [ ]
+        direction LR
+        Y1["hand_detector\nrobot1"]
+        Y2["hand_detector\nrobot2"]
+    end
+    style Detectors fill:none,stroke:none
+
+    Isaac -->|"카메라 압축 스트림"| Y1
+    Isaac -->|"카메라 압축 스트림"| Y2
     Isaac -.->|"카메라 · 지도 · 상태"| HMI
 
     classDef web fill:#e0e7ff,stroke:#4338ca,color:#1e1b4b,stroke-width:1.5px,rx:6,ry:6;
@@ -61,7 +76,9 @@ flowchart TB
 ```
 
 색 구분: 남색 = 웹 UI PC, 초록 = 메인 PC(Isaac Sim/Nav2/Fleet Manager), 주황
-= 원격 YOLO PC.
+= 원격 YOLO PC. hand_detector는 판정 결과(`hand_safety/intrusion`)를 각
+로봇의 Manager로 돌려보내 로봇팔 pause(`99`)/resume(`98`)에 사용합니다
+(화살표 교차를 줄이기 위해 다이어그램에는 표시하지 않음).
 
 ### 주문 처리 플로우 (로봇 1대 기준 `system/status`)
 
