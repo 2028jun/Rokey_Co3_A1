@@ -43,8 +43,8 @@ flowchart LR
     subgraph WebPC["PC 1 · 웹 UI"]
         direction TB
         Browser["브라우저"]
-        HMI["HMI 대시보드<br/>FastAPI · WebSocket"]
-        Browser --> HMI
+        UI["UI 대시보드<br/>FastAPI · WebSocket"]
+        Browser --> UI
     end
 
     subgraph MainPC["PC 2 · 로봇 제어 및 시뮬레이션"]
@@ -71,15 +71,15 @@ flowchart LR
         Y2["hand_detector<br/>robot2"]
     end
 
-    HMI -->|"/manager/order"| Fleet
+    UI -->|"/manager/order"| Fleet
     Isaac -->|"카메라 압축 스트림"| Y1
     Isaac -->|"카메라 압축 스트림"| Y2
-    Isaac -.->|"카메라 · 지도 · 상태"| HMI
+    Isaac -.->|"카메라 · 지도 · 상태"| UI
 
     classDef web fill:#eef2ff,stroke:#4f46e5,color:#1e1b4b;
     classDef main fill:#ecfdf5,stroke:#059669,color:#022c22;
     classDef yolo fill:#fff7ed,stroke:#ea580c,color:#431407;
-    class Browser,HMI web;
+    class Browser,UI web;
     class Fleet,M1,M2,Isaac main;
     class Y1,Y2 yolo;
 
@@ -143,7 +143,7 @@ Fleet Manager는 유휴 상태(`0` 또는 `6`)인 로봇 중 `robot1`을 우선 
 - **slam_toolbox**: SLAM 지도 생성
 - **ultralytics YOLO** (YOLOv10n 손 검출 모델) + **PyTorch(CUDA)**: 손 안전 감지 추론
 - **OpenCV / cv_bridge**: 이미지 처리 및 ROS ↔ OpenCV 변환
-- **FastAPI + uvicorn**: HMI 백엔드 웹서버 및 WebSocket 스트리밍
+- **FastAPI + uvicorn**: UI 백엔드 웹서버 및 WebSocket 스트리밍
 - **tf2_ros**: 좌표 변환(odom → base_link 등)
 
 라이브러리 버전은 저장소에 `requirements.txt`로 고정되어 있지 않으므로, 실제
@@ -170,7 +170,7 @@ Fleet Manager는 유휴 상태(`0` 또는 `6`)인 로봇 중 `robot1`을 우선 
 
 컴퓨터 3대로 역할을 나눠 실행합니다: **메인 PC**(Isaac Sim 시뮬레이션, Nav2
 자율주행, Fleet Manager 주문 배정, 로봇팔 pick & place 제어, 경로 충돌 관측,
-SLAM 지도 생성), **원격 YOLO PC**(손 안전 감지), **웹 UI PC**(HMI 대시보드).
+SLAM 지도 생성), **원격 YOLO PC**(손 안전 감지), **웹 UI PC**(UI 대시보드).
 공통으로 세 PC 모두 Ubuntu 22.04 + ROS 2 Humble이 설치되어 있어야 합니다.
 
 ### 메인 PC (Isaac Sim + Nav2 + Fleet Manager)
@@ -232,11 +232,11 @@ PYTHONNOUSERSITE=1 ./tools/colcon_safe.py build \
 source install/setup.bash
 ```
 
-### 웹 UI PC (HMI 대시보드)
+### 웹 UI PC (UI 대시보드)
 
 - ROS 2 Humble Base (Isaac Sim, GPU 불필요)
 - pip: `fastapi`, `uvicorn`
-- colcon 빌드 대상: `serving_robot_interfaces`, `serving_hmi`
+- colcon 빌드 대상: `serving_robot_interfaces`, `serving_ui`
 - 브라우저로 `http://localhost:8000` 접속 (주문 화면), `/admin`(관리자 화면)
 
 ```bash
