@@ -222,6 +222,10 @@ class SimplifiedPathNavigator:
         self._cfg = load_motion_config()
         self._control_pose: tuple[float, float, float] | None = None
         self._control_twist: tuple[float, float] | None = None
+        # Fleet heartbeat publication must never wait on synchronous TF
+        # lookups.  Keep the latest verified map pose as a fallback when an
+        # AMCL sample is temporarily unavailable.
+        self._last_map_pose: tuple[float, float, float] | None = None
 
         # Cache navigation readiness before the first Manager command arrives.
         # The former implementation only checked these inputs inside navigate_to(),
@@ -599,7 +603,7 @@ class SimplifiedPathNavigator:
             rclpy.spin_once(self._nav, timeout_sec=0.05)
             now = time.monotonic()
             if now - last_claim >= 1.0:
-                pose = self._map_pose()
+                pose = self._cached_map_pose()
                 polyline = (
                     [{"x": float(pose[0]), "y": float(pose[1])}]
                     if pose is not None
@@ -642,7 +646,7 @@ class SimplifiedPathNavigator:
             return
         if self._intent_priority == 0.0:
             self._intent_priority = -float(time.monotonic())
-        pose = self._map_pose()
+        pose = self._cached_map_pose()
         polyline = (
             [{"x": float(pose[0]), "y": float(pose[1])}]
             if pose is not None
@@ -742,7 +746,10 @@ class SimplifiedPathNavigator:
         phase: str | None = None,
         table_id: int | None = None,
     ) -> None:
-        pose = self._map_pose()
+        # This function runs in mission-completion wait loops and periodic
+        # heartbeats.  A synchronous TF lookup here can consume several
+        # seconds and starve the mission-status callback, delaying ARRIVED.
+        pose = self._cached_map_pose()
         if polyline is not None:
             points: list[dict] = []
             for pt in polyline:
@@ -813,7 +820,7 @@ class SimplifiedPathNavigator:
             self._intent_mission_id = mission_id
         elif not self._intent_mission_id:
             self._intent_mission_id = f"occupy_{table_id}_{time.monotonic_ns()}"
-        pose = self._map_pose()
+        pose = self._cached_map_pose()
         pose_poly = (
             [{"x": float(pose[0]), "y": float(pose[1])}]
             if pose is not None
@@ -831,7 +838,7 @@ class SimplifiedPathNavigator:
             if self._intent_phase != "occupying":
                 self._stop_occupying_heartbeat()
                 return
-            live = self._map_pose()
+            live = self._cached_map_pose()
             poly = (
                 [{"x": float(live[0]), "y": float(live[1])}]
                 if live is not None
@@ -882,7 +889,7 @@ class SimplifiedPathNavigator:
                     flush=True,
                 )
                 last_log = now
-                pose = self._map_pose()
+                pose = self._cached_map_pose()
                 poly = (
                     [{"x": float(pose[0]), "y": float(pose[1])}]
                     if pose is not None
@@ -1018,6 +1025,50 @@ class SimplifiedPathNavigator:
         while time.monotonic() - started < timeout_sec:
             rclpy.spin_once(self._nav, timeout_sec=0.03)
 
+            # Completion/failure takes priority over a fleet heartbeat.  The
+            # old order refreshed intent first; when TF was stale that work
+            # could repeatedly block status processing and delay ARRIVED by
+            # tens of seconds after Isaac had already completed docking.
+            status = self._last_status
+            if status and status.get("mission_id") == mission_id:
+                state = status.get("state")
+                phase = str(status.get("phase", "unknown"))
+                if state == "completed" or phase in (
+                    "park_out_aligned",
+                    "completed",
+                ):
+                    print(
+                        f"[mission] completed: mission={mission_id} label={label}",
+                        flush=True,
+                    )
+                    return True, "completed"
+                if state in ("failed", "cancelled"):
+                    print(
+                        f"[mission] status failed/cancelled: mission={mission_id} label={label} "
+                        f"state={state} phase={phase}",
+                        flush=True,
+                    )
+                    return False, state
+            # Late / retried completed frames sometimes drop the exact
+            # mission_id match after Isaac clears the active id. Still accept
+            # a fresh completed kitchen/table status for this label.
+            elif status and str(status.get("state", "")).lower() == "completed":
+                sid = str(status.get("mission_id", ""))
+                if label == "kitchen" and sid.startswith("kitchen_"):
+                    print(
+                        f"[mission] completed (id-relaxed): mission={sid} "
+                        f"waiting={mission_id} label={label}",
+                        flush=True,
+                    )
+                    return True, "completed"
+                if label.startswith("table_") and sid.startswith(f"{label}_"):
+                    print(
+                        f"[mission] completed (id-relaxed): mission={sid} "
+                        f"waiting={mission_id} label={label}",
+                        flush=True,
+                    )
+                    return True, "completed"
+
             # Keep fleet intent fresh so the yield coordinator can use live pose.
             now = time.monotonic()
             if self._intent_mission_id == mission_id and now - last_intent >= 0.4:
@@ -1046,48 +1097,11 @@ class SimplifiedPathNavigator:
                 )
                 last_intent = now
 
-            status = self._last_status
             if status and status.get("mission_id") == mission_id:
                 state = status.get("state")
-                phase = str(status.get("phase", "unknown"))
-                if state == "completed" or phase in (
-                    "park_out_aligned",
-                    "completed",
-                ):
-                    print(
-                        f"[mission] completed: mission={mission_id} label={label}",
-                        flush=True,
-                    )
-                    return True, "completed"
-                elif state == "accepted":
+                if state == "accepted":
                     if time.monotonic() - last_log >= 2.0:
                         print(f"[mission] status accepted: mission={mission_id}", flush=True)
-                elif state in ("failed", "cancelled"):
-                    print(
-                        f"[mission] status failed/cancelled: mission={mission_id} label={label} "
-                        f"state={state} phase={phase}",
-                        flush=True,
-                    )
-                    return False, state
-            # Late / retried completed frames sometimes drop the exact
-            # mission_id match after Isaac clears the active id. Still accept
-            # a fresh completed kitchen/table status for this label.
-            elif status and str(status.get("state", "")).lower() == "completed":
-                sid = str(status.get("mission_id", ""))
-                if label == "kitchen" and sid.startswith("kitchen_"):
-                    print(
-                        f"[mission] completed (id-relaxed): mission={sid} "
-                        f"waiting={mission_id} label={label}",
-                        flush=True,
-                    )
-                    return True, "completed"
-                if label.startswith("table_") and sid.startswith(f"{label}_"):
-                    print(
-                        f"[mission] completed (id-relaxed): mission={sid} "
-                        f"waiting={mission_id} label={label}",
-                        flush=True,
-                    )
-                    return True, "completed"
 
             now = time.monotonic()
             if now - last_log >= 2.0:
@@ -1150,7 +1164,7 @@ class SimplifiedPathNavigator:
                 # peers stay on hold until we arrive at the kitchen.
                 self._intent_table_id = saved_table
                 self._intent_phase = "parking_out"
-                pose = self._map_pose()
+                pose = self._cached_map_pose()
                 poly = (
                     [{"x": float(pose[0]), "y": float(pose[1])}]
                     if pose is not None
@@ -1236,7 +1250,7 @@ class SimplifiedPathNavigator:
                     "waiting at kitchen until peer returns home",
                     flush=True,
                 )
-                pose = self._map_pose()
+                pose = self._cached_map_pose()
                 poly = (
                     [{"x": float(pose[0]), "y": float(pose[1])}]
                     if pose is not None
@@ -1378,7 +1392,20 @@ class SimplifiedPathNavigator:
         yaw = resolve_map_yaw(self._nav, self._tf, self._tracker)
         if xy is None or yaw is None:
             return None
-        return xy[0], xy[1], yaw
+        pose = (xy[0], xy[1], yaw)
+        self._last_map_pose = pose
+        return pose
+
+    def _cached_map_pose(self) -> tuple[float, float, float] | None:
+        """Return a map pose without performing a blocking TF lookup."""
+        tracker = getattr(self, "_tracker", None)
+        xy = tracker.xy if tracker is not None else None
+        yaw = tracker.yaw if tracker is not None else None
+        if xy is not None and yaw is not None:
+            pose = (float(xy[0]), float(xy[1]), float(yaw))
+            self._last_map_pose = pose
+            return pose
+        return getattr(self, "_last_map_pose", None)
 
     def _motion_pose(self) -> tuple[float, float, float] | None:
         return self._control_pose

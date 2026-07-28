@@ -1,3 +1,6 @@
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
 from two_wheel_rails.autonomous_navigator import (
     SimplifiedPathNavigator,
     merge_short_segments,
@@ -82,3 +85,40 @@ def test_robot_corridor_lanes_are_separated():
 
     assert robot1._lane_x() == -0.70
     assert robot2._lane_x() == 0.70
+
+
+def test_cached_map_pose_uses_tracker_without_tf_lookup():
+    navigator = _bare_navigator()
+    navigator._tracker = SimpleNamespace(xy=(1.25, -0.75), yaw=0.4)
+    navigator._last_map_pose = None
+
+    with patch(
+        "two_wheel_rails.autonomous_navigator.resolve_map_xy",
+        side_effect=AssertionError("blocking TF lookup must not run"),
+    ), patch(
+        "two_wheel_rails.autonomous_navigator.resolve_map_yaw",
+        side_effect=AssertionError("blocking TF lookup must not run"),
+    ):
+        assert navigator._cached_map_pose() == (1.25, -0.75, 0.4)
+
+
+def test_mission_completion_is_handled_before_fleet_heartbeat():
+    navigator = _bare_navigator()
+    navigator._nav = Mock()
+    navigator._last_status = {
+        "mission_id": "table_0_test",
+        "state": "completed",
+        "phase": "completed",
+    }
+    navigator._intent_mission_id = "table_0_test"
+    navigator._publish_fleet_intent = Mock(
+        side_effect=AssertionError("heartbeat must not delay completion")
+    )
+
+    with patch("two_wheel_rails.autonomous_navigator.rclpy.spin_once"):
+        result = navigator._wait_for_mission_completion(
+            "table_0_test", 10.0, "table_0"
+        )
+
+    assert result == (True, "completed")
+    navigator._publish_fleet_intent.assert_not_called()
