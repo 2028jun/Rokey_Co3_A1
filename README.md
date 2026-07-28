@@ -39,44 +39,58 @@
 ### 시스템 아키텍처 (PC 3대 + 로봇 2대)
 
 ```mermaid
-flowchart TB
-    Browser["브라우저"] --> HMI["HMI 대시보드\nFastAPI + WebSocket"]
-    HMI -->|"/manager/order"| Fleet["Fleet Manager"]
-
-    subgraph Robots [ ]
-        direction LR
-        M1["robot1\nManager · Nav2 · 로봇팔"]
-        M2["robot2\nManager · Nav2 · 로봇팔"]
+flowchart LR
+    subgraph WebPC["PC 1 · 웹 UI"]
+        direction TB
+        Browser["브라우저"]
+        HMI["HMI 대시보드<br/>FastAPI · WebSocket"]
+        Browser --> HMI
     end
-    style Robots fill:none,stroke:none
 
-    Fleet --> M1
-    Fleet --> M2
+    subgraph MainPC["PC 2 · 로봇 제어 및 시뮬레이션"]
+        direction TB
+        Fleet["Fleet Manager"]
 
-    M1 --> Isaac["Isaac Sim\n식당 씬 · 로봇 2대"]
-    M2 --> Isaac
+        subgraph RobotControl["로봇별 제어"]
+            direction LR
+            M1["robot1<br/>Manager · Nav2 · 로봇팔"]
+            M2["robot2<br/>Manager · Nav2 · 로봇팔"]
+        end
 
-    subgraph Detectors [ ]
-        direction LR
-        Y1["hand_detector\nrobot1"]
-        Y2["hand_detector\nrobot2"]
+        Isaac["Isaac Sim<br/>식당 씬 · 로봇 2대"]
+
+        Fleet --> M1
+        Fleet --> M2
+        M1 --> Isaac
+        M2 --> Isaac
     end
-    style Detectors fill:none,stroke:none
 
+    subgraph YoloPC["PC 3 · 손 안전 감지"]
+        direction TB
+        Y1["hand_detector<br/>robot1"]
+        Y2["hand_detector<br/>robot2"]
+    end
+
+    HMI -->|"/manager/order"| Fleet
     Isaac -->|"카메라 압축 스트림"| Y1
     Isaac -->|"카메라 압축 스트림"| Y2
     Isaac -.->|"카메라 · 지도 · 상태"| HMI
 
-    classDef web fill:#e0e7ff,stroke:#4338ca,color:#1e1b4b,stroke-width:1.5px,rx:6,ry:6;
-    classDef main fill:#d1fae5,stroke:#047857,color:#022c22,stroke-width:1.5px,rx:6,ry:6;
-    classDef yolo fill:#ffedd5,stroke:#c2410c,color:#431407,stroke-width:1.5px,rx:6,ry:6;
-    class Browser,HMI web
-    class Fleet,M1,M2,Isaac main
-    class Y1,Y2 yolo
+    classDef web fill:#eef2ff,stroke:#4f46e5,color:#1e1b4b;
+    classDef main fill:#ecfdf5,stroke:#059669,color:#022c22;
+    classDef yolo fill:#fff7ed,stroke:#ea580c,color:#431407;
+    class Browser,HMI web;
+    class Fleet,M1,M2,Isaac main;
+    class Y1,Y2 yolo;
+
+    style WebPC fill:#f8faff,stroke:#818cf8,stroke-width:2px
+    style MainPC fill:#f6fffb,stroke:#34d399,stroke-width:2px
+    style RobotControl fill:none,stroke:#a7f3d0,stroke-dasharray:4 3
+    style YoloPC fill:#fffaf5,stroke:#fb923c,stroke-width:2px
 ```
 
-색 구분: 남색 = 웹 UI PC, 초록 = 메인 PC(Isaac Sim/Nav2/Fleet Manager), 주황
-= 원격 YOLO PC. hand_detector는 판정 결과(`hand_safety/intrusion`)를 각
+각 테두리는 실제 실행 환경인 웹 UI PC, 메인 PC, 원격 YOLO PC를 나타냅니다.
+hand_detector는 판정 결과(`hand_safety/intrusion`)를 각
 로봇의 Manager로 돌려보내 로봇팔 pause(`99`)/resume(`98`)에 사용합니다
 (화살표 교차를 줄이기 위해 다이어그램에는 표시하지 않음).
 
