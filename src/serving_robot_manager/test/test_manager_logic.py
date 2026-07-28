@@ -183,6 +183,7 @@ def test_new_order_at_confirmed_kitchen_skips_return_navigation():
     manager = _bare_manager()
     manager._nav_location = 4
     manager._nav_status = 2
+    manager._kitchen_arrival_confirmed = True
     manager._serve_queue = [Trip(1, 0, False)]
     manager._call_nav_command = Mock()
     manager._start_next_trip = Mock()
@@ -208,26 +209,32 @@ def test_unknown_kitchen_state_still_requests_return_navigation():
     manager._call_nav_command.assert_called_once_with(4)
 
 
-def test_soft_kitchen_arrival_skips_duplicate_return_for_queued_order():
-    """소프트 도착 확정 뒤 다음 주문이 중복 command=4를 보내지 않는다."""
+def test_kitchen_location_alone_does_not_release_queued_order():
+    """주방 좌표만 먼저 와도 이전 Navigation 종료 전 주문을 시작하지 않는다."""
     manager = _bare_manager(_State.RETURNING_TO_KITCHEN)
     manager._nav_location = 4
     manager._nav_status = 1
+    manager._nav_detail_state = 'PLANNING'
+    manager._nav_detail_phase = 'planning'
+    manager._nav_command_accepted = True
+    manager._nav_moving_confirmed = True
+    manager._kitchen_location_since = time.monotonic() - 30.0
     manager._kitchen_arrival_confirmed = False
     manager._publish_table_occupancy = Mock()
     manager._start_next_trip = Mock()
 
-    manager._complete_kitchen_arrival(reason='soft kitchen arrival')
+    manager._check_kitchen_arrival()
+
+    assert manager._state == _State.RETURNING_TO_KITCHEN
+    assert manager._kitchen_arrival_confirmed is False
+    manager._start_next_trip.assert_not_called()
+
+    manager._nav_status = 2
+    manager._nav_detail_state = 'SUCCEEDED'
+    manager._nav_detail_phase = 'completed'
+    manager._check_kitchen_arrival()
 
     assert manager._kitchen_arrival_confirmed is True
-    manager._start_next_trip.assert_called_once_with()
-
-    manager._serve_queue = [Trip(1, 0, False)]
-    manager._call_nav_command = Mock()
-    manager._start_next_trip.reset_mock()
-    manager._return_to_kitchen_for_next_trip()
-
-    manager._call_nav_command.assert_not_called()
     manager._start_next_trip.assert_called_once_with()
 
 

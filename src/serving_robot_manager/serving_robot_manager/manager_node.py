@@ -225,10 +225,9 @@ class ManagerNode(Node):
         self._nav_command_accepted = False
         self._nav_command_epoch = 0
         self._kitchen_location_since = None
-        # A stable kitchen location may be accepted before the navigation
-        # subsystem publishes its delayed terminal ARRIVED/detail messages.
-        # Preserve that decision across the COMPLETED display interval so a
-        # queued order does not issue a duplicate kitchen mission.
+        # Set only after the navigation subsystem's terminal ARRIVED/detail
+        # handshake. A kitchen pose alone can arrive while its worker is
+        # still active and must never release a queued order.
         self._kitchen_arrival_confirmed = False
         self._arm_status = None
         self._arm_working_confirmed = False
@@ -481,9 +480,17 @@ class ManagerNode(Node):
         # 직전 주행에서 주방 도착 위치와 ARRIVED 상태를 모두 확인했다면 중복 command=4를
         # 보내지 않는다. 위치나 상태 중 하나라도 불확실한 Manager 재시작 직후에는 기존처럼
         # 주방 복귀 명령으로 능동 확인한다.
+        terminal_kitchen_confirmed = bool(
+            getattr(self, '_kitchen_arrival_confirmed', False)
+        )
+        initialized_at_kitchen = (
+            self._nav_status == NAV_STATUS_ARRIVED
+            and getattr(self, '_nav_detail_state', None) == 'SUCCEEDED'
+            and getattr(self, '_nav_detail_phase', None)
+            in ('initialized', 'completed')
+        )
         if (self._nav_location == NAV_LOCATION_KITCHEN
-                and (self._nav_status == NAV_STATUS_ARRIVED
-                     or getattr(self, '_kitchen_arrival_confirmed', False))):
+                and (terminal_kitchen_confirmed or initialized_at_kitchen)):
             self.get_logger().info(
                 '🏠 현재 위치가 주방으로 확인되어 중복 주방 복귀를 생략합니다.')
             self._publish_table_occupancy('clear')
@@ -830,9 +837,8 @@ class ManagerNode(Node):
             self._kitchen_location_since = None
             return
 
-        now_mono = time.monotonic()
         if self._kitchen_location_since is None:
-            self._kitchen_location_since = now_mono
+            self._kitchen_location_since = time.monotonic()
 
         arrived = self._nav_status == NAV_STATUS_ARRIVED
         detail_ok = (
@@ -844,17 +850,6 @@ class ManagerNode(Node):
             return
         if arrived and detail_ok:
             self._complete_kitchen_arrival(reason='arrived+detail')
-            return
-        # Isaac already published kitchen location but ROS mission wait stalled
-        # on accepted. Free the robot after a short stable-location window.
-        if now_mono - self._kitchen_location_since >= 3.0:
-            self._complete_kitchen_arrival(
-                reason=(
-                    'soft kitchen arrival '
-                    f'(status={self._nav_status} detail='
-                    f'{self._nav_detail_state}/{self._nav_detail_phase})'
-                )
-            )
 
     def _complete_kitchen_arrival(self, reason: str = '') -> None:
         if self._state != _State.RETURNING_TO_KITCHEN:
