@@ -246,7 +246,7 @@ source install/setup.bash
 
 - ROS 2 Humble Base (Isaac Sim, GPU 불필요)
 - pip: `fastapi`, `uvicorn`
-- colcon 빌드 대상: `serving_robot_interfaces`, `serving_ui`
+- colcon 빌드 대상: `serving_robot_interfaces`, `serving_hmi`
 - 브라우저로 `http://localhost:8000` 접속 (주문 화면), `/admin`(관리자 화면)
 
 ```bash
