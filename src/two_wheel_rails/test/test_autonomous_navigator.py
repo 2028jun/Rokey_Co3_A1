@@ -113,6 +113,36 @@ def test_robot_corridor_lanes_are_separated():
     assert robot2._lane_x() == 0.70
 
 
+def test_fleet_lane_preserves_axis_aligned_route():
+    navigator = _bare_navigator(robot_id="robot1")
+    points = [(0.0, 5.0), (0.0, -2.2), (-1.17, -2.2)]
+
+    shifted = navigator._apply_fleet_lane(points, preserve_orthogonal=True)
+
+    assert shifted == [
+        {"x": 0.0, "y": 5.0},
+        {"x": -0.7, "y": 5.0},
+        {"x": -0.7, "y": -2.2},
+        {"x": -1.17, "y": -2.2},
+    ]
+    for start, end in zip(shifted, shifted[1:]):
+        assert start["x"] == end["x"] or start["y"] == end["y"]
+
+
+def test_fixed_route_mode_keeps_existing_lane_point_snap():
+    navigator = _bare_navigator(robot_id="robot1")
+
+    shifted = navigator._apply_fleet_lane(
+        [(0.0, 5.0), (0.0, -2.2), (-1.17, -2.2)]
+    )
+
+    assert shifted == [
+        {"x": 0.0, "y": 5.0},
+        {"x": -0.7, "y": -2.2},
+        {"x": -1.17, "y": -2.2},
+    ]
+
+
 def test_cached_map_pose_uses_tracker_without_tf_lookup():
     navigator = _bare_navigator()
     navigator._tracker = SimpleNamespace(xy=(1.25, -0.75), yaw=0.4)

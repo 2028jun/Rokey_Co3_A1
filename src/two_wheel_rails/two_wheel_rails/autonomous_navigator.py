@@ -215,11 +215,22 @@ def corner_rotation_is_clear(
 class SimplifiedPathNavigator:
     """Orthogonal L-path & A* navigator with Mission Command Orchestrator to Isaac Sim Direct Route State Machine."""
 
-    def __init__(self, nav: BasicNavigator, tf_buffer, tracker: AmclPoseTracker) -> None:
+    def __init__(
+        self,
+        nav: BasicNavigator,
+        tf_buffer,
+        tracker: AmclPoseTracker,
+        *,
+        enable_orthogonal_routes: bool = False,
+    ) -> None:
         self._nav = nav
         self._tf = tf_buffer
         self._tracker = tracker
         self._cfg = load_motion_config()
+        # The serving-stable Isaac fixed routes remain the production default.
+        # When explicitly enabled, ROS costmap L/A* points are also executed
+        # by Isaac instead of being used only for visualization/coordination.
+        self._enable_orthogonal_routes = bool(enable_orthogonal_routes)
         self._control_pose: tuple[float, float, float] | None = None
         self._control_twist: tuple[float, float] | None = None
         # Fleet heartbeat publication must never wait on synchronous TF
@@ -708,27 +719,63 @@ class SimplifiedPathNavigator:
         return (hx, hy)
 
     def _apply_fleet_lane(
-        self, points: list[dict] | list[Point]
+        self,
+        points: list[dict] | list[Point],
+        *,
+        preserve_orthogonal: bool = False,
     ) -> list[dict]:
-        """Shift corridor (near x=0) segments onto a per-robot lane.
+        """Shift central route points onto the per-robot corridor lane.
 
         robot1 keeps left of center, robot2 keeps right so simultaneous
-        kitchen departures do not share the exact same spine.
+        kitchen departures do not share the exact same spine. The production
+        fixed-route mode keeps the existing point-snap behavior. Optional
+        orthogonal execution inserts axis-aligned connectors so lane shifting
+        cannot turn a valid X/Y route into a diagonal segment.
         """
         lane_x = self._lane_x()
-        out: list[dict] = []
-        n = len(points)
-        for i, pt in enumerate(points):
+        raw: list[tuple[float, float]] = []
+        for pt in points:
             if isinstance(pt, dict):
                 x, y = float(pt["x"]), float(pt["y"])
             else:
                 x, y = float(pt[0]), float(pt[1])
-            if lane_x is not None and 0 < i < n - 1 and abs(x) < 0.55:
-                x = lane_x
-            out.append({"x": round(x, 4), "y": round(y, 4)})
-        # Drop near-duplicates after lane snap.
+            raw.append((x, y))
+        if lane_x is None or len(raw) < 2:
+            return [{"x": round(x, 4), "y": round(y, 4)} for x, y in raw]
+
+        if not preserve_orthogonal:
+            last_index = len(raw) - 1
+            return [
+                {
+                    "x": round(
+                        lane_x if 0 < index < last_index and abs(x) < 0.55 else x,
+                        4,
+                    ),
+                    "y": round(y, 4),
+                }
+                for index, (x, y) in enumerate(raw)
+            ]
+
+        out: list[tuple[float, float]] = [raw[0]]
+        for start, end in zip(raw, raw[1:]):
+            dx = end[0] - start[0]
+            dy = end[1] - start[1]
+            central_vertical = abs(dx) <= 0.03 and abs(start[0]) < 0.55
+            if central_vertical and abs(dy) > 0.03:
+                shifted_start = (lane_x, start[1])
+                if math.hypot(
+                    shifted_start[0] - out[-1][0],
+                    shifted_start[1] - out[-1][1],
+                ) > 0.05:
+                    out.append(shifted_start)
+                out.append((lane_x, end[1]))
+            else:
+                out.append(end)
+
+        # Drop near-duplicates after inserting horizontal lane connectors.
         cleaned: list[dict] = []
-        for p in out:
+        for x, y in out:
+            p = {"x": round(x, 4), "y": round(y, 4)}
             if (
                 not cleaned
                 or math.hypot(p["x"] - cleaned[-1]["x"], p["y"] - cleaned[-1]["y"])
@@ -919,6 +966,7 @@ class SimplifiedPathNavigator:
         final_yaw: float,
         phase: str,
         table_id: int | None,
+        use_orthogonal_route: bool,
         timeout_sec: float = 180.0,
     ) -> bool:
         for attempt in range(self._cfg.replan_attempts + 1):
@@ -934,25 +982,34 @@ class SimplifiedPathNavigator:
                 )
                 return False
 
-            if attempt > 0:
+            if attempt > 0 and use_orthogonal_route:
                 start_pt = (map_p[0], map_p[1])
                 goal_pt = points[-1] if points else start_pt
                 try:
                     points = self._plan_orthogonal_path(start_pt, goal_pt)
                 except RuntimeError as exc:
                     print(
-                        f"[{label}] replan failed (attempt {attempt}): {exc}",
+                        f"[{label}] orthogonal replan failed; "
+                        f"using fixed route (attempt {attempt}): {exc}",
                         flush=True,
                     )
-                    if attempt < self._cfg.replan_attempts:
-                        self._spin_sleep(0.5)
-                        continue
-                    return False
+                    points = remove_near_duplicate_points(
+                        [
+                            start_pt,
+                            (0.0, start_pt[1]),
+                            (0.0, goal_pt[1]),
+                            goal_pt,
+                        ]
+                    )
+                    use_orthogonal_route = False
 
             ctrl_points = [
                 {"x": round(p[0], 4), "y": round(p[1], 4)} for p in points
             ]
-            lane_points = self._apply_fleet_lane(ctrl_points)
+            lane_points = self._apply_fleet_lane(
+                ctrl_points,
+                preserve_orthogonal=use_orthogonal_route,
+            )
             self._publish_rviz_path(
                 self._pub_selected,
                 [(p["x"], p["y"]) for p in lane_points],
@@ -969,6 +1026,9 @@ class SimplifiedPathNavigator:
             mission_payload = {
                 "mission_id": mission_id,
                 "kind": "execute_route",
+                "route_mode": (
+                    "orthogonal" if use_orthogonal_route else "fixed"
+                ),
                 "points": lane_points,
                 "dock": {
                     "x": round(dock_x, 4),
@@ -981,7 +1041,8 @@ class SimplifiedPathNavigator:
             print(
                 f"[mission] sent mission={mission_id} points={len(lane_points)} "
                 f"dock=({dock_x:.3f},{dock_y:.3f}) phase={phase} "
-                f"lane={self._robot_id}",
+                f"lane={self._robot_id} route_mode="
+                f"{'orthogonal' if use_orthogonal_route else 'fixed'}",
                 flush=True,
             )
             self._intent_mission_id = mission_id
@@ -1289,12 +1350,36 @@ class SimplifiedPathNavigator:
             print(f"[{label}] {self._last_failure_reason}", flush=True)
             return False
         start_pt = (map_p[0], map_p[1])
-        try:
-            points = self._plan_orthogonal_path(start_pt, approach_pt)
-        except RuntimeError as exc:
-            self._last_failure_reason = f"orthogonal planning failed: {exc}"
-            print(f"[{label}] {self._last_failure_reason}", flush=True)
-            return False
+        if self._enable_orthogonal_routes:
+            try:
+                points = self._plan_orthogonal_path(start_pt, approach_pt)
+            except RuntimeError as exc:
+                print(
+                    f"[{label}] orthogonal planning failed; using fixed route: {exc}",
+                    flush=True,
+                )
+                points = [
+                    start_pt,
+                    (0.0, start_pt[1]),
+                    (0.0, approach_pt[1]),
+                    approach_pt,
+                ]
+                points = remove_near_duplicate_points(points)
+                use_orthogonal_route = False
+            else:
+                use_orthogonal_route = True
+        else:
+            # Mirror the current fixed-route corridor for Fleet intent/RViz
+            # without running costmap L/A*. Isaac selects its proven fixed
+            # table/kitchen route from the target ID in this mode.
+            points = [
+                start_pt,
+                (0.0, start_pt[1]),
+                (0.0, approach_pt[1]),
+                approach_pt,
+            ]
+            points = remove_near_duplicate_points(points)
+            use_orthogonal_route = False
 
         if self._intent_priority == 0.0:
             self._intent_priority = -float(time.monotonic())
@@ -1317,6 +1402,7 @@ class SimplifiedPathNavigator:
             final_yaw=normalize_angle(goal_yaw),
             phase=phase,
             table_id=mission_table,
+            use_orthogonal_route=use_orthogonal_route,
         )
         if ok and table_id is not None and not position_then_align:
             print(

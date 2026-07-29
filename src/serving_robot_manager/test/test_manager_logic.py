@@ -787,8 +787,18 @@ def test_plate_rack_shares_first_trip_and_encodes_plate_count():
         assert plate_only[0].spawn_command() == 100 * plate_count
 
 
-def test_failure_requests_arm_and_navigation_pause():
-    """실패 시 동작 중인 Arm과 Navigation에 pause를 보내는지 확인한다."""
+def test_all_pizza_types_use_pepperoni_spawn_command():
+    """HMI의 피자 3종 모두 현재 구현된 페퍼로니 스폰 코드 10을 쓴다."""
+    assert Trip(1, 0, False).spawn_command() == 10
+    assert Trip(2, 0, False).spawn_command() == 10
+    assert Trip(3, 0, False).spawn_command() == 10
+
+    # 피자 외 항목의 기존 가중치는 그대로 조합된다.
+    assert Trip(2, 2, True, 3).spawn_command() == 352
+
+
+def test_failure_aborts_arm_and_navigation_workers():
+    """실패 시 pause가 아니라 abort를 보내 남은 worker를 종료하는지 확인한다."""
     manager = _bare_manager(_State.ARM_SERVING)
     manager._arm_status = ARM_STATUS_WORKING
     manager._nav_status = NAV_STATUS_MOVING
@@ -801,8 +811,8 @@ def test_failure_requests_arm_and_navigation_pause():
 
     arm_request = manager._arm_client.call_async.call_args.args[0]
     nav_request = manager._nav_client.call_async.call_args.args[0]
-    assert arm_request.command == 99
-    assert nav_request.command == 99
+    assert arm_request.command == 97
+    assert nav_request.command == 97
 
 
 def test_hmi_emergency_stop_enters_failed_state():
@@ -813,6 +823,24 @@ def test_hmi_emergency_stop_enters_failed_state():
     manager._on_emergency_stop(type('Message', (), {'data': True})())
 
     manager._fail.assert_called_once_with()
+
+
+def test_hmi_emergency_stop_topic_is_global_for_both_robot_namespaces():
+    """robot1/robot2 Manager가 HMI의 동일한 전역 E-STOP 토픽을 구독한다."""
+    from serving_robot_manager.manager_node import EMERGENCY_STOP_TOPIC
+
+    assert EMERGENCY_STOP_TOPIC == '/serving_robot/emergency_stop'
+
+
+def test_hmi_emergency_stop_release_does_not_resume_automatically():
+    """E-STOP 해제 신호만으로 FAILED 작업을 자동 재개하지 않는다."""
+    manager = _bare_manager(_State.FAILED)
+    manager._fail = Mock()
+
+    manager._on_emergency_stop(type('Message', (), {'data': False})())
+
+    manager._fail.assert_not_called()
+    assert manager._state == _State.FAILED
 
 
 def test_inactive_navigation_moving_does_not_refresh_deadline():

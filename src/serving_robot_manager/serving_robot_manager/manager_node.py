@@ -50,6 +50,7 @@ from serving_robot_interfaces.srv import OrderRequest, TaskCommand
 
 # 자율주행 command / status (스펙 3장)
 NAV_CMD_KITCHEN = 4
+NAV_CMD_ABORT = 97
 NAV_CMD_RESUME = 98
 NAV_CMD_PAUSE = 99
 NAV_STATUS_MOVING = 1
@@ -63,6 +64,7 @@ TABLE_ID_MIN, TABLE_ID_MAX = 0, 3
 # 접시 개수는 스폰 명령에서만 전달하며 Arm은 같은 랙 동작을 사용한다.
 ARM_CMD_RESUME = 98
 ARM_CMD_PAUSE = 99
+ARM_CMD_ABORT = 97
 ARM_STATUS_WORKING = 1
 ARM_STATUS_COMPLETED = 2
 ARM_STATUS_FAILED = 3
@@ -74,13 +76,14 @@ ARM_CMD_PIZZA_WEIGHT = 10
 ARM_CMD_CUTLERY_WEIGHT = 20
 ARM_CMD_PLATE_RACK_WEIGHT = 40
 
-# 음식 스폰 command/status: 하위 두 자리는 음료 + 피자종류*10 + 식기*40,
-# 백의 자리는 접시 수(1~4)로 인코딩한다. 따라서 피자1+음료1+식기+접시2는
-# 251이다. Arm과 달리 피자 종류와 접시 수를 모두 보존해야 한다.
+# 음식 스폰 command/status: 하위 두 자리는 음료 + 피자*10 + 식기*40,
+# 백의 자리는 접시 수(1~4)로 인코딩한다. 따라서 피자+음료1+식기+접시2는
+# 251이다. 현재 피자 에셋은 페퍼로니 하나뿐이므로 HMI에서 선택한 피자
+# 종류와 관계없이 스폰 명령의 피자 부분은 항상 10을 사용한다.
 # status는 Arm과 동일한 관례
 # (0=IDLE,1=WORKING,2=COMPLETED,3=FAILED)를 스폰 노드 쪽에서 지켜야 한다.
 SPAWN_CMD_DRINK_WEIGHT = 1
-SPAWN_CMD_PIZZA_TYPE_WEIGHT = 10  # 피자 N번 -> 10*N
+SPAWN_CMD_PIZZA_WEIGHT = 10
 SPAWN_CMD_CUTLERY_WEIGHT = 40
 SPAWN_CMD_PLATE_COUNT_WEIGHT = 100
 SPAWN_STATUS_WORKING = 1
@@ -94,6 +97,7 @@ MAX_TRIPS_PER_ORDER = 20
 MAX_PENDING_ORDERS = 10
 COMPLETED_DISPLAY_SEC = 1.5  # 완료 상태를 최소 이 정도는 유지한 뒤 다음 단계로 넘어간다.
 NAVIGATION_HANDOFF_DELAY_SEC = 1.0  # 완료 발행 후 Navigation worker가 정리될 시간을 준다.
+EMERGENCY_STOP_TOPIC = '/serving_robot/emergency_stop'
 
 
 @dataclass
@@ -115,9 +119,9 @@ class Trip:
 
     def spawn_command(self):
         """음식 스폰 노드용 트립 명령 정수를 반환한다."""
-        # 스폰은 피자 종류를 구분해야 하므로 Arm과 다른 가중치를 쓴다.
+        # 마르게리따/콤비네이션도 현재 구현된 페퍼로니 에셋으로 스폰한다.
         return (self.drink_count * SPAWN_CMD_DRINK_WEIGHT
-                + (self.pizza_type * SPAWN_CMD_PIZZA_TYPE_WEIGHT if self.pizza_type else 0)
+                + (SPAWN_CMD_PIZZA_WEIGHT if self.pizza_type else 0)
                 + (SPAWN_CMD_CUTLERY_WEIGHT if self.cutlery else 0)
                 + self.plate_count * SPAWN_CMD_PLATE_COUNT_WEIGHT)
 
@@ -277,7 +281,7 @@ class ManagerNode(Node):
             Int32, 'food_spawn/status', self._on_spawn_status, 10)
         self.create_subscription(Bool, 'hand_safety/intrusion', self._on_hand_intrusion, 10)
         self.create_subscription(
-            Bool, 'serving_robot/emergency_stop', self._on_emergency_stop, 10)
+            Bool, EMERGENCY_STOP_TOPIC, self._on_emergency_stop, 10)
 
         # 늦게 연결된 UI도 마지막 시스템 상태를 즉시 받을 수 있게 상태 토픽은 latched QoS로
         # 발행한다. 일반 volatile 구독자와도 현재 이후의 발행은 호환된다.
@@ -1085,15 +1089,20 @@ class ManagerNode(Node):
         self._publish_system_status()
 
     def _send_best_effort_stop(self, failed_state):
-        """동작 중일 수 있는 하위 노드에 응답을 기다리지 않고 정지 명령을 보낸다."""
+        """실패한 작업을 종료해 fault reset 뒤에 작업자가 남지 않게 한다.
+
+        99(pause)는 손 침입이 사라진 뒤 98(resume)으로 이어서 수행할 때만
+        사용한다. FAILED 전환에서 pause를 사용하면 Isaac 작업과 Navigation
+        worker가 계속 살아 있어 reset_fault 이후의 새 주문을 막는다.
+        """
         if (not self._navigation_only
                 and (failed_state in (_State.ARM_SERVING, _State.ARM_PAUSED)
                      or self._arm_status == ARM_STATUS_WORKING)):
-            self._call_emergency_command(self._arm_client, 'Arm', ARM_CMD_PAUSE)
+            self._call_emergency_command(self._arm_client, 'Arm', ARM_CMD_ABORT)
         if (failed_state in (_State.RETURNING_TO_KITCHEN, _State.MOVING_TO_TABLE)
                 or self._nav_status == NAV_STATUS_MOVING):
             self._call_emergency_command(
-                self._nav_client, 'Navigation', NAV_CMD_PAUSE)
+                self._nav_client, 'Navigation', NAV_CMD_ABORT)
 
     def _call_emergency_command(self, client, subsystem, command):
         request = TaskCommand.Request()

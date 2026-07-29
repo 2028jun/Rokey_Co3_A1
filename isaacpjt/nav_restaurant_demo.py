@@ -19,6 +19,7 @@ import gc
 from pathlib import Path
 
 from fleet_peer_yield import in_narrow_forward_strip, is_later_active_order
+from orthogonal_route_execution import build_axis_stages, parse_route_points
 
 
 # Arm serving targets are expressed in the docked robot frame.  The former
@@ -30,6 +31,23 @@ DOCK_XY_TOLERANCE_M = float(
 )
 DOCK_YAW_TOLERANCE_RAD = math.radians(
     float(os.environ.get("NAV_DOCK_YAW_TOLERANCE_DEG", "1.0"))
+)
+# A skid-steer base can settle a few centimetres short of the exact point
+# while remaining well aligned with the table.  Treat that as a valid dock
+# when both lateral and yaw errors are already tight; otherwise a harmless
+# 4 cm residual used to run out the 60 s timer and trigger a full second
+# approach.  These bounds still keep the arm/table geometry deterministic.
+DOCK_ALIGNED_FORWARD_TOLERANCE_M = float(
+    os.environ.get("NAV_DOCK_ALIGNED_FORWARD_TOLERANCE_M", "0.045")
+)
+DOCK_ALIGNED_LATERAL_TOLERANCE_M = float(
+    os.environ.get("NAV_DOCK_ALIGNED_LATERAL_TOLERANCE_M", "0.025")
+)
+DOCK_FINAL_MAX_SPEED_MPS = float(
+    os.environ.get("NAV_DOCK_FINAL_MAX_SPEED_MPS", "0.18")
+)
+DOCK_FINAL_MIN_SPEED_MPS = float(
+    os.environ.get("NAV_DOCK_FINAL_MIN_SPEED_MPS", "0.035")
 )
 
 WORKSPACE = Path(
@@ -2100,6 +2118,7 @@ class NavBridge(Node):
         self._pending_teleport = None  # (x, y, z, yaw) applied on sim thread
         self._pending_food_spawn = None
         self._pending_arm_command = None
+        self._pending_arm_abort = False
         self._active_serving_task = None
         self._serving_paused = False
         self._serving_pause_started_at = None
@@ -2419,6 +2438,15 @@ class NavBridge(Node):
 
     def _queue_arm_command(self, command):
         with self._lock:
+            if command == 97:
+                # The ROS callback must not mutate USD/task objects.  The
+                # simulation thread consumes this flag on its next tick.  An
+                # apparently idle bridge also publishes FAILED here so a stale
+                # latched WORKING status cannot block reset_fault forever.
+                self._pending_arm_abort = True
+                self._serving_paused = False
+                self._serving_pause_started_at = None
+                return True
             if command == 99:
                 if (
                     self._active_serving_task is None
@@ -2714,7 +2742,32 @@ class NavBridge(Node):
             "accepted", "accepted", target=target
         )
 
-        if not self._queue_navigation(target):
+        route_request = None
+        if kind == "execute_route" and payload.get("route_mode") == "orthogonal":
+            try:
+                route_points = parse_route_points(points)
+                if self._active_two_wheel_goal is None:
+                    raise ValueError("orthogonal route requires a valid dock")
+                route_request = {
+                    "target": target,
+                    "points": route_points,
+                    "dock": self._active_two_wheel_goal,
+                    "finish_after_route": bool(
+                        payload.get("finish_after_route", False)
+                    ),
+                    "final_yaw": float(
+                        payload.get(
+                            "final_yaw", self._active_two_wheel_goal[2]
+                        )
+                    ),
+                }
+            except (TypeError, ValueError) as exc:
+                self.get_logger().warning(
+                    "[Mission RX] invalid orthogonal route; using fixed "
+                    f"target route: {exc}"
+                )
+
+        if not self._queue_navigation(target, route_request=route_request):
             self._publish_two_wheel_mission_status(
                 "failed",
                 "queue_rejected",
@@ -2728,7 +2781,7 @@ class NavBridge(Node):
     def _on_navigation_trigger(self, msg: Int32):
         self._queue_navigation(int(msg.data))
 
-    def _queue_navigation(self, target):
+    def _queue_navigation(self, target, route_request=None):
         if target == 99:
             with self._lock:
                 if self._direct_nav is None and self._direct_nav_request is None:
@@ -2762,14 +2815,14 @@ class NavBridge(Node):
                 # Kitchen return is also the escape path from a stalled or
                 # imperfect table dock.  Let the simulation thread atomically
                 # replace the current controller on its next update.
-                self._direct_nav_request = 4
+                self._direct_nav_request = route_request or 4
                 self._target_vx = 0.0
                 self._target_wz = 0.0
                 self.get_logger().warning(
                     "preempting active navigation for kitchen return"
                 )
                 return True
-            self._direct_nav_request = target
+            self._direct_nav_request = route_request or target
             self._target_vx = 0.0
             self._target_wz = 0.0
         self.get_logger().info(
@@ -3365,7 +3418,9 @@ class NavBridge(Node):
         # Match the proven controller's limit exactly.
         return np.clip(wheels, -8.0, 8.0)
 
-    def _start_direct_navigation(self, target, x, y, yaw):
+    def _start_direct_navigation(self, request, x, y, yaw):
+        route_request = request if isinstance(request, dict) else None
+        target = int(route_request["target"] if route_request else request)
         kitchen_dock = self._active_two_wheel_goal or (
             0.0,
             5.25,
@@ -3401,6 +3456,48 @@ class NavBridge(Node):
                 "without moving"
             )
             return
+        if route_request is not None:
+            try:
+                stages = build_axis_stages(route_request["points"])
+                finish_after_route = bool(
+                    route_request.get("finish_after_route", False)
+                )
+                dock = tuple(route_request["dock"])
+                if finish_after_route:
+                    final_yaw = float(
+                        route_request.get("final_yaw", dock[2])
+                    )
+                    stages.append({"kind": "pivot", "yaw": final_yaw})
+                    mode = "planned_axis_route"
+                else:
+                    mode = "table_transfer"
+                self._direct_nav = {
+                    "mode": mode,
+                    "target": target,
+                    "goal": dock,
+                    "stages": stages,
+                    "index": 0,
+                    "stage_start": time.monotonic(),
+                    "last_log": 0.0,
+                }
+                self._obstacle_stop = False
+                self._obstacle_stop_started = None
+                self._obstacle_stop_from_peer = False
+                self._clearance_start = None
+                self._cmd_vx = self._cmd_wz = 0.0
+                self._target_vx = self._target_wz = 0.0
+                self.get_logger().info(
+                    f"planned orthogonal route started target={target} "
+                    f"points={len(route_request['points'])} "
+                    f"stages={len(stages)} mode={mode}"
+                )
+                return
+            except (KeyError, TypeError, ValueError) as exc:
+                self.get_logger().error(
+                    "planned route conversion failed; using fixed route: "
+                    f"{exc}"
+                )
+
         aisle_x = self._fleet_aisle_x()
         stages = (
             build_kitchen_route(
@@ -3770,7 +3867,11 @@ class NavBridge(Node):
             axis = x if kind == "axis_x" else y
             # Live retarget corridor x to the peer-aware lane so a head-on
             # pair peels apart even if the stage was planned on a narrow aisle.
-            if kind == "axis_x" and abs(float(stage.get("value", 0.0))) <= 0.85:
+            if (
+                kind == "axis_x"
+                and not stage.get("planned_route", False)
+                and abs(float(stage.get("value", 0.0))) <= 0.85
+            ):
                 stage["value"] = self._fleet_aisle_x()
             error = stage["value"] - axis
             done = abs(error) <= 0.05
@@ -3837,15 +3938,23 @@ class NavBridge(Node):
         # Lane hold only while translating and roughly aligned. Constant-sign
         # peer swerve + raw (aisle-x) on northbound axis_y turned robot1 CW
         # into +X and parked it in the east table bay (table 4).
-        if kind == "axis_y" and abs(vx) > 1e-3:
+        if kind in ("axis_x", "axis_y") and abs(vx) > 1e-3:
             desired_yaw = float(stage["yaw"])
             yaw_error = self._angle_error(desired_yaw, yaw)
             if abs(yaw_error) < math.radians(25.0):
-                aisle = self._fleet_aisle_x()
-                lat_err = aisle - x
-                # Heading-aware crosstrack: northbound (+Y) needs
-                # wz = -k*(aisle-x); southbound the opposite.
-                lane_wz = -1.15 * lat_err * math.sin(desired_yaw)
+                if stage.get("planned_route", False):
+                    cross_axis = stage.get("cross_axis")
+                    cross_now = x if cross_axis == "x" else y
+                    cross_target = float(stage.get("cross_value", cross_now))
+                    lat_err = cross_target - cross_now
+                elif kind == "axis_y":
+                    lat_err = self._fleet_aisle_x() - x
+                else:
+                    lat_err = 0.0
+                if kind == "axis_x":
+                    lane_wz = 1.15 * lat_err * math.cos(desired_yaw)
+                else:
+                    lane_wz = -1.15 * lat_err * math.sin(desired_yaw)
                 peer_near = float(
                     getattr(self, "_peer_near_dist", float("inf"))
                 )
@@ -4008,8 +4117,17 @@ class NavBridge(Node):
             yaw_error = self._angle_error(goal_yaw, yaw)
             forward_error = math.cos(goal_yaw) * dx + math.sin(goal_yaw) * dy
             lateral_error = -math.sin(goal_yaw) * dx + math.cos(goal_yaw) * dy
-            position_ok = distance <= DOCK_XY_TOLERANCE_M
             yaw_ok = abs(yaw_error) <= DOCK_YAW_TOLERANCE_RAD
+            position_ok = (
+                distance <= DOCK_XY_TOLERANCE_M
+                or (
+                    abs(forward_error)
+                    <= DOCK_ALIGNED_FORWARD_TOLERANCE_M
+                    and abs(lateral_error)
+                    <= DOCK_ALIGNED_LATERAL_TOLERANCE_M
+                    and yaw_ok
+                )
+            )
             if (
                 abs(lateral_error) > 0.05
                 and abs(forward_error) < 0.10
@@ -4032,9 +4150,21 @@ class NavBridge(Node):
             elif not position_ok:
                 phase = "final_forward_approach"
                 if abs(yaw_error) <= math.radians(8.0):
-                    vx = float(np.clip(0.45 * forward_error, -0.04, 0.08))
-                    if abs(vx) < 0.015 and abs(forward_error) > 0.004:
-                        vx = math.copysign(0.015, forward_error)
+                    vx = float(
+                        np.clip(
+                            0.80 * forward_error,
+                            -0.05,
+                            DOCK_FINAL_MAX_SPEED_MPS,
+                        )
+                    )
+                    if (
+                        abs(vx) < DOCK_FINAL_MIN_SPEED_MPS
+                        and abs(forward_error)
+                        > DOCK_ALIGNED_FORWARD_TOLERANCE_M
+                    ):
+                        vx = math.copysign(
+                            DOCK_FINAL_MIN_SPEED_MPS, forward_error
+                        )
                 wz = float(
                     # Positive lateral error is to the goal-frame left and
                     # therefore requires positive yaw.  The copied controller
@@ -4290,10 +4420,37 @@ class NavBridge(Node):
                 self.spawn_status_pub.publish(Int32(data=3))  # 3 = FAILED
 
         with self._lock:
+            abort_arm = self._pending_arm_abort
+            self._pending_arm_abort = False
             arm_command = self._pending_arm_command
             self._pending_arm_command = None
 
-        if arm_command is not None:
+        if abort_arm:
+            if self._active_serving_task is not None:
+                self._active_serving_task.close()
+            self._active_serving_task = None
+            self._pending_arm_command = None
+            self._arm_returning_to_stow = False
+            self._tray_returning_home = False
+            self._serving_paused = False
+            self._serving_pause_started_at = None
+            self._arm_stow_started_at = None
+            self._arm_stow_command = None
+            self._arm_stow_last_update = None
+            self._arm_stow_last_log = None
+            self._tray_home_started_at = None
+            self._tray_home_start = None
+            self._tray_home_step = 0
+            self._active_delivery_table = None
+            self._spawned_serving_tasks = {}
+            self._pending_plate_count = 0
+            remove_parking_brake(self.stage, self.articulation.prim_path)
+            self.arm_status_pub.publish(Int32(data=3))
+            self.get_logger().warning(
+                "[integrated-serving] active delivery aborted for fault reset"
+            )
+
+        if arm_command is not None and not abort_arm:
             try:
                 # Match the successful standalone serving tests exactly:
                 # lock the chassis before constructing any task. Constructors

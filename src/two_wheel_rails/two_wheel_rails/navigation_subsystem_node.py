@@ -29,6 +29,7 @@ from two_wheel_rails.rail_geometry import load_routes
 
 TABLE_COMMANDS = {0, 1, 2, 3}
 KITCHEN_COMMAND = 4
+ABORT_COMMAND = 97
 RESUME_COMMAND = 98
 PAUSE_COMMAND = 99
 
@@ -57,7 +58,11 @@ class NavigationSubsystemNode(Node):
     def __init__(self) -> None:
         super().__init__("navigation_subsystem")
         self.declare_parameter("routes_file", "")
+        self.declare_parameter("enable_orthogonal_routes", False)
         routes_file = str(self.get_parameter("routes_file").value or "")
+        self._enable_orthogonal_routes = bool(
+            self.get_parameter("enable_orthogonal_routes").value
+        )
         self._routes = load_routes()
         if routes_file:
             overrides = load_routes(routes_file)
@@ -117,11 +122,16 @@ class NavigationSubsystemNode(Node):
         )
         self._publish_status(NAV_IDLE, "IDLE", "idle")
         self.get_logger().info(
-            "navigation subsystem ready: commands 0..4, pause=99, resume=98"
+            "navigation subsystem ready: commands 0..4, abort=97, "
+            "pause=99, resume=98, "
+            f"route_mode={'orthogonal' if self._enable_orthogonal_routes else 'fixed'}"
         )
 
     def _on_command(self, request, response):
         command = int(request.command)
+        if command == ABORT_COMMAND:
+            response.success = self._abort()
+            return response
         if command == PAUSE_COMMAND:
             response.success = self._pause()
             return response
@@ -183,7 +193,12 @@ class NavigationSubsystemNode(Node):
         self._worker_nav = nav
         self._tf_buffer = tf_buffer
         self._tracker = tracker
-        self._controller = SimplifiedPathNavigator(nav, tf_buffer, tracker)
+        self._controller = SimplifiedPathNavigator(
+            nav,
+            tf_buffer,
+            tracker,
+            enable_orthogonal_routes=self._enable_orthogonal_routes,
+        )
 
     def _run_initialize(self) -> None:
         try:
@@ -341,6 +356,17 @@ class NavigationSubsystemNode(Node):
             self._paused = True
         self._send_control("pause")
         self._publish_status(NAV_PAUSED, "PAUSED", "paused")
+        return True
+
+    def _abort(self) -> bool:
+        """Cancel the live mission instead of leaving a paused worker behind."""
+        with self._lock:
+            if self._worker is None or not self._worker.is_alive():
+                return False
+            self._paused = False
+            self._failure_reason = "aborted by manager fault handling"
+        self._send_control("cancel")
+        self._publish_status(NAV_FAILED, "CANCELLED", "manager_abort")
         return True
 
     def _resume(self) -> bool:

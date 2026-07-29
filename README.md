@@ -320,7 +320,17 @@ serialize_shared_payloads:=false
 enable_local_hand_detection:=false
 enable_jpeg_transport:=true
 jpeg_quality:=90
+enable_orthogonal_routes:=false
 use_sim_time:=true
+```
+
+기본값은 검증된 고정 루트입니다. costmap을 이용해 두 L자 후보를 비교하고,
+두 후보가 막혔을 때 직교 A* 경로를 생성하여 Isaac 실제 주행에 적용하려면 ROS
+스택을 아래처럼 실행하십시오. 직교 계획 또는 payload 검증이 실패하면 해당
+미션은 고정 루트로 자동 전환됩니다.
+
+```bash
+./tools/t2_ros.sh enable_orthogonal_routes:=true
 ```
 
 `robot1`, `robot2` 모두 `Navigation is fully initialized and ready!`를

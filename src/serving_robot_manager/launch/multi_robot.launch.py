@@ -37,6 +37,7 @@ def _worker(
     enable_local_hand_detection,
     enable_jpeg_transport,
     jpeg_quality,
+    enable_orthogonal_routes,
 ):
     nav_share = get_package_share_directory("two_wheel_rails")
     nav_launch = os.path.join(nav_share, "launch", "nav2.launch.py")
@@ -68,7 +69,13 @@ def _worker(
         Node(
             package="two_wheel_rails", executable="navigation_subsystem",
             name="navigation_subsystem", output="screen",
-            parameters=[{"use_sim_time": use_sim_time, "routes_file": routes_file}],
+            parameters=[{
+                "use_sim_time": use_sim_time,
+                "routes_file": routes_file,
+                "enable_orthogonal_routes": ParameterValue(
+                    enable_orthogonal_routes, value_type=bool
+                ),
+            }],
             remappings=[("/tf", "tf"), ("/tf_static", "tf_static")],
         ),
         Node(
@@ -135,6 +142,7 @@ def generate_launch_description():
     )
     enable_jpeg_transport = LaunchConfiguration("enable_jpeg_transport")
     jpeg_quality = LaunchConfiguration("jpeg_quality")
+    enable_orthogonal_routes = LaunchConfiguration("enable_orthogonal_routes")
     serialize_shared_payloads = LaunchConfiguration("serialize_shared_payloads")
     nav_share = get_package_share_directory("two_wheel_rails")
     config = os.path.join(nav_share, "config")
@@ -143,13 +151,13 @@ def generate_launch_description():
         "robot1", "-0.90", os.path.join(config, "routes_robot1.yaml"),
         use_sim_time, enable_serving, navigation_only,
         enable_local_hand_detection,
-        enable_jpeg_transport, jpeg_quality,
+        enable_jpeg_transport, jpeg_quality, enable_orthogonal_routes,
     )
     robot2_worker = _worker(
         "robot2", "0.90", os.path.join(config, "routes_robot2.yaml"),
         use_sim_time, enable_serving, navigation_only,
         enable_local_hand_detection,
-        enable_jpeg_transport, jpeg_quality,
+        enable_jpeg_transport, jpeg_quality, enable_orthogonal_routes,
     )
     robot1_gate = Node(
         package="two_wheel_rails",
@@ -246,6 +254,14 @@ def generate_launch_description():
             description=(
                 "Legacy diagnostic serialization switch. Isolated robot "
                 "payload roots allow the default false setting."
+            ),
+        ),
+        DeclareLaunchArgument(
+            "enable_orthogonal_routes",
+            default_value="false",
+            description=(
+                "Execute ROS costmap L/orthogonal A* routes in Isaac. "
+                "Default false keeps the serving-stable fixed routes."
             ),
         ),
         robot1_worker,
