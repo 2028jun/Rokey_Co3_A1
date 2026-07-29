@@ -1,6 +1,6 @@
 # Robot 2 starts in the right kitchen slot. Routes are populated at install
 # time by the same table geometry used by routes.yaml.
 frame_id: map
-kitchen: {x: 0.70, y: 5.25, yaw: -1.5707963267948966}
-spawn: {x: 0.70, y: 5.25, yaw: -1.5707963267948966}
+kitchen: {x: 0.90, y: 5.25, yaw: -1.5707963267948966}
+spawn: {x: 0.90, y: 5.25, yaw: -1.5707963267948966}
 routes: {}

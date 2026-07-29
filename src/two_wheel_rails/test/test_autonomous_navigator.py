@@ -53,11 +53,24 @@ def test_same_side_peer_does_not_block_kitchen_departure():
     assert navigator._opposite_outbound_blocker(0) is None
 
 
-def test_opposite_side_later_priority_waits_at_kitchen():
+def test_opposite_side_outbound_peer_does_not_serialize_departure():
     navigator = _bare_navigator(robot_id="robot2", priority=-101.0)
     navigator._peer_intents["robot1"] = {
         "active": True,
         "phase": "approaching",
+        "table_id": 0,
+        "priority": -100.0,
+        "pose_xy": (0.0, 2.0),
+    }
+
+    assert navigator._opposite_outbound_blocker(1) is None
+
+
+def test_opposite_side_later_priority_waits_for_returning_peer():
+    navigator = _bare_navigator(robot_id="robot2", priority=-101.0)
+    navigator._peer_intents["robot1"] = {
+        "active": True,
+        "phase": "returning",
         "table_id": 0,
         "priority": -100.0,
         "pose_xy": (0.0, 2.0),
@@ -98,22 +111,6 @@ def test_robot_corridor_lanes_are_separated():
 
     assert robot1._lane_x() == -0.70
     assert robot2._lane_x() == 0.70
-
-
-def test_fleet_lane_preserves_axis_aligned_route():
-    navigator = _bare_navigator(robot_id="robot1")
-    points = [(0.0, 5.0), (0.0, -2.2), (-1.17, -2.2)]
-
-    shifted = navigator._apply_fleet_lane(points)
-
-    assert shifted == [
-        {"x": 0.0, "y": 5.0},
-        {"x": -0.7, "y": 5.0},
-        {"x": -0.7, "y": -2.2},
-        {"x": -1.17, "y": -2.2},
-    ]
-    for start, end in zip(shifted, shifted[1:]):
-        assert start["x"] == end["x"] or start["y"] == end["y"]
 
 
 def test_cached_map_pose_uses_tracker_without_tf_lookup():

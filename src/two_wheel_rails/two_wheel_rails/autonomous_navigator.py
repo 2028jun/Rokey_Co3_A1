@@ -564,7 +564,15 @@ class SimplifiedPathNavigator:
         )
 
     def _opposite_outbound_blocker(self, my_table: int | None) -> str | None:
-        """Return the earlier peer still using the opposite-side aisle."""
+        """Return an earlier peer creating a real head-on corridor conflict.
+
+        Outbound robots use separate fleet lanes and travel south in the same
+        direction, so serializing every west/east table pair adds a full-trip
+        delay without preventing a head-on collision.  Keep priority waiting
+        only while the peer is returning north or parking out into the shared
+        corridor.  The narrow peer hard-stop remains the final close-range
+        guard for all phases.
+        """
         my_side = self._table_side(my_table)
         if my_side is None:
             return None
@@ -576,13 +584,7 @@ class SimplifiedPathNavigator:
         if not peer_side or peer_side == my_side:
             return None
         phase = str(intent.get("phase", "idle") or "idle").lower()
-        if phase not in (
-            "approaching",
-            "holding",
-            "navigating",
-            "returning",
-            "parking_out",
-        ):
+        if phase not in ("returning", "parking_out"):
             return None
         if self._peer_cleared_corridor(intent):
             return None
@@ -708,42 +710,25 @@ class SimplifiedPathNavigator:
     def _apply_fleet_lane(
         self, points: list[dict] | list[Point]
     ) -> list[dict]:
-        """Shift central vertical segments while preserving orthogonality.
+        """Shift corridor (near x=0) segments onto a per-robot lane.
 
         robot1 keeps left of center, robot2 keeps right so simultaneous
         kitchen departures do not share the exact same spine.
         """
         lane_x = self._lane_x()
-        raw: list[tuple[float, float]] = []
-        for pt in points:
+        out: list[dict] = []
+        n = len(points)
+        for i, pt in enumerate(points):
             if isinstance(pt, dict):
                 x, y = float(pt["x"]), float(pt["y"])
             else:
                 x, y = float(pt[0]), float(pt[1])
-            raw.append((x, y))
-        if lane_x is None or len(raw) < 2:
-            return [{"x": round(x, 4), "y": round(y, 4)} for x, y in raw]
-
-        out: list[tuple[float, float]] = [raw[0]]
-        for start, end in zip(raw, raw[1:]):
-            dx = end[0] - start[0]
-            dy = end[1] - start[1]
-            central_vertical = abs(dx) <= 0.03 and abs(start[0]) < 0.55
-            if central_vertical and abs(dy) > 0.03:
-                shifted_start = (lane_x, start[1])
-                if math.hypot(
-                    shifted_start[0] - out[-1][0],
-                    shifted_start[1] - out[-1][1],
-                ) > 0.05:
-                    out.append(shifted_start)
-                out.append((lane_x, end[1]))
-            else:
-                out.append(end)
-
-        # Drop near-duplicates after inserting horizontal lane connectors.
+            if lane_x is not None and 0 < i < n - 1 and abs(x) < 0.55:
+                x = lane_x
+            out.append({"x": round(x, 4), "y": round(y, 4)})
+        # Drop near-duplicates after lane snap.
         cleaned: list[dict] = []
-        for x, y in out:
-            p = {"x": round(x, 4), "y": round(y, 4)}
+        for p in out:
             if (
                 not cleaned
                 or math.hypot(p["x"] - cleaned[-1]["x"], p["y"] - cleaned[-1]["y"])

@@ -62,16 +62,6 @@ class RvizTfAggregator(Node):
             for source, suffix, source_qos in (
                 ("plan", "plan", live_path_qos),
                 ("local_plan", "local_plan", live_path_qos),
-                (
-                    "orthogonal_path/l_candidate_x_first",
-                    "l_candidate_x_first",
-                    path_qos,
-                ),
-                (
-                    "orthogonal_path/l_candidate_y_first",
-                    "l_candidate_y_first",
-                    path_qos,
-                ),
                 ("orthogonal_path/selected", "selected_path", path_qos),
                 ("orthogonal_path/dock_approach", "dock_approach", path_qos),
             ):

@@ -19,7 +19,6 @@ import gc
 from pathlib import Path
 
 from fleet_peer_yield import in_narrow_forward_strip, is_later_active_order
-from orthogonal_route_execution import build_axis_stages, parse_route_points
 
 
 # Arm serving targets are expressed in the docked robot frame.  The former
@@ -2715,32 +2714,7 @@ class NavBridge(Node):
             "accepted", "accepted", target=target
         )
 
-        route_request = None
-        if kind == "execute_route":
-            try:
-                route_points = parse_route_points(points)
-                if self._active_two_wheel_goal is None:
-                    raise ValueError("execute_route requires a valid dock")
-                route_request = {
-                    "target": target,
-                    "points": route_points,
-                    "dock": self._active_two_wheel_goal,
-                    "finish_after_route": bool(
-                        payload.get("finish_after_route", False)
-                    ),
-                    "final_yaw": float(
-                        payload.get(
-                            "final_yaw", self._active_two_wheel_goal[2]
-                        )
-                    ),
-                }
-            except (TypeError, ValueError) as exc:
-                self.get_logger().warning(
-                    f"[Mission RX] invalid planned route; using legacy "
-                    f"target route: {exc}"
-                )
-
-        if not self._queue_navigation(target, route_request=route_request):
+        if not self._queue_navigation(target):
             self._publish_two_wheel_mission_status(
                 "failed",
                 "queue_rejected",
@@ -2754,7 +2728,7 @@ class NavBridge(Node):
     def _on_navigation_trigger(self, msg: Int32):
         self._queue_navigation(int(msg.data))
 
-    def _queue_navigation(self, target, route_request=None):
+    def _queue_navigation(self, target):
         if target == 99:
             with self._lock:
                 if self._direct_nav is None and self._direct_nav_request is None:
@@ -2788,14 +2762,14 @@ class NavBridge(Node):
                 # Kitchen return is also the escape path from a stalled or
                 # imperfect table dock.  Let the simulation thread atomically
                 # replace the current controller on its next update.
-                self._direct_nav_request = route_request or 4
+                self._direct_nav_request = 4
                 self._target_vx = 0.0
                 self._target_wz = 0.0
                 self.get_logger().warning(
                     "preempting active navigation for kitchen return"
                 )
                 return True
-            self._direct_nav_request = route_request or target
+            self._direct_nav_request = target
             self._target_vx = 0.0
             self._target_wz = 0.0
         self.get_logger().info(
@@ -3391,9 +3365,7 @@ class NavBridge(Node):
         # Match the proven controller's limit exactly.
         return np.clip(wheels, -8.0, 8.0)
 
-    def _start_direct_navigation(self, request, x, y, yaw):
-        route_request = request if isinstance(request, dict) else None
-        target = int(route_request["target"] if route_request else request)
+    def _start_direct_navigation(self, target, x, y, yaw):
         kitchen_dock = self._active_two_wheel_goal or (
             0.0,
             5.25,
@@ -3429,47 +3401,6 @@ class NavBridge(Node):
                 "without moving"
             )
             return
-        if route_request is not None:
-            try:
-                stages = build_axis_stages(route_request["points"])
-                finish_after_route = bool(
-                    route_request.get("finish_after_route", False)
-                )
-                dock = tuple(route_request["dock"])
-                if finish_after_route:
-                    final_yaw = float(
-                        route_request.get("final_yaw", dock[2])
-                    )
-                    stages.append({"kind": "pivot", "yaw": final_yaw})
-                    mode = "planned_axis_route"
-                else:
-                    mode = "table_transfer"
-                self._direct_nav = {
-                    "mode": mode,
-                    "target": target,
-                    "goal": dock,
-                    "stages": stages,
-                    "index": 0,
-                    "stage_start": time.monotonic(),
-                    "last_log": 0.0,
-                }
-                self._obstacle_stop = False
-                self._obstacle_stop_started = None
-                self._obstacle_stop_from_peer = False
-                self._clearance_start = None
-                self._cmd_vx = self._cmd_wz = 0.0
-                self._target_vx = self._target_wz = 0.0
-                self.get_logger().info(
-                    f"planned orthogonal route started target={target} "
-                    f"points={len(route_request['points'])} "
-                    f"stages={len(stages)} mode={mode}"
-                )
-                return
-            except (KeyError, TypeError, ValueError) as exc:
-                self.get_logger().error(
-                    f"planned route conversion failed; using legacy route: {exc}"
-                )
-
         aisle_x = self._fleet_aisle_x()
         stages = (
             build_kitchen_route(
@@ -3839,11 +3770,7 @@ class NavBridge(Node):
             axis = x if kind == "axis_x" else y
             # Live retarget corridor x to the peer-aware lane so a head-on
             # pair peels apart even if the stage was planned on a narrow aisle.
-            if (
-                kind == "axis_x"
-                and not stage.get("planned_route", False)
-                and abs(float(stage.get("value", 0.0))) <= 0.85
-            ):
+            if kind == "axis_x" and abs(float(stage.get("value", 0.0))) <= 0.85:
                 stage["value"] = self._fleet_aisle_x()
             error = stage["value"] - axis
             done = abs(error) <= 0.05
@@ -3910,26 +3837,15 @@ class NavBridge(Node):
         # Lane hold only while translating and roughly aligned. Constant-sign
         # peer swerve + raw (aisle-x) on northbound axis_y turned robot1 CW
         # into +X and parked it in the east table bay (table 4).
-        if kind in ("axis_x", "axis_y") and abs(vx) > 1e-3:
+        if kind == "axis_y" and abs(vx) > 1e-3:
             desired_yaw = float(stage["yaw"])
             yaw_error = self._angle_error(desired_yaw, yaw)
             if abs(yaw_error) < math.radians(25.0):
-                if stage.get("planned_route", False):
-                    cross_axis = stage.get("cross_axis")
-                    cross_now = x if cross_axis == "x" else y
-                    cross_target = float(stage.get("cross_value", cross_now))
-                    lat_err = cross_target - cross_now
-                elif kind == "axis_y":
-                    lat_err = self._fleet_aisle_x() - x
-                else:
-                    lat_err = 0.0
-                # Heading-aware cross-track correction.  For X motion the
-                # cross-axis is world Y; for Y motion it is world X.  The
-                # signs flip automatically when travelling west/south.
-                if kind == "axis_x":
-                    lane_wz = 1.15 * lat_err * math.cos(desired_yaw)
-                else:
-                    lane_wz = -1.15 * lat_err * math.sin(desired_yaw)
+                aisle = self._fleet_aisle_x()
+                lat_err = aisle - x
+                # Heading-aware crosstrack: northbound (+Y) needs
+                # wz = -k*(aisle-x); southbound the opposite.
+                lane_wz = -1.15 * lat_err * math.sin(desired_yaw)
                 peer_near = float(
                     getattr(self, "_peer_near_dist", float("inf"))
                 )
@@ -4872,12 +4788,12 @@ def main():
             {
                 "name": "robot1",
                 "root": "/World/NavRobot1",
-                "spawn": Gf.Vec3d(-0.70, 5.25, 0.01),
+                "spawn": Gf.Vec3d(-0.90, 5.25, 0.01),
             },
             {
                 "name": "robot2",
                 "root": "/World/NavRobot2",
-                "spawn": Gf.Vec3d(0.70, 5.25, 0.01),
+                "spawn": Gf.Vec3d(0.90, 5.25, 0.01),
             },
         ]
         if multi_robot
