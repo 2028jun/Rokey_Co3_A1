@@ -73,7 +73,7 @@ flowchart LR
 
     UI -->|"/manager/order"| Fleet
     Isaac -->|"카메라 압축 스트림"| Y1
-    Isaac -->|"카메라 압축 스트림"| Y2
+    Y1 -->|"손 침입 판정"| M1
     Isaac -.->|"카메라 · 지도 · 상태"| UI
 
     classDef web fill:#eef2ff,stroke:#4f46e5,color:#1e1b4b;
