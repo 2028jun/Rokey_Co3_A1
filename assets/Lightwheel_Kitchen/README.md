@@ -41,17 +41,24 @@ For questions or collaboration, contact Frank Chen at ming.chen@lightwheel.ai.
 - `omniverse-content...aws.com/`
   Cached content pulled from Omniverse's remote servers (optional for reuse).
 
-## 🚀 Usage
+## 🚀 Project installation
 
-Download by clicking
+This repository distributes the required runtime as a versioned GitHub Release.
+From the repository root, run:
 
-[DOWNLOAD_LINK](https://storage.googleapis.com/sim-cloud-paltform-bucket-file-upload-001/upload-file/Lightwheel_Kitchen-20250713.zip)
+```bash
+./tools/install_kitchen_assets.sh
+```
 
+The installer verifies the release archive checksum and extracts it to
+`assets/Lightwheel_Kitchen/Collected_KitchenRoom/`. To replace an existing
+installation, use `./tools/install_kitchen_assets.sh --force`.
 
-1. Open **Isaac Sim**.
-2. Use the Content browser to navigate to this directory.
-3. Double-click on `KitchenRoom.usd` to load the complete scene.
-4. You can edit, simulate, or extend the environment directly.
+The original upstream archive is also available from the
+[Lightwheel download link](https://storage.googleapis.com/sim-cloud-paltform-bucket-file-upload-001/upload-file/Lightwheel_Kitchen-20250713.zip).
+
+After installation, open **Isaac Sim** and load
+`Collected_KitchenRoom/KitchenRoom.usd` to inspect the complete source scene.
 
 ## 🖥️ System Requirements
 

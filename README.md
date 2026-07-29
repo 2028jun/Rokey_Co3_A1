@@ -180,13 +180,23 @@ SLAM 지도 생성), **원격 YOLO PC**(손 안전 감지), **웹 UI PC**(UI 대
   (예: `export ISAAC_SIM_ROOT=~/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release`).
   `~/.bashrc`에 넣어두면 매 터미널마다 다시 지정할 필요가 없습니다.
 - 주방 3D 에셋: 식당 씬(`assets/lightweight_restaurant/`)은 git에 포함되어
-  있지만, 이 씬이 참조하는 주방 모델
-  `assets/Lightwheel_Kitchen/Collected_KitchenRoom/KitchenRoom.usd`는 용량
-  때문에 `.gitignore`로 제외되어 있어 클론 직후에는 없습니다. 다운로드 방법은
+  있지만, 이 씬이 참조하는 주방 모델은 용량 때문에 GitHub Release로
+  배포합니다. 저장소를 처음 클론한 메인 PC에서 아래 명령을 한 번 실행하십시오.
+  스크립트가 압축파일의 SHA-256을 검증하고
+  `assets/Lightwheel_Kitchen/Collected_KitchenRoom/KitchenRoom.usd` 경로에
+  설치합니다. 이 파일이 없으면 주방 부분이 깨진 참조로 표시됩니다.
+
+```bash
+sudo apt update
+sudo apt install -y curl zstd
+./tools/install_kitchen_assets.sh
+```
+
+  기존 주방 에셋을 Release 버전으로 교체하려면
+  `./tools/install_kitchen_assets.sh --force`를 사용합니다. 원본 에셋의 출처와
+  CC BY-NC 4.0 라이선스는
   [assets/Lightwheel_Kitchen/README.md](assets/Lightwheel_Kitchen/README.md)를
-  참고해 압축을 풀고 `assets/Lightwheel_Kitchen/Collected_KitchenRoom/`
-  아래에 두십시오. 없는 상태로 Isaac Sim을 실행하면 주방 부분이 깨진 참조로
-  표시됩니다.
+  참고하십시오.
 - ROS 2 Humble Desktop (`rviz2` 포함)
 - apt(rosdep): `ros-humble-nav2-bringup`, `ros-humble-nav2-collision-monitor`,
   `ros-humble-nav2-lifecycle-manager`, `ros-humble-nav2-simple-commander`,
